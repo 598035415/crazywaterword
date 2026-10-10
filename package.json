@@ -1,0 +1,29 @@
+{
+  "name": "crazywaterword",
+  "version": "1.0.0",
+  "description": "微信小游戏《疯狂水世界》协议侧挂机工具：直连游戏网关完成日常/任务/英雄/海面循环，附本地网页控制台",
+  "type": "module",
+  "main": "src/app.mjs",
+  "scripts": {
+    "start": "node src/app.mjs",
+    "test": "node src/selftest.mjs",
+    "capture": "node tools/capture-credentials.mjs",
+    "sync-config": "node tools/sync-config.mjs",
+    "sync-art": "node tools/sync-art.mjs"
+  },
+  "keywords": [
+    "wechat",
+    "minigame",
+    "protocol",
+    "protobuf",
+    "websocket"
+  ],
+  "license": "ISC",
+  "private": false,
+  "engines": {
+    "node": ">=20.11"
+  },
+  "dependencies": {
+    "protobufjs": "^7.6.6"
+  }
+}
