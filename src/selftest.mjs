@@ -4,6 +4,7 @@ import { loadProtocol } from './proto.mjs';
 import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
 import { GameClient } from './client.mjs';
+import { gateDue, humanDuration, formatLoopRound } from './loop.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -815,6 +816,37 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// ★ 防回归：潜水 / 打捞**永远不许**被排进计划。
+//
+// 两者都不是「发个请求就完事」的玩法：DivingRequest.reward.asset 与
+// EndSalvageRequest.pickedFloaters 都是「你这一局实际捡到了什么」的上报体，
+// 客户端是在小游戏里产生战利品之后才填进去发给服务端的（空手时客户端根本不发）。
+// 纯协议发空体 = 上报「一件没捡到」，服务端如实回空奖励（实测 {"reward":{"asset":[]}}）；
+// 想拿到东西只能伪造清单，属于谎报战利品。项目边界明确不做，详见 docs/gameplay.md。
+//
+// 这组断言的作用是**拦住以后的自己**：谁要是又给 planWorld 加个 diving 参数，
+// 这里会直接红。别改这组断言，要改先读 docs/gameplay.md。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [] }, BuildingProduceCfg: { data: [] }, BuildingUpgradeCfg: { data: [] },
+  } };
+  const survey = () => ({
+    now: 1000, player: { level: 50 }, population: 10, maxPopulation: 99,
+    stockCap: 9999, factorySlots: 2, stock: new Map(), have: () => 0,
+    buildings: [], factories: [], orders: [], floaters: [{ floaterId: 'f1', num: 1 }],
+  });
+  // 把「历史上曾经存在的开关」都塞进去，模拟有人按老代码调用。
+  const plan = planWorld(survey(), {
+    config, pickUpFloaters: true, diving: true, maxDivings: 3, allowSpeedUp: true, allowReroll: true,
+  });
+  const banned = plan.actions.filter((a) => a.kind === 'diving' || a.request === 'DivingRequest'
+    || a.request === 'BeginSalvageRequest' || a.request === 'EndSalvageRequest');
+  assert.deepEqual(banned, [], '潜水/打捞永远不许进计划：它们的请求体要上报真实战利品，伪造即谎报');
+  assert.equal(plan.actions.some((a) => a.kind === 'pickUpFloater'), true, '拾荒不受影响，该排还是要排');
+  checked += 1;
+}
+
 // 建造：OnWaterResponse 里 level=0 的建筑是已解锁未建的空位，走 BuildBuildingRequest，
 // 判据是 BuildingUpgradeCfg 的 level 1 行（实测 49 种建筑这一行全是 costTime 0 / consume 空）。
 {
@@ -1245,4 +1277,43 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 活跃度宝箱 / 每日赠礼）`);
+// --- 自动循环里的拾荒间隔 ------------------------------------------------------
+// 拾荒比循环慢得多，靠「上次执行时间 + 间隔」节流；判定必须是纯函数才好测。
+// （潜水/打捞没有这种开关，因为它们根本不做 —— 见上面那组禁令断言。）
+{
+  const every = 5 * 60_000;
+  assert.equal(gateDue(0, every, 1_000_000), true, '没执行过（lastAt=0）时首次立刻执行');
+  assert.equal(gateDue(1_000_000, every, 1_000_000 + every - 1), false, '差 1ms 到间隔就还是不发');
+  assert.equal(gateDue(1_000_000, every, 1_000_000 + every), true, '刚好到间隔就该发');
+  assert.equal(gateDue(1_000_000, 0, 1_000_001), true, '间隔 0 = 不限制，每轮都试');
+  assert.equal(gateDue(1_000_000, -5000, 1_000_001), true, '负数间隔也按不限制处理');
+
+  assert.equal(humanDuration(40), '40 秒');
+  assert.equal(humanDuration(320), '5 分 20 秒');
+  assert.equal(humanDuration(1800), '30 分');
+  assert.equal(humanDuration(3780), '1 小时 3 分');
+  checked += 1;
+}
+
+// 被间隔挡住的轮次要能在日志里看出来，否则像「勾了没反应」。
+{
+  const summary = {
+    round: 3,
+    startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    gates: {
+      pick: { enabled: true, everyMs: 300_000, lastAt: 1_700_000_000, waitSeconds: 200, throttled: true },
+    },
+  };
+  const text = formatLoopRound(summary);
+  assert.ok(text.includes('拾荒 间隔未到，还差 3 分 20 秒（每 5 分一次）'), `应显示拾荒节流提示，实际：\n${text}`);
+
+  // 老 history（没有 gates 字段）不能炸。
+  const legacy = formatLoopRound({ ...summary, gates: undefined });
+  assert.ok(legacy.startsWith('第 3 轮'), '缺 gates 的旧轮次记录也要能正常格式化');
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼）`);

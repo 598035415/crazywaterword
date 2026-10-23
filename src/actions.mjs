@@ -206,6 +206,10 @@ export const ACTIONS = {
     // 单个字符串会被 protobufjs 按字符拆开，这里统一成数组。
     body: ({ floaterId }) => ({ floaterId: Array.isArray(floaterId) ? floaterId : [floaterId] }),
   },
+  // 潜水（DivingRequest）**故意不封装**：它的请求体 reward.asset 是客户端上报
+  // 「这一局我在水下捡到了什么」（客户端 finishDive 里把 _getResourceMap 塞进去再发），
+  // 跟打捞的 EndSalvageRequest.pickedFloaters 同源。发空体 = 上报「什么都没捡到」，
+  // 服务端就回空奖励；要拿到东西只能伪造战利品，属于谎报，故不做。详见 docs/gameplay.md。
   upgradeBuilding: {
     request: 'UpgradeBuildingRequest',
     response: null,

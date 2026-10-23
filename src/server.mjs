@@ -84,6 +84,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         rounds: 0,
         completed: 0,
         everyMs: 60_000,
+        // 拾荒的间隔（0 = 不限制，每轮都试）。潜水已移除，这里只剩拾荒。
+        pickEveryMs: 0,
+        lastPickAt: null,
         stop: { aborted: false },
         history: [],
         error: null,
@@ -503,7 +506,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       }
       if (route === 'GET /api/world') {
         const { account, session } = scoped_(parsed);
-        json(await world(session, account, { pickUpFloaters: parsed.searchParams.get('pick') === '1' }));
+        json(await world(session, account, {
+          pickUpFloaters: parsed.searchParams.get('pick') === '1',
+        }));
         return;
       }
       if (route === 'GET /api/worlds') {
@@ -607,6 +612,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           maxPackPerRound: Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined,
           // 拾荒默认不做，前端勾了「自动拾荒」才扫海面漂浮物。
           pickUpFloaters: payload.pickFloaters === true,
+          // 潜水**没有这个参数**：DivingRequest 要上报「这一局捡到了什么」，
+          // 纯协议发空体只会拿回空奖励，详见 docs/gameplay.md 与 world.mjs 顶部注释。
         });
         const { results } = await runWorld(instance, protocol, plan, {
           allowMutate: true,
@@ -645,10 +652,14 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.rounds = Number(payload.rounds ?? 1);
         loop.completed = 0;
         loop.everyMs = Number(payload.everySeconds ?? 60) * 1000;
+        // 0 或负数 = 不节流（旧行为）。负数按 0 处理，免得写成 -1 时被当成「永远不做」。
+        loop.pickEveryMs = Math.max(0, Number(payload.pickEverySeconds ?? 0)) * 1000;
+        loop.lastPickAt = null;
         loop.history = [];
         loop.error = null;
         loop.stop = { aborted: false };
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒`);
+        const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
+        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}`);
         runLoop(instance, protocol, {
           config,
           player: session.player,
@@ -659,9 +670,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           allowSpeedUp: payload.speedUp === true,
           allowReroll: payload.reroll === true,
           pickUpFloaters: payload.pickFloaters === true,
+          pickEveryMs: loop.pickEveryMs,
           stop: loop.stop,
           onRound: (summary) => {
             loop.completed = summary.round;
+            loop.lastPickAt = summary.gates?.pick?.lastAt ?? loop.lastPickAt;
             loop.history.push(summary);
             if (loop.history.length > 50) loop.history.shift();
             emit(session, 'info', formatLoopRound(summary));
@@ -708,6 +721,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       rounds: loop.rounds,
       completed: loop.completed,
       everyMs: loop.everyMs,
+      pickEveryMs: loop.pickEveryMs,
+      lastPickAt: loop.lastPickAt,
       history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
       error: loop.error,
     };

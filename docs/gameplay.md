@@ -321,6 +321,8 @@ MonthCardDailyRewardRequest          领取月卡每日奖励，无响应类型
   不会放宽任何一项授权要求，也不会顺带连接：连接仍然要显式动作。
 - 网页「一键扫码 + 抓包」会动系统设置（HKCU 代理 + 当前用户根证书）。它比普通写操作门控更重：
   必须先在页面上确认，且改动随时可完整回滚（见 13.2）。
+- **潜水与打捞永久不做**：两者的请求体都是「这一局你实际捡到了什么」的上报体，纯协议只能伪造战利品。
+  证据链、实测回包与历史误判都记在第 14 节，`selftest` 有对应的禁令断言。
 
 ## 9. 复现命令
 
@@ -642,3 +644,67 @@ node tools/selftest-describe.mjs    # 字段布局还原自检
   （「领取主线 62 · 拥有指定资源 1200/20」「排产 1切鱼厂 → 生鱼片」这种）。
 - 账号页：账号列表（切换/删除/当前标记）、添加账号（二维码 + 一键抓包）、凭证查看。
 - 写操作一律要求请求体带 `confirm: true`，页面上表现为「先勾选、再等 3 秒倒计时」两样都满足才能点确认。
+
+## 14. 不做清单：潜水与打捞（**别再改回来**）
+
+**结论：这两个玩法都不做，将来也不做。** 不是还没实现，是设计上排除。
+
+### 14.1 为什么：请求体是「你捡到了什么」的上报体
+
+| 玩法 | 请求 | 关键字段 | 谁填的 |
+|---|---|---|---|
+| 潜水 | `DivingRequest` | `1 reward: DisplayAssetPackage{ asset: DisplayAsset[] }` | 客户端 `finishDive()` |
+| 打捞 | `EndSalvageRequest` | `1 pickedFloaters: repeated DispWaterFloater` | 客户端小游戏内拾取 |
+
+客户端原文（`work/extracted/_subpackages_main_/subpackages/main/game.js`，`s.finishDive`）：
+
+```js
+s.finishDive = function (t) {
+  for (...this._getResourceMap.entries()) { if (r > 0) s.push({ type: ITEM, id: o, num: r }); }
+  if (s.length > 0) {
+    var h = W('DivingRequest', { reward: { asset: s } });   // ← 把本局战利品塞进请求体
+    I.instance.sendMessage(h, function (i) { null == t || t(i); });
+  } else null == t || t();                                   // ← 一件没捡到就根本不发请求
+};
+```
+
+也就是说：**产出不是服务端算的，是客户端小游戏里一件件捡出来再上报的**。同一段代码里
+`pickUpItem()` 还会乘 `water.divingLevel.criticalRate` 算暴击倍率，全在客户端。
+
+`DiveLayoutCfg` 也对得上：40 层里每层 `pickupMin: 0`、`normalBoxProbability: 2000`(20%)、
+`safeBoxProbability: 800`(8%) —— 它描述的是**小游戏里那一局的生成规则**，不是「发个请求就随机给你一份」。
+
+### 14.2 实测：发空体只会拿回空奖励
+
+```
+2026-10-23T08:27:36.637Z -> [DivingRequest] seq=5402 24B
+2026-10-23T08:27:36.702Z <- [DivingResponse] seq=96619 {"reward":{"asset":[]}}
+```
+
+请求成功、服务端不报错，但奖励是空的 —— 因为它如实理解了「你上报 0 件」。
+界面上的那句「潜水 1 次：没有回报」就是这个。
+
+### 14.3 为什么这就不能做了
+
+想拿到东西只有一条路：**编一份 `asset` 清单发过去**。那就是往服务端谎报战利品，
+与打捞的 `pickedFloaters` 完全同源，属于作弊 —— 本项目从第一版起就把这类动作列在
+「安全边界」之外（见第 8 节、README「安全边界」）。伪造成本极低、收益为零、风险最大，没有讨论空间。
+
+### 14.4 历史教训（写给以后的自己）
+
+- 2026-10-22 曾实现过「自动潜水」：当时只看 `describe.mjs` 的字段表，把
+  `reward` 误判成「回显字段」，结论写成「`DivingRequest` 是空体，一次请求一次下潜，服务端按层概率随机」，
+  还配套做了 `key: diving:日期:N` 的跨天去重、`maxDivings`、`summarizeDiving` 一整套。
+- 2026-10-23 实跑发现每轮都是「潜水 1 次：没有回报」，回头读客户端 `finishDive` 才定位到上面的真相，
+  当天把功能全部移除（`actions.mjs` / `world.mjs` / `loop.mjs` / `server.mjs` / `page.mjs` / `app.mjs`）。
+- **教训**：`describe.mjs` 只能告诉你「字段叫什么、什么类型」，**告诉不了你「谁填、什么语义」**。
+  凡是 `*Request` 里出现奖励/战利品形状的字段（`reward`、`asset`、`picked*`、`items`），
+  必须回客户端找到**发送点**，看它是常量、回显，还是把本地状态填进去。
+
+### 14.5 防回归
+
+`src/selftest.mjs` 有一组断言专门守这件事：即使按老参数调用
+`planWorld(survey, { diving: true, maxDivings: 3 })`，也不许出现
+`kind: 'diving'` / `DivingRequest` / `BeginSalvageRequest` / `EndSalvageRequest`。
+**要动这组断言，先读完本节。**
+

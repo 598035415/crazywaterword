@@ -10,6 +10,40 @@ import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } f
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 拾荒的节流判定：海面漂浮物是慢慢刷出来的，跟循环的 60s 不是一回事 ——
+// 每轮都发一遍既没收益，也更容易被服务端注意到「这个号的请求频率过于规整」。
+// 所以给它一个间隔，只有距上次执行超过间隔才发。
+// everyMs <= 0 表示不限制（等于旧行为：每轮都试）。
+export function gateDue(lastAt, everyMs, nowMs) {
+  if (!(Number(everyMs) > 0)) return true;
+  if (!Number(lastAt)) return true;
+  return Number(nowMs) - Number(lastAt) >= Number(everyMs);
+}
+
+// 间隔的展示文案：40 秒 / 5 分 20 秒 / 1 小时 3 分。
+export function humanDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return `${total} 秒`;
+  const m = Math.floor(total / 60);
+  const rest = total % 60;
+  if (m < 60) return rest > 0 ? `${m} 分 ${rest} 秒` : `${m} 分`;
+  const h = Math.floor(m / 60);
+  const restM = m % 60;
+  return restM > 0 ? `${h} 小时 ${restM} 分` : `${h} 小时`;
+}
+
+// 一轮结束时把两个闸门的状态塞进 summary，网页与日志都靠它显示「还差多久」。
+function gateSummary(enabled, everyMs, lastAt, nowMs) {
+  const every = Math.max(0, Number(everyMs) || 0);
+  const waitMs = enabled && lastAt && every > 0 ? Math.max(0, lastAt + every - nowMs) : 0;
+  return {
+    enabled,
+    everyMs: every,
+    lastAt: lastAt ? Math.floor(lastAt / 1000) : null,
+    waitSeconds: Math.ceil(waitMs / 1000),
+  };
+}
+
 export async function runLoop(client, protocol, {
   config = null,
   player = null,
@@ -22,6 +56,7 @@ export async function runLoop(client, protocol, {
   useSelectPack = true,
   maxPackPerRound,
   pickUpFloaters = false,
+  pickEveryMs = 0,
   sleep = defaultSleep,
   stop = { aborted: false },
   onRound,
@@ -30,12 +65,16 @@ export async function runLoop(client, protocol, {
   if (!allowMutate) throw new Error('循环会持续改变账号状态，需要 --yes');
   const rejected = { tasks: new Set(), world: new Set() };
   const history = [];
+  // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
+  // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
+  let lastPickAt = 0;
   // rounds <= 0 表示一直跑，靠 stop.aborted（Ctrl-C 或网页停止按钮）退出。
   const total = rounds > 0 ? rounds : Infinity;
 
   for (let round = 1; round <= total; round += 1) {
     if (stop.aborted) break;
-    const summary = { round, startedAt: Math.floor(Date.now() / 1000), tasks: null, dailies: null, world: null };
+    const tickAt = Date.now();
+    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null };
 
     // 1. 任务奖励
     const tasksSurvey = await surveyTasks(client, protocol, { config });
@@ -61,9 +100,18 @@ export async function runLoop(client, protocol, {
       });
     }
 
-    // 3. 海面世界
+    // 3. 海面世界。拾荒按自己的间隔节流：间隔没到就这轮不发，到点才发。
+    //    （潜水已移除：DivingRequest 要上报「捡到了什么」，纯协议发空体只能拿回空奖励。见 docs。）
+    const pickDue = pickUpFloaters && gateDue(lastPickAt, pickEveryMs, tickAt);
     const worldSurvey = await surveyWorld(client, protocol, { config, player });
-    const worldPlan = planWorld(worldSurvey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters });
+    const worldPlan = planWorld(worldSurvey, {
+      config,
+      allowSpeedUp,
+      allowReroll,
+      useSelectPack,
+      maxPackPerRound,
+      pickUpFloaters: pickDue,
+    });
     summary.world = {
       planned: worldPlan.actions.length,
       notes: [...worldSurvey.notes, ...worldPlan.notes],
@@ -81,6 +129,13 @@ export async function runLoop(client, protocol, {
       summary.world.results = results;
       summary.world.floaterLoot = summarizeFloaters(results);
     }
+
+    // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
+    // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
+    if (pickDue && worldPlan.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
+    summary.gates = {
+      pick: { ...gateSummary(pickUpFloaters, pickEveryMs, lastPickAt, tickAt), throttled: pickUpFloaters && !pickDue },
+    };
 
     history.push(summary);
     onRound?.(summary);
@@ -140,6 +195,11 @@ export function formatLoopRound(summary) {
   const line = (name, part) => `  ${name} 计划 ${part.planned}，成功 ${ok(part.results)}，失败 ${failed(part.results)}`
     + (skipped(part.results) ? `，跳过 ${skipped(part.results)}` : '');
   const floater = summary.world.floaterLoot ? formatFloaters(summary.world.floaterLoot) : '';
+  // 勾了但被间隔挡住的那一轮要说清楚，否则看起来像「勾了没反应」。
+  const gateLine = (name, gate) => {
+    if (!gate?.enabled || !gate.throttled) return '';
+    return `  ${name} 间隔未到，还差 ${humanDuration(gate.waitSeconds)}（每 ${humanDuration(gate.everyMs / 1000)}一次）`;
+  };
   return [
     `第 ${summary.round} 轮`,
     line('任务', summary.tasks),
@@ -149,5 +209,6 @@ export function formatLoopRound(summary) {
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
     ...detailLines(summary.world),
     ...(floater ? [`  ${floater}`] : []),
+    ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
   ].join('\n');
 }

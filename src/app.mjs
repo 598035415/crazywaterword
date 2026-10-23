@@ -487,6 +487,7 @@ async function tasks({ allowMutate, dryRun }) {
 // --speed-up 才允许花「加速器」（钻石永远不碰）；--reroll 才允许拒绝材料不齐的订单。
 // 材料不齐时默认会拿「原料自选包 / 工事材料自选包」兑出来补（--no-pack 关掉，--max-pack 改上限）。
 // --pick 才扫海面漂浮物（拾荒），结束后打印所得。
+// 没有 --dive：潜水/打捞的请求体里要填「你实际捡到了什么」，纯协议只能伪造，故不做（见 docs/gameplay.md）。
 async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, pickUpFloaters = false }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
@@ -517,7 +518,7 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
         else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
       },
     });
-    // 拾荒所得单独汇总一行：逐条日志太碎，看不出这一轮到底捡到了什么。
+    // 拾荒所得汇总一行：逐条日志太碎，看不出这一轮到底拿到了什么。
     const floaterText = formatFloaters(summarizeFloaters(results));
     if (floaterText) console.log(`\n${floaterText}`);
     if (rejected.size) console.log(`本轮被拒 ${rejected.size} 条`);
@@ -539,6 +540,83 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
       const a = survey.have(key);
       const b = after.have(key);
       if (a !== b) console.log(`  变 ${key} ${a} -> ${b}`);
+    }
+  } finally {
+    client.stop();
+  }
+}
+
+// 临时验证命令：SetAutoFarmingRequest 到底管什么？
+// 协议里它只有一个 isOn，配置里却同时有「自动潜水」和「自动拾荒」两个 param，
+// 而海面响应里也有一堆并列的自动开关。所以不猜，发一次，前后各拍一张快照对比：
+// 漂浮物数量掉不掉、autoFarming 变不变 true、三个小游戏等级动不动。
+// 它会改账号状态，因此要 --yes；--off 用来恢复关闭；--wait 控制观察秒数。
+async function autofarm({ allowMutate, turnOn = true, waitSeconds = 8 }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  await client.connect(login);
+  const snapshot = async () => {
+    const water = normalize(await client.request('OnWaterRequest', {}, 'OnWaterResponse', 8000));
+    return {
+      autoFarming: water.autoFarming === true,
+      floaters: (water.floater ?? []).length,
+      autoProduceForever: water.autoProduceForever === true,
+      diving: water.divingLevel?.level ?? null,
+      salvage: water.salvageLevel?.level ?? null,
+      fishing: water.fishingLevel?.level ?? null,
+    };
+  };
+  const show = (tag, s) => console.log(
+    `${tag} autoFarming=${s.autoFarming}  漂浮物=${s.floaters}  永久自动生产=${s.autoProduceForever}`
+    + `  潜水Lv${s.diving} 打捞Lv${s.salvage} 钓鱼Lv${s.fishing}`,
+  );
+
+  try {
+    const before = await snapshot();
+    show('开前 ', before);
+
+    if (!allowMutate) {
+      console.log('\n（没加 --yes：只读快照，没发任何请求）');
+      return;
+    }
+
+    try {
+      // 这个请求没有 *Response，成功时服务端一声不吭，只能靠 sendWatch 守窗口。
+      await client.sendWatch('SetAutoFarmingRequest', { isOn: turnOn }, { window: 900 });
+      console.log(`\n已发送 SetAutoFarmingRequest { isOn: ${turnOn} }，窗口内没有被拒`);
+    } catch (error) {
+      console.log(`\nSetAutoFarmingRequest 被拒：${error.message}`);
+      return;
+    }
+
+    console.log(`等 ${waitSeconds} 秒，看服务端会不会有反应 ...`);
+    await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+
+    const after = await snapshot();
+    show('开后 ', after);
+
+    console.log('\n对比:');
+    console.log(`  autoFarming    ${before.autoFarming} -> ${after.autoFarming}`);
+    console.log(`  漂浮物数量     ${before.floaters} -> ${after.floaters}`);
+    console.log(`  永久自动生产   ${before.autoProduceForever} -> ${after.autoProduceForever}`);
+    console.log(`  潜水等级       ${before.diving} -> ${after.diving}`);
+    console.log(`  打捞等级       ${before.salvage} -> ${after.salvage}`);
+    console.log(`  钓鱼等级       ${before.fishing} -> ${after.fishing}`);
+
+    console.log('\n判读:');
+    if (after.autoFarming !== before.autoFarming) {
+      console.log('  → autoFarming 状态跟着变了，这个开关确实是它');
+      if (after.floaters < before.floaters) console.log('  → 而且漂浮物在减少，说明它就是自动拾荒');
+      else console.log('  → 但漂浮物没减少，说明它管的是别的东西（很可能只是农场）');
+    } else if (after.floaters < before.floaters) {
+      console.log('  → 回显字段没变，但漂浮物在减少，说明服务端已经在自动捡了');
+    } else {
+      console.log('  → 短时间内看不出变化。把 --wait 调大（如 --wait 60）再看一次，');
+      console.log('     或者回网页观察 2 分钟：漂浮物自己变少 = 自动拾荒生效');
     }
   } finally {
     client.stop();
@@ -601,7 +679,19 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 }
 
 // 自动循环：任务 → 日常 → 海面，每轮之间睡 --every 秒。必须显式开，Ctrl-C 收尾后退出。
-async function loopCli({ allowMutate, rounds, everySeconds, allowSpeedUp, allowReroll, allowPaid }) {
+// 拾荒另外有自己的间隔（--pick-every，秒；0 = 不限制）。
+async function loopCli({
+  allowMutate,
+  rounds,
+  everySeconds,
+  allowSpeedUp,
+  allowReroll,
+  allowPaid,
+  useSelectPack = true,
+  maxPackPerRound,
+  pickUpFloaters = false,
+  pickEverySeconds = 0,
+}) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -620,6 +710,7 @@ async function loopCli({ allowMutate, rounds, everySeconds, allowSpeedUp, allowR
     const player = response.playerInfo;
     console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}，${rounds > 0 ? `共 ${rounds} 轮` : '一直跑（Ctrl-C 停）'}，间隔 ${everySeconds}s`);
     console.log(`开关: 加速=${allowSpeedUp ? '开(只花' + SPEED_UP_ITEM + ')' : '关'} 拒绝重刷=${allowReroll ? '开' : '关'}`);
+    console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -629,6 +720,10 @@ async function loopCli({ allowMutate, rounds, everySeconds, allowSpeedUp, allowR
       allowPaid,
       allowSpeedUp,
       allowReroll,
+      useSelectPack,
+      maxPackPerRound,
+      pickUpFloaters,
+      pickEveryMs: Math.max(0, Number(pickEverySeconds) || 0) * 1000,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
@@ -820,7 +915,18 @@ async function main() {
       useSelectPack: !process.argv.includes('--no-pack'),
       maxPackPerRound: numericArg('--max-pack'),
       pickUpFloaters: process.argv.includes('--pick'),
+      pickEverySeconds: at('--pick-every', 0),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  // 临时验证：node src/app.mjs autofarm [--yes] [--off] [--wait 秒]
+  if (mode === 'autofarm') {
+    await autofarm({
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      turnOn: !process.argv.includes('--off'),
+      waitSeconds: numericArg('--wait') ?? 8,
     });
     return;
   }

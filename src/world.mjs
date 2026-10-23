@@ -322,6 +322,13 @@ export function planWorld(survey, {
     }
   }
 
+  // 潜水（DivingRequest）不在这里规划，也不该被自动化：它的 body 是
+  // reward.asset —— 客户端 `finishDive()` 把「这一局水下捡到的东西」(_getResourceMap)
+  // 塞进请求体上报，服务端据此入库；空手时客户端**根本不发请求**。
+  // 所以纯协议发空体只会拿回空奖励（实测 {"reward":{"asset":[]}}），
+  // 想要产出只能伪造战利品清单，跟打捞的 EndSalvageRequest.pickedFloaters 一样属于谎报，
+  // 本项目明确不做。详见 docs/gameplay.md「潜水为什么不能自动化」。
+
   // 1. 收成品：工厂走 GainFactoryProduce，非工厂建筑的囤积产物一次性批量收。
   for (const b of survey.factories) {
     if ((b.factory.finishedProducts ?? []).length > 0) {
@@ -548,6 +555,10 @@ export function planWorld(survey, {
 }
 
 export function stepKey(step) {
+  // 显式指定的 key 优先：有些动作的去重粒度靠 body 里的字段算不出来
+  // （典型是「按天一次」，body 里压根没有日期）。当前计划器没用到，但 runWorld 的
+  // rejected 集合认这条规则，动作定义里写了 key 就按它算。
+  if (step.key) return step.key;
   // selectPack 的 body 里没有 buildingId/index，用 selectItemId（材料名，天然唯一）区分，
   // 否则多个兑换动作会撞成同一个 key，被 rejected 集合误伤。
   const target = step.body?.buildingId ?? step.body?.index ?? step.body?.selectItemId ?? '';
@@ -662,7 +673,14 @@ export function formatFloaters(summary) {
   if (summary.failed) extras.push(`失败 ${summary.failed}`);
   const head = `拾荒 ${summary.submitted + summary.failed} 件`
     + (extras.length ? `（${extras.join('，')}）` : '');
-  if (!summary.items.length) return `${head}（没有回报）`;
+  if (!summary.items.length) {
+    // 全被拒不等于功能坏了：海面漂浮物有时效，也可能被别人捡走，
+    // 服务端用 deniedFloaterIds 明确告诉你「这几件已经没了」，下一轮会拿新列表。
+    if (summary.denied && !summary.failed) {
+      return `${head}：这批已经失效（被别人捡走或过期），下一轮会拿新列表`;
+    }
+    return `${head}：没有回报`;
+  }
   const shown = summary.items.slice(0, LOOT_SHOW).map((x) => `${x.id}×${x.num}`).join('  ');
   const more = summary.items.length > LOOT_SHOW ? `  等 ${summary.items.length} 种` : '';
   return `${head}：${shown}${more}`;

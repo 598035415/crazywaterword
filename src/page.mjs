@@ -121,7 +121,6 @@ export const PAGE = `<!doctype html>
       <label class="dim">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
       <label class="dim"><input type="checkbox" id="world-speedup"> 允许花加速器</label>
       <label class="dim"><input type="checkbox" id="world-reroll"> 拒绝重刷订单</label>
-      <label class="dim"><input type="checkbox" id="world-pick" checked> 自动拾荒</label>
       <button id="loop-start" class="primary">开始挂机</button>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
@@ -147,6 +146,16 @@ export const PAGE = `<!doctype html>
     <div id="world-orders"></div>
     <h2>仓库</h2><div class="icons" id="world-stock"></div>
     <h2>资源田</h2><pre id="world-fields"></pre>
+
+    <h2>拾荒</h2>
+    <div class="bar">
+      <label class="dim"><input type="checkbox" id="world-pick" checked> 自动拾荒</label>
+      <label class="dim">时间间隔 <input id="pick-every" value="300" style="width:64px"> 秒</label>
+      <span id="pick-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="gate-view">拾荒的节奏跟循环间隔无关，所以单独给一个时间间隔：自动循环每轮都会看一眼，只有「距上次执行」超过间隔才真的发请求，其余轮次直接跳过。
+拾荒：扫海面漂浮物，一次全捡（不消耗任何资源）。间隔填 0 表示不限制（每轮都试）；手动「执行一轮」不受间隔限制。
+潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
   </section>
 
   <section id="tab-heroes" class="hidden">
@@ -524,10 +533,49 @@ $('loot-run').onclick = () => {
 // ---- 挂机 ------------------------------------------------------------------
 const HERO_STATUS = { ready: '可做', done: '已完成', blocked: '不可做' };
 
+// 秒数说人话：40 秒 / 5 分 20 秒 / 1 小时 3 分。
+function dur(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return total + ' 秒';
+  const m = Math.floor(total / 60);
+  const rest = total % 60;
+  if (m < 60) return rest > 0 ? m + ' 分 ' + rest + ' 秒' : m + ' 分';
+  const h = Math.floor(m / 60);
+  const restM = m % 60;
+  return restM > 0 ? h + ' 小时 ' + restM + ' 分' : h + ' 小时';
+}
+
+function clock(seconds) {
+  return new Date(seconds * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+// 拾荒的状态：上次什么时候做的、离下次还差多久。
+function renderGate(nodeId, lastAt, everyMs, enabled) {
+  const node = $(nodeId);
+  if (!enabled) {
+    node.textContent = '未勾选，不会执行';
+    return;
+  }
+  if (!lastAt) {
+    node.textContent = '上次：还没执行（首次跑就做一次）';
+    return;
+  }
+  const left = Math.max(0, Math.ceil((lastAt * 1000 + (everyMs || 0) - Date.now()) / 1000));
+  const base = '上次 ' + clock(lastAt);
+  node.textContent = !(everyMs > 0) ? base + '（不限间隔，每轮都试）'
+    : base + ' · ' + (left > 0 ? '还差 ' + dur(left) : '已到间隔');
+}
+
 function renderLoop(data) {
   $('loop-start').disabled = data.running;
   $('loop-stop').disabled = !data.running;
   $('loop-hint').textContent = (data.running ? '挂机中，已完成 ' : '未在挂机，累计 ') + data.completed + ' 轮' + (data.error ? '，中止: ' + data.error : '');
+  // 运行中把服务端实际生效的间隔回填到输入框（用户正在改的那个不动）。
+  const pickInput = $('pick-every');
+  if (data.running && document.activeElement !== pickInput) {
+    pickInput.value = String(Math.round((data.pickEveryMs || 0) / 1000));
+  }
+  renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked);
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
     return;
@@ -555,6 +603,7 @@ $('loop-start').onclick = async () => {
         speedUp: $('world-speedup').checked,
         reroll: $('world-reroll').checked,
         pickFloaters: $('world-pick').checked,
+        pickEverySeconds: Number($('pick-every').value || 0),
       }),
     });
     refreshLoop();
@@ -570,6 +619,9 @@ $('loop-stop').onclick = async () => {
     $('loop-hint').textContent = error.message;
   }
 };
+
+// 勾选一变就把「上次 / 还差多久」重算一遍，不用等下一次 3 秒轮询。
+$('world-pick').onchange = refreshLoop;
 
 $('tasks-plan').onclick = async () => {
   $('tasks-hint').textContent = '检查中 ...';
@@ -640,6 +692,7 @@ $('world-run').onclick = () => {
     el('div', null, '会收成品、竣工、交居民订单、按缺口排产、把余料拿去升级建筑。'),
     el('div', null, '加速只花加速器（' + ($('world-speedup').checked ? '当前允许' : '当前不允许') + '），钻石与付费礼包永不购买。'),
     el('div', null, $('world-pick').checked ? '会顺带扫海面漂浮物（拾荒），捡完打印所得。' : '未勾「自动拾荒」，不会动海面漂浮物。'),
+    el('div', null, '拾荒的「时间间隔」只约束自动循环，手动执行不看间隔。'),
   ], async () => {
     $('world-hint').textContent = '执行中 ...';
     try {
