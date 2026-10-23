@@ -25,9 +25,46 @@ export const SPEED_UP_ITEM_TYPE = 2;
 // 原料自选包能换：鱼 / 塑料 / 木材 / 碎布 / 金属 / 玻璃 / 海藻；
 // 工事材料自选包能换：耐火砖 / 高温合金 / 炮弹 / 压电陶瓷 / 碳纤维 / 液态金属。
 export const AUTO_PACK_ALLOWLIST = ['原料自选包', '工事材料自选包'];
+// 工事材料在 ItemCfg 里的 type 是「加工品」（跟 158 种中间产物混在一起），认不出来，
+// 所以从「用哪个包能换到它」反查 —— SelectPackLibCfg 本来就是这张对应表。
+export const WORK_MATERIAL_PACK = '工事材料自选包';
 const STOCK_PARAM = '产品存量初始上限';
 const SLOTS_PARAM = '制造位上限';
 const POPULATION_PARAM = '初始人口上限';
+
+// 仓库材料清单：建造 / 升级 / 交订单 / 排产真正会消耗掉的那些东西，总览页单独列一栏。
+// 分类不硬编码，全部从配置读：
+//   原料、农产品、加工品 —— ItemCfg.type 就是这个分类（7 / 13 / 158 种）；
+//   工事材料           —— ItemCfg 里它们也是「加工品」，认不出来，改从 SelectPackLibCfg 的
+//                        「工事材料自选包」反查（这张表本来就是「用包能换到什么材料」）。
+// 缺表时对应分组为空，前端就不渲染它。
+//
+// `onlyOwned` = 这一组种类太多（工厂产品 158 种），全部列出来会把页面铺满，
+// 由调用方只保留仓库里数量 > 0 的。
+export function materialGroups(config) {
+  const ofType = (type) => rowsOf(config, 'ItemCfg')
+    .filter((row) => row?.type === type)
+    .map((row) => row.id);
+  const works = rowsOf(config, 'SelectPackLibCfg')
+    .filter((row) => row?.itemId === WORK_MATERIAL_PACK)
+    .map((row) => row.selectItemId);
+  const groups = [
+    { key: 'raw', name: '原料', items: ofType('原料') },
+    { key: 'works', name: '工事材料', items: works },
+    { key: 'farm', name: '农产品', items: ofType('农产品') },
+    // 工厂/生产线造出来的东西（生鱼片、罐头、铜锭、瓷砖…）。
+    // 扣除工事材料那 6 种，否则会在两组里重复出现。
+    {
+      key: 'made',
+      name: '工厂产品',
+      items: ofType('加工品').filter((id) => !works.includes(id)),
+      onlyOwned: true,
+    },
+  ];
+  return groups
+    .map((group) => ({ ...group, items: [...new Set(group.items.filter(Boolean))] }))
+    .filter((group) => group.items.length > 0);
+}
 
 // 客户端 Resource 枚举：1=EXP 3=GOLD 4=RUBY 5=ARENA_POINT 6=LEAGUE_POINT。
 // AllResourceResponse.list[].res 是数字，配置表的消耗项写的是名字，两边靠这张表对齐。
@@ -466,12 +503,15 @@ export function planWorld(survey, {
     const best = cand.sort((a, b2) => score(b2) - score(a))[0];
     for (const [id, n] of best.costItem ?? []) reserve(id, n);
     const need = demand.get(best.itemId) ?? 0;
+    // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」，
+    // 光有产品名看不出为什么它一直排这个（或者为什么别的配方排不上）。
+    const costText = (best.costItem ?? []).map(([id, n]) => `${id}×${n}`).join(' ');
     actions.push({
       kind: 'startProduce',
       request: 'StartFactoryProduceRequest',
       response: null,
       body: { buildingId: b.buildingId, productId: best.itemId },
-      label: `排产 ${b.buildingId} -> ${best.itemId}（${best.produceTime}s${need ? `，订单缺 ${need}` : ''}）`,
+      label: `排产 ${b.buildingId} -> ${best.itemId}（${best.produceTime}s${costText ? `，耗 ${costText}` : ''}${need ? `，订单缺 ${need}` : ''}）`,
     });
   }
 

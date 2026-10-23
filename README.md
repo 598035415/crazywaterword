@@ -150,6 +150,9 @@ node src/app.mjs <子命令> [参数]
   + `uint8 标志`（0 = 原始，非零 = LZ4）+ protobuf 载荷。
 - 协议定义来自客户端自带的 protobufjs **static module** 产物 —— 它没有任何反射元数据，
   字段号和字段名只能从生成的 `encode` / `decode` 函数体里读回来（`tools/describe.mjs`）。
+- 每一帧都写进 `data/protocol.log`：出站带 body（`LoginRequest` 除外，它的 body 里是 token/sign），
+  入站带解出来的 JSON。想查「这一轮到底排产了哪个产品」，就看
+  `-> [StartFactoryProduceRequest] seq=… {"buildingId":"1食品厂","productId":"烤鱼"}` 这一行。
 
 ### 账号与区服
 

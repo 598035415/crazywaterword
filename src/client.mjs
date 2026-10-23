@@ -12,6 +12,25 @@ export const HEARTBEAT_DEADLINE_MS = 604800000 + TICK_INTERVAL_MS;
 
 export const DEFAULT_GATEWAY = 'wss://dhyaoj-gate.khlgamen.com/ws';
 
+// 出站帧的 body 会被写进协议日志（data/protocol.log）与 CLI 的 send 行 ——
+// 这是事后查「这一轮到底排了什么产品」的唯一取证点。但 LoginRequest 的 body 里
+// 带着 openId / token / sign，属于凭证，**任何情况下都不许落盘或打到终端**。
+// 需要排除新帧时往这里加，不要在调用点各写一份判断。
+export const SECRET_FRAMES = new Set(['LoginRequest']);
+
+// 日志用的简短 JSON：截断到 n 字符，避免一条 OnWaterResponse 把日志刷爆。
+export function clipBody(body, n = 400) {
+  if (body === null || body === undefined) return '';
+  let text;
+  try {
+    text = typeof body === 'string' ? body : JSON.stringify(body);
+  } catch {
+    return '[unserializable]';
+  }
+  if (!text) return '';
+  return text.length > n ? `${text.slice(0, n)}…` : text;
+}
+
 export function nextSeqNo(seq) {
   return seq === MAX_SEQ ? 1 : seq + 1;
 }

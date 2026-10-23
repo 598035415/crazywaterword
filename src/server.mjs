@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { GameClient } from './client.mjs';
+import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
 import { loadProtocol } from './proto.mjs';
 import { PAGE } from './page.mjs';
 import { listWorlds, enterWorld, describeRole } from './worlds.mjs';
@@ -12,7 +12,7 @@ import { qrSvg } from './vendor/qrcode.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
 import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
-import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters } from './world.mjs';
+import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -101,7 +101,17 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
 
   function wire(session, instance) {
     instance.on('state', ({ state, detail }) => emit(session, 'state', STATE_TEXT[state] ?? state, detail ? { detail } : undefined));
-    instance.on('frame', ({ dir, name, seq, bytes }) => trace(session, `${dir === 'out' ? '->' : '<-'} [${name}] seq=${seq} ${bytes.byteLength}B`));
+    // 出站帧必须带上 body：这是事后查「这一轮到底排产了哪个产品」的唯一取证点
+    // （收包那条 line 105 只覆盖 <- 方向）。LoginRequest 带 token/sign，永远不写。
+    instance.on('frame', ({ dir, name, seq, bytes, body }) => {
+      const head = `${dir === 'out' ? '->' : '<-'} [${name}] seq=${seq} ${bytes.byteLength}B`;
+      if (dir === 'out' && body && !SECRET_FRAMES.has(name)) {
+        const text = clipBody(body);
+        trace(session, text ? `${head} ${text}` : head);
+        return;
+      }
+      trace(session, head);
+    });
     instance.on('message', ({ seq, name, body }) => trace(session, `[${name}] seq=${seq} ${JSON.stringify(body).slice(0, 400)}`));
     instance.on('pong', ({ latencyMs, offsetMs }) => trace(session, `pong ${latencyMs}ms offset=${offsetMs}ms`));
     instance.on('drop', ({ name, reason }) => emit(session, 'warn', `漏收了一条 ${name} 的应答（${reason}），本轮跳过`));
@@ -179,6 +189,24 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const config = loadConfigSafe();
     const view = summarize({ ok }, { config });
     const daily = view.daily;
+    // 仓库材料：从完整道具清单里按名字取数量（view.items.top 只留了前 12 个，不够用）。
+    // 工厂产品 158 种，只传仓库里真有的，并按数量降序 —— 这一栏是给人看的，不是图鉴。
+    const stock = new Map((Array.isArray(ok.AllItemRequest?.items) ? ok.AllItemRequest.items : [])
+      .map((item) => [item.itemId, item.num]));
+    const materials = materialGroups(config)
+      .map((group) => {
+        const owned = group.items.map((id) => ({ id, num: stock.get(id) ?? 0 }));
+        const kept = group.onlyOwned
+          ? owned.filter((item) => item.num > 0).sort((a, b) => b.num - a.num)
+          : owned;
+        return {
+          key: group.key,
+          name: group.name,
+          onlyOwned: group.onlyOwned === true,
+          items: kept.map((item) => ({ ...item, icon: itemIcon(item.id) })),
+        };
+      })
+      .filter((group) => group.items.length > 0);
     return {
       account: describeAccount(account, { active: account.id === loadStore().activeId }),
       status: accountStatus(session),
@@ -188,6 +216,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         ...view.items,
         top: view.items.top.map((item) => ({ itemId: item.itemId, num: item.num, icon: itemIcon(item.itemId) })),
       },
+      materials,
       claimable: {
         mainTask: view.mainTask ? 1 : 0,
         daily: daily?.claimable ?? 0,

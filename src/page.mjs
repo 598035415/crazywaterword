@@ -40,6 +40,9 @@ export const PAGE = `<!doctype html>
   .cell .txt { display: flex; flex-direction: column; line-height: 1.25; }
   .cell .nm { font-size: 12px; }
   .cell .qty { font-size: 11px; color: #7c8695; }
+  .cell.zero { opacity: .42; }
+  .mat-group { margin-bottom: 10px; }
+  .mat-group .gname { font-size: 11px; color: #7c8695; letter-spacing: .6px; margin-bottom: 4px; }
   .ico { display: inline-block; position: relative; overflow: hidden; flex: none; border-radius: 3px; background: #1d2129; }
   .ico .atlas { position: absolute; top: 0; left: 0; background-repeat: no-repeat; transform-origin: 0 0; }
   .ico .fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #7c8695; font-size: 11px; }
@@ -108,6 +111,7 @@ export const PAGE = `<!doctype html>
     </div>
     <pre id="loot-view">主线、成就、邮件、挂机收益，能领的都领一遍。不花钻石。</pre>
     <h2>资源</h2><div class="icons" id="res"><span class="dim">连接后显示</span></div>
+    <h2>仓库材料</h2><div id="materials"><span class="dim">连接后显示</span></div>
     <h2>库存</h2><div class="icons" id="items"><span class="dim">连接后显示</span></div>
     <h2>主力英雄</h2><div class="icons" id="hero-strip"><span class="dim">连接后显示</span></div>
     <h2>运行记录</h2>
@@ -487,6 +491,27 @@ function renderOverview(data) {
   const res = clear($('res'));
   for (const entry of data.resources || []) res.appendChild(cell(entry.icon, 34, entry.name || String(entry.res), fmt(entry.amount)));
   if (!res.childElementCount) res.appendChild(el('span', 'dim', '暂无数据'));
+
+  // 仓库材料：按「原料 / 工事材料 / 农产品」分组，数量 0 的也留着（只是变暗）——
+  // 缺什么正是这一栏要看的信息，藏起来就白做了。
+  const mats = clear($('materials'));
+  for (const group of data.materials || []) {
+    if (!group.items || !group.items.length) continue;
+    const wrap = el('div', 'mat-group');
+    const title = el('div', 'gname', group.name);
+    // 工厂产品有 158 种，只列仓库里真有的，标题上说明一下，免得以为漏了。
+    if (group.onlyOwned) title.appendChild(el('span', 'dim', '  只列仓库里有的'));
+    wrap.appendChild(title);
+    const row = el('div', 'icons');
+    for (const item of group.items) {
+      const node = cell(item.icon, 30, item.id, fmt(item.num));
+      if (!item.num) node.classList.add('zero');
+      row.appendChild(node);
+    }
+    wrap.appendChild(row);
+    mats.appendChild(wrap);
+  }
+  if (!mats.childElementCount) mats.appendChild(el('span', 'dim', '暂无数据'));
 
   const items = clear($('items'));
   for (const entry of (data.items && data.items.top) || []) items.appendChild(cell(entry.icon, 34, entry.itemId, 'x' + fmt(entry.num)));

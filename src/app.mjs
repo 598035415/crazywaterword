@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { GameClient } from './client.mjs';
+import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
 import { loadProtocol } from './proto.mjs';
 import { createConsole, openBrowser } from './server.mjs';
 import { loadStore, saveStore, pickAccount, removeAccount, setActive, describeAccount, revealAccount, ACCOUNTS_PATH, LEGACY_CREDENTIALS_PATH } from './accounts.mjs';
@@ -70,6 +70,13 @@ async function headless({ seconds = 60, probes = true }) {
 
   client.on('state', ({ state, detail }) => console.log(`state: ${state}${detail ? ` (${detail})` : ''}`));
   client.on('pong', ({ latencyMs, offsetMs }) => console.log(`pong: ${latencyMs}ms offset=${offsetMs}ms`));
+  // 发出去了什么也要看得见 —— 排产/交单这类请求的问题往往在 body 里（productId 选错、
+  // buildingId 认错建筑），只看 recv 无从判断。LoginRequest 带 token/sign，永远不打。
+  client.on('frame', ({ dir, name, seq, bytes, body }) => {
+    if (dir !== 'out' || !body || SECRET_FRAMES.has(name)) return;
+    const text = clipBody(body);
+    console.log(`send [${name}] seq=${seq} ${bytes.byteLength}B${text ? ` ${text}` : ''}`);
+  });
   client.on('message', ({ name, seq, body }) => {
     const text = JSON.stringify(body);
     console.log(`recv [${name}] seq=${seq} ${text.length > 600 ? `${text.slice(0, 600)}...` : text}`);

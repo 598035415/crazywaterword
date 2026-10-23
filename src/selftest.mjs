@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { loadProtocol } from './proto.mjs';
 import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
-import { GameClient } from './client.mjs';
+import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
 import { gateDue, humanDuration, formatLoopRound } from './loop.mjs';
 
 const require = createRequire(import.meta.url);
@@ -816,6 +816,43 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 仓库材料清单：总览页那一栏的内容。分类全部来自配置，不硬编码名字。
+{
+  const { materialGroups } = await import('./world.mjs');
+  const config = { tables: {
+    ItemCfg: { data: [
+      { id: '鱼', type: '原料' },
+      { id: '木材', type: '原料' },
+      { id: '鱼', type: '原料' }, // 重复项要合并
+      { id: '小麦', type: '农产品' },
+      { id: '玉米', type: '农产品' },
+      { id: '耐火砖', type: '加工品' },
+      { id: '液态金属', type: '加工品' },
+      { id: '生鱼片', type: '加工品' }, // 工厂产品
+      { id: '铜锭', type: '加工品' },   // 工厂产品
+    ] },
+    SelectPackLibCfg: { data: [
+      { itemId: '工事材料自选包', selectItemId: '耐火砖', num: 1 },
+      { itemId: '工事材料自选包', selectItemId: '液态金属', num: 1 },
+      { itemId: '原料自选包', selectItemId: '鱼', num: 1 }, // 原料靠 type 取，不靠包
+      { itemId: '橙装材料自选包', selectItemId: '橙武器材料', num: 1 }, // 别的包不许混进来
+    ] },
+  } };
+  const groups = materialGroups(config);
+  assert.deepEqual(groups.map((g) => g.key), ['raw', 'works', 'farm', 'made'],
+    '四组顺序固定：原料 / 工事材料 / 农产品 / 工厂产品');
+  assert.deepEqual(groups.map((g) => g.name), ['原料', '工事材料', '农产品', '工厂产品']);
+  assert.deepEqual(groups[0].items, ['鱼', '木材'], '原料按 ItemCfg.type 取，重复项要去重');
+  assert.deepEqual(groups[1].items, ['耐火砖', '液态金属'], '工事材料从「工事材料自选包」反查，别的包不混进来');
+  assert.deepEqual(groups[2].items, ['小麦', '玉米'], '农产品按 type 取');
+  assert.deepEqual(groups[3].items, ['生鱼片', '铜锭'],
+    '工厂产品 = 加工品扣掉工事材料（耐火砖/液态金属 已经在上一组，不能重复出现）');
+  assert.equal(groups[3].onlyOwned, true, '工厂产品 158 种太多，交给调用方只留仓库里有的');
+  assert.equal(groups[0].onlyOwned, undefined, '其余三组要全列（数量 0 也要显示，才知道缺什么）');
+  assert.deepEqual(materialGroups({ tables: {} }), [], '配置缺表时返回空数组，交给前端降级');
+  checked += 1;
+}
+
 // ★ 防回归：潜水 / 打捞**永远不许**被排进计划。
 //
 // 两者都不是「发个请求就完事」的玩法：DivingRequest.reward.asset 与
@@ -1316,4 +1353,20 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼）`);
+// 协议日志会记出站 body（查「这一轮排了什么」靠它），但 LoginRequest 的 body 里是
+// openId / token / sign。这组断言是防回归的锁：谁把 LoginRequest 从 SECRET_FRAMES 拿掉，
+// 凭证就会开始往 data/protocol.log 里写。
+{
+  assert.ok(SECRET_FRAMES.has('LoginRequest'), 'LoginRequest 必须留在 SECRET_FRAMES 里，否则 token/sign 会落盘');
+  assert.ok(!SECRET_FRAMES.has('StartFactoryProduceRequest'), '普通业务请求要能记录 body，否则查不出排产了什么');
+
+  assert.equal(clipBody({ buildingId: '1食品厂', productId: '烤鱼' }), '{"buildingId":"1食品厂","productId":"烤鱼"}');
+  assert.equal(clipBody({}), '{}');
+  assert.equal(clipBody(null), '');
+  const long = clipBody({ text: 'x'.repeat(1000) }, 20);
+  assert.equal(long.length, 21, `截断后应保留 20 字符 + 省略号，实际 ${long.length}`);
+  assert.ok(long.endsWith('…'));
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 日志脱敏）`);
