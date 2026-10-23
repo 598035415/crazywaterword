@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { CA_CRT, CA_CN, caFingerprint, initCa, installCa, isInstalled, uninstallCa } from './mitm-ca.mjs';
-import { isProxyOn, readCurrent, restore, setProxy } from './proxy-settings.mjs';
-import { createProxy, DEFAULT_PROXY_PORT } from './mitm-proxy.mjs';
+import { chainedUpstream, isProxyOn, readCurrent, restore, setProxy } from './proxy-settings.mjs';
+import { createProxy, DEFAULT_PROXY_PORT, probeUpstream } from './mitm-proxy.mjs';
 
 const PORT = DEFAULT_PROXY_PORT;
 const HOST = '127.0.0.1';
@@ -100,11 +100,20 @@ async function main() {
   setProxy(HOST, PORT);
   proxied = isProxyOn();
   if (!proxied) throw new Error('代理未能打开，中止');
-  console.log(`[2/3] 代理已打开 -> ${HOST}:${PORT}`);
+  const candidate = chainedUpstream(PORT);
+  const upstream = await probeUpstream(candidate);
+  if (upstream) {
+    console.log(`[2/3] 代理已打开 -> ${HOST}:${PORT}（非游戏流量级联到原代理 ${upstream.host}:${upstream.port}）`);
+  } else if (candidate) {
+    console.log(`[2/3] 代理已打开 -> ${HOST}:${PORT}（原代理 ${candidate.host}:${candidate.port} 没在监听，非游戏流量直连）`);
+  } else {
+    console.log(`[2/3] 代理已打开 -> ${HOST}:${PORT}（非游戏流量直连）`);
+  }
 
   fs.rmSync(OUT, { force: true });
   proxy = createProxy({
     port: PORT,
+    upstream,
     log: (kind, message) => console.log(`${new Date().toISOString()} [${kind}] ${message}`),
     onLogin: ({ url, body, rawFrameHex }) => {
       fs.writeFileSync(OUT, JSON.stringify({

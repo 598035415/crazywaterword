@@ -473,7 +473,8 @@ export async function runWorld(client, protocol, plan, {
 // --- 资源田 ------------------------------------------------------------------
 //
 // 「哪些 gridIdx 是田、是什么类型」不在协议里也不在 591 张配置表里，只在 CDN bundle world_map 的
-// JsonAsset 里。地图资源用 work/tmp/fetch-map.mjs 下到 work/cdn/，编码是 resType * 10000 + cityId。
+// JsonAsset 里。跑 node tools/fetch-map.mjs 会按 settings.json 的 bundleVers 定位并下到 work/cdn/，
+// 编码是 resType * 10000 + cityId。
 // 占田（ChallengeResFieldRequest）要求「该田所属城是我方城 + 有闲置且 durability > 0 的舰队」，
 // 账号没有舰队时这一步必然失败，所以本模块只做只读报告 + 显式手动占田/放弃，不做无人值守的自动占田。
 
@@ -527,7 +528,7 @@ export function formatFieldReport(survey, map) {
   if (map) {
     lines.push(`地图 ${path.basename(map.file)} ${map.width}x${map.height}，资源田 ${map.fieldCount} 块，城池 ${Object.keys(map.cityInfo ?? {}).length} 座`);
   } else {
-    lines.push(`没有本地地图资源（${mapPath(1)}），先跑 node work/tmp/fetch-map.mjs 才有 gridIdx → 城池/类型 的对照`);
+    lines.push(`没有本地地图资源（${mapPath(1)}），先跑 node tools/fetch-map.mjs 才有 gridIdx → 城池/类型 的对照`);
   }
   if (survey.fleets.length === 0) lines.push('没有舰队，占田的前置条件（闲置且耐久>0 的舰队）不满足，只能放弃已占的田');
   return lines.join('\n');

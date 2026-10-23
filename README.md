@@ -53,6 +53,24 @@ npm install
 
 ## 快速开始
 
+### 0. 补齐本地数据（首次必做）
+
+`work/` 与 `data/` 都在 `.gitignore` 里，克隆下来是空的。运行前要从**本机的微信小游戏缓存**
+和 CDN 重新生成这些数据：
+
+```bash
+node tools/sync-config.mjs    # 591 张配置表 -> work/cdn/config_cn_pack.json
+node tools/sync-art.mjs       # UI 图标索引 -> work/cdn/art/（缺图集页加 --fetch 从 CDN 补）
+node tools/fetch-map.mjs      # 世界地图 -> work/cdn/world_map.*.json
+```
+
+还有一项不能少：**协议表**。`src/proto.mjs` 直接读
+`work/extracted/_src_chunks_/src/chunks/game.js`，它只能由 `tools/wxapkg.mjs`
+从微信小程序包里解密 + 解包出来（包目录与完整命令见下方「数据来源」）。
+缺了它程序直接起不来（不是降级，是抛 `ENOENT`）。
+
+**前置条件**：电脑上**打开过一次《疯狂水世界》**，微信才会有本地小程序包与资源缓存。
+
 ### 1. 抓一份登录凭证
 
 游戏不会把凭证交给外部程序，只能由本机代理从真实会话里抓：
@@ -142,14 +160,31 @@ node src/app.mjs <子命令> [参数]
 
 ### 数据来源
 
+- **协议表**：客户端自带的 protobufjs static module，在微信小程序包的
+  `_src_chunks_` 分卷里（`src/chunks/game.js`）。`tools/wxapkg.mjs` 解密并解包后落到
+  `work/extracted/`，`src/proto.mjs` 从里面把 `encode` / `decode` 函数体读回字段号与字段名。
+  包目录形如 `%APPDATA%\Tencent\xwechat\radium\users\<id>\applet\packages\wx2ea52a972ea18e5e\<ver>\`：
+
+  ```bash
+  SRC="$APPDATA/Tencent/xwechat/radium/users/<id>/applet/packages/wx2ea52a972ea18e5e/<ver>"
+  for f in "$SRC"/*.wxapkg; do
+    n=$(basename "$f" .wxapkg)
+    node tools/wxapkg.mjs decrypt wx2ea52a972ea18e5e "$f" "work/wxapkg/$n.wxapkg"
+    node tools/wxapkg.mjs unpack "work/wxapkg/$n.wxapkg" "work/extracted/$n"
+  done
+  ```
+
 - **配置表**：客户端运行时从 CDN 拉独立 bundle `config_cn`（591 张表）。微信缓存里有副本，
   `tools/sync-config.mjs` 把它快照到 `work/cdn/`。游戏里的 itemId / heroId / buildingType
   本身就是中文字符串（`生鱼片`、`杰森`、`食品厂`）。
 - **素材**：Cocos 远程 bundle 里的 FairyGUI 图集。`tools/sync-art.mjs` 从微信缓存还原文件名并镜像，
   `src/fgui.mjs` 从 `FGUI` 二进制里解出「名字 → 图集矩形」，页面直接用 CSS `background-position`
   裁切，不需要任何图像处理依赖。
-- **地图**：资源田的 grid 数据只在客户端地图 bundle 里，`work/cdn/world_map.*.json`。
-- 这些都在 `.gitignore` 里，不进仓库；缺了程序会如实降级而不是编造。
+- **地图**：资源田的 grid 数据只在地图 bundle `world_map` 的 JsonAsset 里（协议和配置表都没有）。
+  `tools/fetch-map.mjs` 按 `work/extracted` 里 `settings.json` 的 `bundleVers` 定位、
+  解压 uuid 后下到 `work/cdn/world_map.*.json`；`--list` 只看远端清单不下载。
+- 这些都在 `.gitignore` 里，不进仓库。缺配置表/素材/地图时程序会如实降级而不是编造；
+  缺协议表则是硬失败（`ENOENT`）。
 
 ---
 
@@ -184,6 +219,7 @@ tools/
   proxy-settings.mjs       HKCU 代理读写与还原
   sync-config.mjs          镜像 config_cn
   sync-art.mjs             镜像 UI 贴图并建索引
+  fetch-map.mjs            下载 world_map 地图 JsonAsset
   describe.mjs             从 static module 里读回字段
   build-names.mjs          抠出内联的 id→名字枚举
   wxapkg.mjs               解密并解包 PC 微信小程序包

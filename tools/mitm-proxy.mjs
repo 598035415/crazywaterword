@@ -78,10 +78,56 @@ function makeFrameReader(onMessage) {
   };
 }
 
+// 判断 host 是否落在后缀白名单里（按域名边界匹配，避免 evilkhlgamen.com 被误判）。
+export function matchesHostSuffix(host, suffixes) {
+  const h = String(host).toLowerCase();
+  return suffixes.some((suffix) => {
+    const s = String(suffix).toLowerCase();
+    return Boolean(s) && (h === s || h.endsWith(`.${s}`));
+  });
+}
+
+// 启动时探一下上游代理到底通不通。不通就退回直连，别让用户的流量吊在死端口上。
+export function probeUpstream(upstream, timeoutMs = 700) {
+  if (!upstream) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const socket = net.connect(upstream.port, upstream.host);
+    let done = false;
+    const settle = (ok) => {
+      if (done) return;
+      done = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok ? upstream : null);
+    };
+    socket.setTimeout(timeoutMs, () => settle(false));
+    socket.once('connect', () => settle(true));
+    socket.once('error', () => settle(false));
+  });
+}
+
 // onLogin 收到 { url, name, body, rawFrameHex }，只会在本次运行里触发一次。
 // onFrame 可选，用来把下行帧也记下来（调试用）。
-export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log = () => {}, interceptPorts } = {}) {
+export function createProxy({
+  port = DEFAULT_PROXY_PORT,
+  onLogin,
+  onFrame,
+  log = () => {},
+  interceptPorts,
+  interceptHosts,
+  upstream = null,
+} = {}) {
   const intercept = new Set(interceptPorts ?? (process.env.CW_INTERCEPT_PORTS ?? '443').split(',').map((text) => Number(text.trim())));
+
+  // 只解密游戏自己的域名。默认 443 全解会把整台机器的 HTTPS 都接管过来：
+  // 任何一个域名签证书失败，用户那边的浏览器、微信、小程序就跟着一起废。
+  // 其余流量一律走隧道透传，跟没装代理一样。
+  const hostSuffixes = (interceptHosts ?? process.env.CW_INTERCEPT_HOSTS ?? 'khlgamen.com')
+    .split(',')
+    .map((text) => text.trim().toLowerCase())
+    .filter(Boolean);
+  const shouldIntercept = (host) => matchesHostSuffix(host, hostSuffixes);
+
   const tlsServers = new Map();
   const liveSockets = new Set();
   let captured = false;
@@ -124,7 +170,10 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
   function tlsServerFor(host, targetPort) {
     const key = `${host}:${targetPort}`;
     if (tlsServers.has(key)) return tlsServers.get(key);
-    const { cert, key: keyPem } = leafFor(host);
+    // leafFor 返回的 key 是**文件路径**，keyPem 才是私钥内容。
+    // 这里必须取 keyPem：早先写成 `key: keyPem` 把路径字符串当 PEM 内容传给了 createServer，
+    // 结果每个 HTTPS 连接都在这一步报 error:1E08010C:DECODER routines::unsupported。
+    const { cert, keyPem } = leafFor(host);
     const server = tls.createServer({ cert, key: keyPem }, (socket) => {
       socket._target = { host, port: targetPort };
       httpServer.emit('connection', socket);
@@ -134,6 +183,82 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
     return server;
   }
 
+  // 透传隧道。如果用户原本就挂着系统代理（Clash/v2ray 之类），现在被我们顶替了，
+  // 隧道优先级联回它 —— 否则原本能出去的境外流量会全部变成直连。
+  // 但上游随时可能没开（用户为了抓包把梯子关了，或者它本来就要手动启动），
+  // 所以连不上 / 明确拒绝时一定要**回退直连**，不能让整台机器的流量吊死在一个死端口上。
+  function openTunnel(host, targetPort, clientSocket, head) {
+    const dst = `${host}:${targetPort}`;
+
+    const bridge = (socket) => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length) socket.write(head);
+      clientSocket.pipe(socket);
+      socket.pipe(clientSocket);
+    };
+
+    const direct = () => {
+      const socket = net.connect(targetPort, host, () => bridge(socket));
+      socket.on('error', () => clientSocket.destroy());
+      clientSocket.on('close', () => socket.destroy());
+    };
+
+    if (!upstream) {
+      direct();
+      return;
+    }
+
+    const socket = net.connect(upstream.port, upstream.host, () => {
+      socket.write(`CONNECT ${dst} HTTP/1.1\r\nHost: ${dst}\r\n\r\n`);
+    });
+
+    let buffered = Buffer.alloc(0);
+    let settled = false;
+
+    const giveUp = (why) => {
+      if (settled) return;
+      settled = true;
+      socket.removeListener('data', onData);
+      socket.destroy();
+      log('tunnel', `上游代理 ${upstream.host}:${upstream.port} ${why}，${dst} 回退直连`);
+      direct();
+    };
+
+    function onData(chunk) {
+      buffered = Buffer.concat([buffered, chunk]);
+      const end = buffered.indexOf('\r\n\r\n');
+      if (end === -1) return;
+
+      const headText = buffered.subarray(0, end).toString('latin1');
+      const rest = buffered.subarray(end + 4);
+      if (!/^HTTP\/1\.[01] 2\d\d/.test(headText)) {
+        giveUp(`拒绝（${headText.split('\r\n')[0]}）`);
+        return;
+      }
+
+      settled = true;
+      socket.removeListener('data', onData);
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length) socket.write(head);
+      if (rest.length) clientSocket.write(rest);
+      clientSocket.pipe(socket);
+      socket.pipe(clientSocket);
+    }
+
+    socket.on('data', onData);
+    socket.on('error', () => {
+      if (!settled) giveUp('连不上');
+      else clientSocket.destroy();
+    });
+    socket.setTimeout(5000, () => {
+      if (!settled) giveUp('握手超时');
+    });
+    clientSocket.on('close', () => {
+      settled = true;
+      socket.destroy();
+    });
+  }
+
   function onConnect(req, clientSocket, head) {
     const [host, portText] = req.url.split(':');
     const targetPort = Number(portText || 443);
@@ -141,22 +266,26 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
     log('connect', key);
     clientSocket.on('error', () => {});
 
-    // 只解密我们要的端口，其它流量原样隧道转发，免得影响无关程序。
-    if (!intercept.has(targetPort)) {
-      const upstream = net.connect(targetPort, host, () => {
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head && head.length) upstream.write(head);
-        clientSocket.pipe(upstream);
-        upstream.pipe(clientSocket);
-      });
-      upstream.on('error', () => clientSocket.destroy());
-      clientSocket.on('close', () => upstream.destroy());
+    // 端口不在名单里、或者域名不是游戏的，一律隧道透传，免得影响无关程序。
+    if (!intercept.has(targetPort) || !shouldIntercept(host)) {
+      openTunnel(host, targetPort, clientSocket, head);
+      return;
+    }
+
+    // 先把叶证书签出来再回 200：签不出来（openssl 找不到、目录不可写）时，
+    // 一个连接失败不该让整个挂机进程陪葬，回个 502 让它重连，代理继续服务别的请求。
+    let tlsServer;
+    try {
+      tlsServer = tlsServerFor(host, targetPort);
+    } catch (error) {
+      log('error', `${key} 签发叶证书失败，本连接已放弃: ${error.message}`);
+      clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
       return;
     }
 
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     if (head && head.length) clientSocket.unshift(head);
-    tlsServerFor(host, targetPort).emit('connection', clientSocket);
+    tlsServer.emit('connection', clientSocket);
   }
 
   function onRequest(req, res) {
@@ -176,7 +305,8 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
     const transport = secure ? https : http;
     log('http', `${req.method} ${secure ? 'https' : 'http'}://${target.host}:${target.port}${requestPath}`);
 
-    const upstream = transport.request({
+    // 注意：这里别用 upstream 当变量名，会把 createProxy 的 upstream（级联代理）参数遮蔽掉。
+    const proxyReq = transport.request({
       host: target.host,
       port: target.port,
       path: requestPath,
@@ -188,12 +318,12 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
       res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
       upstreamRes.pipe(res);
     });
-    upstream.on('error', (error) => {
+    proxyReq.on('error', (error) => {
       log('http', `上游出错: ${error.message}`);
       if (!res.headersSent) res.writeHead(502);
       res.end();
     });
-    req.pipe(upstream);
+    req.pipe(proxyReq);
   }
 
   function onUpgrade(req, clientSocket, head) {
@@ -208,7 +338,8 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
     const context = `${scheme}://${target.host}:${target.port}${req.url}`;
     log('upgrade', context);
 
-    const upstream = transport.request({
+    // 同上：不要遮蔽外层的 upstream 参数。
+    const proxyReq = transport.request({
       host: target.host,
       port: target.port,
       path: req.url,
@@ -217,7 +348,7 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
       servername: target.host,
       rejectUnauthorized: false,
     });
-    upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    proxyReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
       const headers = Object.entries(upstreamRes.headers)
         .map(([k, v]) => `${k}: ${v}`)
         .join('\r\n');
@@ -235,11 +366,11 @@ export function createProxy({ port = DEFAULT_PROXY_PORT, onLogin, onFrame, log =
       clientSocket.pipe(upstreamSocket);
       upstreamSocket.pipe(clientSocket);
     });
-    upstream.on('error', (error) => {
+    proxyReq.on('error', (error) => {
       log('upgrade', `上游出错: ${error.message}`);
       clientSocket.destroy();
     });
-    upstream.end();
+    proxyReq.end();
   }
 
   return {

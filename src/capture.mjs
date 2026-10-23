@@ -6,8 +6,8 @@
 //   2. 系统改动全部记在 module 级的 state 里，stop() 幂等，进程退出钩子会把没回滚的补上。
 // 安全边界不变：只改当前用户（certutil -user 与 HKCU），只绑 127.0.0.1，随时可完整回滚。
 import { initCa, installCa, isInstalled, uninstallCa, CA_CN, CA_CRT, caFingerprint } from '../tools/mitm-ca.mjs';
-import { isProxyOn, readCurrent, restore, setProxy } from '../tools/proxy-settings.mjs';
-import { createProxy, DEFAULT_PROXY_PORT } from '../tools/mitm-proxy.mjs';
+import { chainedUpstream, isProxyOn, readCurrent, restore, setProxy } from '../tools/proxy-settings.mjs';
+import { createProxy, DEFAULT_PROXY_PORT, probeUpstream } from '../tools/mitm-proxy.mjs';
 
 const state = {
   running: false,
@@ -109,16 +109,36 @@ export async function startCapture({ onLogin, onLog, port = DEFAULT_PROXY_PORT, 
     note(`本地 CA 已装进当前用户根存储（${caFingerprint()}）`);
 
     state.phase = 'proxy';
+    // 必须在 setProxy 之前读：state.proxy 存的是「用户自己的原始代理」，
+    // stopCapture 里还原后要拿它逐项比对，读到新值就永远对不上。
+    const before = readCurrent();
     setProxy('127.0.0.1', port);
     if (!isProxyOn()) throw new Error('系统代理未能打开');
-    state.proxy = readCurrent();
-    note(`系统代理已指向 127.0.0.1:${port}`);
+    state.proxy = before;
+
+    const candidate = chainedUpstream(port);
+    const upstream = await probeUpstream(candidate);
+    if (upstream) {
+      note(`系统代理已指向 127.0.0.1:${port}，非游戏流量级联到原代理 ${upstream.host}:${upstream.port}`);
+    } else if (candidate) {
+      note(`系统代理已指向 127.0.0.1:${port}；原代理 ${candidate.host}:${candidate.port} 没在监听，非游戏流量改为直连`);
+    } else {
+      note(`系统代理已指向 127.0.0.1:${port}，非游戏流量直连`);
+    }
 
     state.phase = 'listening';
     proxy = createProxy({
       port,
+      upstream,
       log: (kind, message) => {
-        if (kind === 'upgrade' || kind === 'capture') note(message);
+        // 排查抓包问题全靠这里：连了什么域名、走了隧道还是 MITM、上游报什么错。
+        // 只记 upgrade 的话，一旦请求根本没走到 upgrade，日志就是空的，什么都看不出来。
+        // http / ws 两类太吵（每个请求/每帧一条），只在命中 LoginRequest 时留痕。
+        if (kind === 'http' || kind === 'ws') {
+          if (/LoginRequest/.test(message)) note(message);
+          return;
+        }
+        note(`[${kind}] ${message}`);
       },
       onLogin: async (record) => {
         state.capturedAt = new Date().toISOString();
