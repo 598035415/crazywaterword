@@ -236,7 +236,8 @@ docs/
 这些边界是**有意保留**的，不是还没做：
 
 - 写操作一律要 `--yes` / `CW_ALLOW_MUTATE=1` / 网页 `confirm: true`，且在连网关**之前**就检查。
-- **不花钻石**。加速只花「加速器」道具（`SpeedUpCostParam.type` 恒为 2；1 = 钻石、3 = 广告都不使用）。
+- **不花钻石**。加速只花「加速器」道具（`SpeedUpCostParam.type` 恒为 2；1 = 钻石、3 = 广告都不使用）；
+  而且**默认关闭** —— 网页要勾「允许花加速器」、CLI 要加 `--speed-up` 才会用。
   点金与折扣店默认跳过，要勾 `--paid` 才做。
 - **不买任何付费礼包**（含 12 元那个「自动生产」礼包）。
 - 建造/升级/交订单材料不齐时，客户端会弹「用钻石补」——本工具**永远不用钻石**，改为：
@@ -251,7 +252,12 @@ docs/
   **永远不会被自动消耗** —— 白名单是 `world.mjs` 的 `AUTO_PACK_ALLOWLIST`，
   `planWorld({ allowPacks })` 还能进一步收窄。
 - **拾荒网页默认勾选**（CLI 需显式 `--pick`，与 `--speed-up` 同一套约定）。它只捡海面漂浮物，不消耗任何资源；
-  每轮最多 50 件，捡完按 `PickUpFloaterResponse.reward` 汇总成一行「拾荒 N 件：木材×5 淡水×1」。
+  `PickUpFloaterRequest.floaterId` 是 **repeated string**，所以一轮最多 50 件会打成**一个请求**提交
+  （传单个字符串会被 protobufjs 按字符拆成 N 个单字 id，服务端回 `invalid floater id`），
+  捡完按 `PickUpFloaterResponse.reward` 汇总，**件数按提交的 `floaterId` 个数算**（不是按请求数 ——
+  一个请求能装 50 件）；藏品碎片会抹掉编号按品质合并成「藏品蓝碎片×8」，其余超过 12 种折叠成「等 N 种」。
+- 循环每轮除了汇总数字，还会按动作类型列出**成功明细**、逐条列出失败原因、按原因聚合跳过数，
+  例如「成功 收成品×6  排产×6  加速生产×5 / 失败 加速生产 1服装厂：invalid speed-up count」。
 - 默认**不拒单**（`--reroll` 才开，且跟客户端一样拒绝重刷）。
 - **不使用** `LoginRequest` 的 `testAccount` / `superToken` —— 那是绕过鉴权的开发者后门。
 - 抓包的系统改动只在**当前用户**范围内（`certutil -user`、HKCU），必须在网页上显式点确认，

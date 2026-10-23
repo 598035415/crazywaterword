@@ -733,22 +733,56 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(capped.notes.some((note) => note.includes('额度用完')), '超出上限的部分要说明');
 
   const results = [
-    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [{ id: '木材', num: 3 }, { id: '淡水', num: 1 }] } } },
-    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [{ id: '木材', num: { low: 2, high: 0, unsigned: false } }] } } },
-    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [] } } },
-    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [] }, deniedFloaterIds: ['x'] } },
-    { step: { kind: 'pickUpFloater' }, ok: false, error: '被拒' },
-    { step: { kind: 'gainFactory' }, ok: true, body: { reward: { asset: [{ id: '不该计入', num: 99 }] } } },
+    // 一次提交 3 件，全成功
+    { step: { kind: 'pickUpFloater', body: { floaterId: ['a', 'b', 'c'] } }, ok: true,
+      body: { reward: { asset: [{ id: '木材', num: 3 }, { id: '淡水', num: 1 }] } } },
+    // 一次提交 2 件，其中 1 件被服务端拒绝（木材用没转换的 {low,high} 形状）
+    { step: { kind: 'pickUpFloater', body: { floaterId: ['d', 'e'] } }, ok: true,
+      body: { reward: { asset: [{ id: '木材', num: { low: 2, high: 0, unsigned: false } }] }, deniedFloaterIds: ['e'] } },
+    // 一次提交 1 件，整个请求失败
+    { step: { kind: 'pickUpFloater', body: { floaterId: ['f'] } }, ok: false, error: '被拒' },
+    // 别的动作，绝不能被算进拾荒所得
+    { step: { kind: 'gainFactory', body: {} }, ok: true, body: { reward: { asset: [{ id: '不该计入', num: 99 }] } } },
   ];
   const loot = summarizeFloaters(results);
-  assert.equal(loot.picked, 2, '两件有回报');
-  assert.equal(loot.empty, 2, '两件捡到但没回报');
-  assert.equal(loot.failed, 1, '一件失败');
-  assert.equal(loot.denied, 1, '一件被服务端标成 denied');
+  assert.equal(loot.submitted, 5, '成功的请求一共提交了 5 件');
+  assert.equal(loot.denied, 1, '服务端拒了其中 1 件');
+  assert.equal(loot.picked, 4, '实际到手 4 件 = 提交 5 - 被拒 1');
+  // 这条是用户实际踩到的坑：件数按「请求数」算的话，一个请求装 50 件会被显示成「拾荒 1 件」。
+  assert.notEqual(loot.picked, 2, '件数要按 floaterId 的个数算，不是按请求条数算');
+  assert.equal(loot.failed, 1, '失败的请求涉及 1 件');
+  assert.equal(loot.total, 6, '提交 5 件 + 失败 1 件');
   assert.deepEqual(loot.items, [{ id: '木材', num: 5 }, { id: '淡水', num: 1 }],
     '同物品累加，且不把别的动作算进拾荒所得');
-  assert.ok(formatFloaters(loot).includes('木材×5'), '汇总行要能直接读');
+  assert.ok(formatFloaters(loot).includes('拾荒 6 件'), '汇总行要能直接读');
   assert.equal(formatFloaters(summarizeFloaters([])), '', '没拾荒就别打印空行');
+
+  // 一次拾荒能出几十种碎片，整行铺出来没法读，超过 12 种要折叠。
+  const many = summarizeFloaters([{
+    step: { kind: 'pickUpFloater', body: { floaterId: Array.from({ length: 20 }, (_, i) => `x${i}`) } },
+    ok: true,
+    body: { reward: { asset: Array.from({ length: 20 }, (_, i) => ({ id: `物${i}`, num: 1 })) } },
+  }]);
+  assert.ok(formatFloaters(many).includes('等 20 种'), '物品太多要折叠成「等 N 种」');
+
+  // 藏品碎片按品质合并：奖励里是「藏品蓝10碎片 / 藏品蓝11碎片 / 藏品紫2碎片」这种按编号分的，
+  // 不合并的话一次拾荒能铺出几十条，完全没法读。
+  const frag = summarizeFloaters([{
+    step: { kind: 'pickUpFloater', body: { floaterId: ['a', 'b', 'c', 'd'] } },
+    ok: true,
+    body: { reward: { asset: [
+      { id: '藏品蓝10碎片', num: 1 },
+      { id: '藏品蓝11碎片', num: 1 },
+      { id: '藏品紫2碎片', num: 1 },
+      { id: '木材', num: 3 },
+    ] } },
+  }]);
+  assert.deepEqual(frag.items, [
+    { id: '木材', num: 3 },
+    { id: '藏品蓝碎片', num: 2 },
+    { id: '藏品紫碎片', num: 1 },
+  ], '藏品碎片要抹掉编号、按品质合并');
+  assert.ok(formatFloaters(frag).includes('藏品蓝碎片×2'), '合并结果要出现在汇总行里');
   checked += 1;
 }
 

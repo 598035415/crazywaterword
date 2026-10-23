@@ -119,8 +119,9 @@ export const PAGE = `<!doctype html>
       <span class="k">自动循环</span>
       <label class="dim">轮数 <input id="loop-rounds" value="0" style="width:56px"></label>
       <label class="dim">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
-      <label class="dim"><input type="checkbox" id="world-speedup" checked> 允许花加速器</label>
+      <label class="dim"><input type="checkbox" id="world-speedup"> 允许花加速器</label>
       <label class="dim"><input type="checkbox" id="world-reroll"> 拒绝重刷订单</label>
+      <label class="dim"><input type="checkbox" id="world-pick" checked> 自动拾荒</label>
       <button id="loop-start" class="primary">开始挂机</button>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
@@ -553,6 +554,7 @@ $('loop-start').onclick = async () => {
         everySeconds: Number($('loop-every').value || 60),
         speedUp: $('world-speedup').checked,
         reroll: $('world-reroll').checked,
+        pickFloaters: $('world-pick').checked,
       }),
     });
     refreshLoop();
@@ -626,7 +628,8 @@ function renderWorld(data) {
 $('world-plan').onclick = async () => {
   $('world-hint').textContent = '探测中 ...';
   try {
-    renderWorld(await call('/api/world'));
+    // 计划要跟着勾选状态走，否则「探测计划」比「执行一轮」少几行，看着像 bug。
+    renderWorld(await call('/api/world?pick=' + ($('world-pick').checked ? '1' : '0')));
     $('world-hint').textContent = '';
   } catch (error) {
     $('world-hint').textContent = error.message;
@@ -636,12 +639,20 @@ $('world-run').onclick = () => {
   openConfirm('执行一轮海面自动化', [
     el('div', null, '会收成品、竣工、交居民订单、按缺口排产、把余料拿去升级建筑。'),
     el('div', null, '加速只花加速器（' + ($('world-speedup').checked ? '当前允许' : '当前不允许') + '），钻石与付费礼包永不购买。'),
+    el('div', null, $('world-pick').checked ? '会顺带扫海面漂浮物（拾荒），捡完打印所得。' : '未勾「自动拾荒」，不会动海面漂浮物。'),
   ], async () => {
     $('world-hint').textContent = '执行中 ...';
     try {
-      const body = { confirm: true, speedUp: $('world-speedup').checked, reroll: $('world-reroll').checked };
+      const body = {
+        confirm: true,
+        speedUp: $('world-speedup').checked,
+        reroll: $('world-reroll').checked,
+        pickFloaters: $('world-pick').checked,
+      };
       const data = await call('/api/world/run', { method: 'POST', body: JSON.stringify(body) });
-      $('world-hint').textContent = '执行 ' + data.results.length + ' 个动作，失败 ' + data.results.filter((r) => r.ok === false).length;
+      const failed = data.results.filter((r) => r.ok === false).length;
+      $('world-hint').textContent = '执行 ' + data.results.length + ' 个动作，失败 ' + failed
+        + (data.floaterText ? ' ｜ ' + data.floaterText : '');
       renderWorld(data);
     } catch (error) {
       $('world-hint').textContent = error.message;

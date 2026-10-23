@@ -512,7 +512,7 @@ export function planWorld(survey, {
       if (!Number.isFinite(finishTime) || finishTime <= now || left <= 0) continue;
       const minutes = Math.ceil((finishTime - now) / 60);
       if (!Number.isFinite(minutes) || minutes <= 0) continue;
-      const useNum = NaN;
+      const useNum = Math.max(1, Math.min(minutes, left));
       if (!Number.isFinite(useNum) || useNum <= 0) continue;
       left -= useNum;
       actions.push({
@@ -606,43 +606,66 @@ function assetCount(num) {
   return Number(num ?? 0) || 0;
 }
 
+// 藏品碎片在奖励里是按编号分开的（藏品蓝10碎片、藏品蓝11碎片、藏品紫2碎片…），
+// 一次拾荒能出几十条，单独列出来完全没法读。汇总时把编号抹掉，合并成「藏品蓝碎片 ×8」。
+// 「藏品蓝碎片」本身没有数字，不会被这条规则误伤。
+function lootKey(id) {
+  const hit = /^(藏品\D+?)\d+碎片$/.exec(String(id ?? ''));
+  return hit ? `${hit[1]}碎片` : id;
+}
+
 export function summarizeFloaters(results) {
   const loot = new Map();
-  let picked = 0;
-  let empty = 0;
-  let failed = 0;
+  let submitted = 0;
   let denied = 0;
+  let failed = 0;
   for (const entry of results ?? []) {
     if (entry?.step?.kind !== 'pickUpFloater') continue;
     if (entry.skipped) continue;
+    // 件数看提交的 floaterId 有多少个 —— 一个请求可能装了 50 件，
+    // 按「请求数」计会显示成「拾荒 1 件」，跟实际差了两个数量级。
+    const ids = entry.step?.body?.floaterId ?? [];
+    const count = Array.isArray(ids) ? ids.length : 0;
     if (!entry.ok) {
-      failed += 1;
+      failed += count;
       continue;
     }
-    const asset = entry.body?.reward?.asset ?? [];
-    if (asset.length) picked += 1;
-    else empty += 1;
-    for (const a of asset) {
+    submitted += count;
+    for (const a of entry.body?.reward?.asset ?? []) {
       if (!a?.id) continue;
       const n = assetCount(a.num);
-      if (n > 0) loot.set(a.id, (loot.get(a.id) ?? 0) + n);
+      const key = lootKey(a.id);
+      if (n > 0) loot.set(key, (loot.get(key) ?? 0) + n);
     }
     denied += (entry.body?.deniedFloaterIds ?? []).length;
   }
   const items = [...loot.entries()]
     .map(([id, num]) => ({ id, num }))
     .sort((a, b) => b.num - a.num || a.id.localeCompare(b.id));
-  return { picked, empty, failed, denied, items, total: picked + empty + failed + denied };
+  return {
+    submitted,
+    picked: Math.max(0, submitted - denied),
+    denied,
+    failed,
+    items,
+    total: submitted + failed,
+  };
 }
+
+// 一次拾荒能出 30 种碎片，整行铺出来没法读，超过 12 种就折叠。
+const LOOT_SHOW = 12;
 
 export function formatFloaters(summary) {
   if (!summary || summary.total === 0) return '';
-  const parts = [`拾荒 ${summary.picked + summary.empty} 件`];
-  if (summary.failed) parts.push(`${summary.failed} 件失败`);
-  if (summary.denied) parts.push(`${summary.denied} 件被拒`);
-  const head = parts.join('，');
+  const extras = [];
+  if (summary.denied) extras.push(`被拒 ${summary.denied}`);
+  if (summary.failed) extras.push(`失败 ${summary.failed}`);
+  const head = `拾荒 ${summary.submitted + summary.failed} 件`
+    + (extras.length ? `（${extras.join('，')}）` : '');
   if (!summary.items.length) return `${head}（没有回报）`;
-  return `${head}：${summary.items.map((x) => `${x.id}×${x.num}`).join('  ')}`;
+  const shown = summary.items.slice(0, LOOT_SHOW).map((x) => `${x.id}×${x.num}`).join('  ');
+  const more = summary.items.length > LOOT_SHOW ? `  等 ${summary.items.length} 种` : '';
+  return `${head}：${shown}${more}`;
 }
 
 // --- 资源田 ------------------------------------------------------------------
