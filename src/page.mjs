@@ -81,6 +81,28 @@ export const PAGE = `<!doctype html>
   #modal .body code { background: #101317; padding: 1px 4px; border-radius: 3px; }
   #modal .ack { display: block; margin: 12px 0; }
   #modal .foot { display: flex; gap: 10px; align-items: center; }
+  .fac { border: 1px solid #262a31; border-radius: 6px; background: #191c21; padding: 10px 12px; margin-bottom: 10px; }
+  .fac .head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .fac .name { font-size: 14px; }
+  .fac .meta { color: #7c8695; font-size: 12px; }
+  .fac .cols { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; align-items: flex-start; }
+  .fac .col { min-width: 260px; flex: 1 1 300px; }
+  .fac .col-title { font-size: 11px; color: #7c8695; letter-spacing: .6px; margin-bottom: 5px; }
+  .job { display: flex; align-items: center; gap: 8px; border: 1px solid #262a31; border-radius: 5px; background: #12151a; padding: 4px 8px; margin-bottom: 4px; }
+  .job .naming { min-width: 92px; font-size: 12px; }
+  .job .left { font-variant-numeric: tabular-nums; font-size: 12px; color: #8fb8f0; min-width: 62px; text-align: right; }
+  .job .pbar { flex: 1; height: 4px; min-width: 36px; border-radius: 2px; background: #262a31; overflow: hidden; }
+  .job .pbar i { display: block; height: 100%; background: #4f8a5c; }
+  .recipes { display: flex; flex-wrap: wrap; gap: 6px; }
+  .recipe { display: flex; align-items: center; gap: 6px; border: 1px solid #262a31; border-radius: 5px; background: #12151a; padding: 4px 8px 4px 4px; cursor: pointer; }
+  .recipe:hover { border-color: #4a5364; }
+  .recipe.on { border-color: #3f6b4a; background: #1d2a1f; }
+  .recipe.locked { opacity: .38; cursor: not-allowed; }
+  .recipe.lack { opacity: .6; }
+  .recipe .nm { font-size: 12px; display: block; line-height: 1.3; }
+  .recipe .sub { font-size: 11px; color: #7c8695; display: block; line-height: 1.3; }
+  .recipe .sub .miss { color: #f08a8a; }
+  .pick { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #262a31; }
 </style>
 </head>
 <body>
@@ -99,6 +121,7 @@ export const PAGE = `<!doctype html>
     <button data-tab="heroes">英雄</button>
     <button data-tab="dailies">日常</button>
     <button data-tab="account">账号</button>
+    <button data-tab="factory">工厂</button>
   </nav>
 </header>
 <main>
@@ -211,6 +234,22 @@ export const PAGE = `<!doctype html>
       <span id="cap-hint" class="warn"></span>
     </div>
     <div id="cap-box"></div>
+  </section>
+
+  <section id="tab-factory" class="hidden">
+    <div class="bar">
+      <button id="factory-refresh" class="primary">刷新工厂</button>
+      <button id="factory-gain" disabled>一键收成</button>
+      <label class="dim"><input type="checkbox" id="factory-auto" checked> 停在这个页面时每 5 秒自动刷新</label>
+      <span id="factory-hint" class="warn"></span>
+      <span id="factory-summary" class="dim"></span>
+    </div>
+    <pre id="factory-view">队列的倒计时是服务端给的完成时间，本地每秒自己走，不额外发请求。
+制造：点一下配方选中，再点「制造」就直接排产（不二次确认）。
+配方上的「满」= 这个产品的持有量（仓库 + 工厂待收/在造）到上限了；「缺料」= 配方材料不够。造不了时点「制造」不会发请求，而是把卡在哪写在上面那行（红字）。
+一键收成：把每座工厂囤积的成品一次收完（逐座发 GainFactoryProduceRequest，收益按产品名合并显示）。
+非工厂建筑（民居、指标楼）的产物不在这里收，那些走「挂机 → 执行一轮」。</pre>
+    <div id="factory-list"><span class="dim">还没读。点「刷新工厂」，或先在右上角「连接」。</span></div>
   </section>
 </main>
 
@@ -845,6 +884,266 @@ $('dailies-run').onclick = () => {
   });
 };
 
+// ---- 工厂 ------------------------------------------------------------------
+// 倒计时用服务端给的 finishAt（Unix 秒）在本地每秒重算，不靠轮询；
+// 只有「能造什么、材料够不够」这类会变的状态才重新问服务端。
+const facState = { data: null, picked: new Map(), ticks: [], loading: false };
+
+// 提示行分三色：成功绿 / 进行中黄 / 出错红。
+// 全塞同一个颜色的话，「已排产」和「造不了」看起来一模一样，等于没提醒。
+function factoryHint(text, kind) {
+  const node = $('factory-hint');
+  node.textContent = text || '';
+  node.className = kind === 'bad' ? 'bad' : kind === 'ok' ? 'ok' : 'warn';
+}
+
+function countdown(seconds) {
+  const total = Math.max(0, Math.ceil(Number(seconds) || 0));
+  if (total <= 0) return '可收取';
+  const pad = (n) => (n < 10 ? '0' + n : String(n));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  return (h > 0 ? h + ':' + pad(m) : pad(m)) + ':' + pad(total % 60);
+}
+
+function tickFactories() {
+  if (!facState.ticks.length) return;
+  const now = Math.floor(Date.now() / 1000);
+  for (const tick of facState.ticks) {
+    // 队首之外的都是「排队中」：游戏里制造位是串行的，只有正在做的那一项有完成时间。
+    if (tick.pending) {
+      tick.node.textContent = '排队中';
+      tick.fill.style.width = '0%';
+      continue;
+    }
+    const left = Math.max(0, tick.finishAt - now);
+    tick.node.textContent = countdown(left);
+    // 进度按配方时长算；没有 produceTime（表里查不到这条配方）就只显示倒计时，不画进度。
+    const pct = tick.total > 0 ? Math.min(100, Math.max(0, ((tick.total - left) / tick.total) * 100)) : (left > 0 ? 0 : 100);
+    tick.fill.style.width = pct.toFixed(1) + '%';
+  }
+}
+setInterval(tickFactories, 1000);
+
+function recipeTitle(recipe) {
+  const parts = ['生产 ' + dur(recipe.produceTime)];
+  if (recipe.costs.length) {
+    parts.push('消耗 ' + recipe.costs.map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num + (c.enough ? '' : '（不够）')).join('，'));
+  }
+  if (!recipe.unlocked) parts.push('要 lv' + recipe.unlockLevel + ' 才解锁');
+  if (recipe.limitType) parts.push('限时活动：' + recipe.limitType);
+  if (recipe.atCap) parts.push('持有 ' + fmt(recipe.held) + ' 个，到上限了（仓库 ' + fmt(recipe.inStock) + ' + 待收/在造 ' + fmt(recipe.inFactory) + '）');
+  if (recipe.queuedCount) parts.push('队列里已有 ' + recipe.queuedCount + ' 个（可以继续排）');
+  return parts.join(' ｜ ');
+}
+
+// 造不了时把「卡在哪、怎么解决」说成一句人话 —— 服务端只会回一句 storage full。
+function blockReason(factory, recipe) {
+  const cap = facState.data ? facState.data.stockCap : 0;
+  const slots = facState.data ? facState.data.slots : 0;
+  const parts = [];
+  if (!recipe.unlocked) parts.push('要 ' + factory.buildingId + ' 升到 lv' + recipe.unlockLevel + ' 才解锁');
+  if (recipe.atCap) {
+    const advice = recipe.capKind === 'stock'
+      ? '仓库里这批已经堆到上限了，先把它消耗掉（交订单 / 建造）再来造'
+      : '先点「一键收成」把工厂里囤的收走再来造';
+    parts.push('持有量到上限了（仓库 ' + fmt(recipe.inStock) + ' + 工厂待收/在造 ' + fmt(recipe.inFactory)
+      + ' = ' + fmt(recipe.held) + '，上限 ' + (cap || '?') + '）：' + advice);
+  }
+  if (!recipe.enough) {
+    const lack = recipe.costs.filter((c) => !c.enough).map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num);
+    parts.push('材料不够：' + lack.join('、'));
+  }
+  if (factory.full) parts.push('制造位满了 ' + factory.queue.length + '/' + (slots || '?') + '，等它做完或收掉');
+  return '造不了 ' + recipe.itemId + '：' + parts.join('；');
+}
+
+function factoryCard(factory, data) {
+  const card = el('div', 'fac');
+  const head = el('div', 'head');
+  head.appendChild(iconEl(factory.icon, 34, factory.type));
+  head.appendChild(el('span', 'name', factory.buildingId));
+  head.appendChild(el('span', 'meta', (factory.type || '类型未知') + ' · lv' + factory.level));
+  head.appendChild(chip(factory.full ? 'blocked' : 'ready', '制造位 ' + factory.queue.length + '/' + data.slots));
+  if (factory.finishedTotal) head.appendChild(chip('done', '待收 ' + factory.finishedTotal));
+  if (factory.autoProductId) head.appendChild(chip('waiting', '自动生产 ' + factory.autoProductId));
+  card.appendChild(head);
+
+  const cols = el('div', 'cols');
+
+  // 左：正在制造 + 待收成品
+  const qcol = el('div', 'col');
+  qcol.appendChild(el('div', 'col-title', '正在制造'));
+  if (!factory.queue.length) {
+    qcol.appendChild(el('div', 'dim', factory.autoProductId ? '队列空着，自动生产会补上' : '空闲中'));
+  }
+  for (const job of factory.queue) {
+    const row = el('div', 'job');
+    row.appendChild(iconEl(job.icon, 24, job.productId));
+    row.appendChild(el('span', 'naming', job.productId));
+    const bar = el('span', 'pbar');
+    const fill = el('i');
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    const left = el('span', 'left', job.pending ? '排队中' : countdown(job.remain));
+    row.appendChild(left);
+    qcol.appendChild(row);
+    facState.ticks.push({ node: left, fill, finishAt: job.finishAt, total: job.produceTime, pending: job.pending });
+  }
+  if (factory.finished.length) {
+    qcol.appendChild(el('div', 'col-title', '待收成品'));
+    const done = el('div', 'icons');
+    for (const asset of factory.finished) done.appendChild(cell(asset.icon, 24, asset.id, '×' + fmt(asset.num)));
+    qcol.appendChild(done);
+  }
+  cols.appendChild(qcol);
+
+  // 右：可制造配方（未解锁的灰着但保留，好解释「为什么没有」）
+  const rcol = el('div', 'col');
+  const pickedId = facState.picked.get(factory.buildingId);
+  rcol.appendChild(el('div', 'col-title', '可制造 · 点一下选中'));
+  const grid = el('div', 'recipes');
+  if (!factory.recipes.length) {
+    grid.appendChild(el('span', 'dim', factory.type ? '配置表里没有这个工厂类型的配方' : '认不出工厂类型，读不到配方'));
+  }
+  for (const recipe of factory.recipes) {
+    const node = el('div', 'recipe');
+    if (!recipe.unlocked) node.classList.add('locked');
+    else if (!recipe.enough || recipe.atCap) node.classList.add('lack');
+    if (recipe.itemId === pickedId) node.classList.add('on');
+    node.appendChild(iconEl(recipe.icon, 24, recipe.itemId));
+    const txt = el('div');
+    txt.appendChild(el('span', 'nm', recipe.itemId));
+    // 状态直接写在副标题上：满 / 缺料 / 已排几个。光把格子变暗，看不出是为什么。
+    const sub = el('span', 'sub');
+    sub.appendChild(document.createTextNode(dur(recipe.produceTime)));
+    if (!recipe.unlocked) sub.appendChild(document.createTextNode(' · lv' + recipe.unlockLevel));
+    if (recipe.atCap) sub.appendChild(el('span', 'miss', ' · 满'));
+    else if (!recipe.enough) sub.appendChild(el('span', 'miss', ' · 缺料'));
+    if (recipe.queuedCount) sub.appendChild(document.createTextNode(' · ×' + recipe.queuedCount));
+    txt.appendChild(sub);
+    node.appendChild(txt);
+    node.title = recipeTitle(recipe);
+    node.onclick = () => {
+      if (!recipe.unlocked) {
+        factoryHint(recipe.itemId + ' 要 ' + factory.buildingId + ' 升到 lv' + recipe.unlockLevel + ' 才解锁', 'bad');
+        return;
+      }
+      if (facState.picked.get(factory.buildingId) === recipe.itemId) facState.picked.delete(factory.buildingId);
+      else facState.picked.set(factory.buildingId, recipe.itemId);
+      renderFactories(facState.data);
+    };
+    grid.appendChild(node);
+  }
+  rcol.appendChild(grid);
+
+  // 选中才出现制造按钮：避免手滑就把材料烧了
+  const picked = factory.recipes.find((recipe) => recipe.itemId === pickedId);
+  if (picked) {
+    const why = [];
+    if (!picked.unlocked) why.push('未解锁');
+    if (!picked.enough) why.push('材料不够');
+    if (picked.atCap) why.push('仓库到上限');
+    if (factory.full) why.push('制造位满');
+    const foot = el('div', 'pick');
+    foot.appendChild(el('div', 'dim', '已选 ' + picked.itemId + '：' + dur(picked.produceTime)
+      + (picked.costs.length ? '，耗 ' + picked.costs.map((c) => c.id + '×' + c.num).join(' ') : '')
+      + (why.length ? '（' + why.join('、') + '）' : '')));
+    const btn = el('button', 'primary tiny', '制造 ' + picked.itemId);
+    // 按钮**不禁用**：灰着一个没反应的按钮，用户不知道卡在哪。
+    // 点下去如果造不了，就在提示行把原因说清楚，别发请求。
+    btn.onclick = async () => {
+      if (why.length) {
+        factoryHint(blockReason(factory, picked), 'bad');
+        return;
+      }
+      btn.disabled = true;
+      factoryHint('正在排产 ' + picked.itemId + ' ...', 'warn');
+      try {
+        const data = await call('/api/factory/produce', {
+          method: 'POST',
+          body: JSON.stringify({ confirm: true, buildingId: factory.buildingId, productId: picked.itemId }),
+        });
+        factoryHint(data.note || '', 'ok');
+        // 选中状态留着：同一个产品要连排几个时，可以接着点，不用重新选。
+        renderFactories(data);
+      } catch (error) {
+        factoryHint(error.message, 'bad');
+        // 被服务端拒通常意味着本地数据过期了（刚被消耗掉 / 刚满），拉一次最新的修正按钮状态。
+        refreshFactories();
+      }
+    };
+    foot.appendChild(btn);
+    rcol.appendChild(foot);
+  }
+
+  cols.appendChild(rcol);
+  card.appendChild(cols);
+  return card;
+}
+
+function renderFactories(data) {
+  facState.data = data;
+  facState.ticks = [];
+  const box = clear($('factory-list'));
+  const list = data.factories || [];
+  const making = list.reduce((sum, factory) => sum + factory.queue.length, 0);
+  const waiting = list.reduce((sum, factory) => sum + factory.finishedTotal, 0);
+  // 收成按钮直接带待收数量，为 0 时禁用 —— 省得点了才发现没东西可收。
+  $('factory-gain').disabled = waiting === 0;
+  $('factory-gain').textContent = waiting ? '一键收成（' + waiting + '）' : '一键收成';
+  $('factory-summary').textContent = list.length
+    ? list.length + ' 座工厂 · 在造 ' + making + ' 个 · 待收 ' + waiting + ' 个 · 制造位上限 ' + data.slots
+    : '';
+  if (!list.length) {
+    box.appendChild(el('div', 'dim', '这个账号还没有工厂建筑。'));
+    return;
+  }
+  for (const factory of list) box.appendChild(factoryCard(factory, data));
+  tickFactories();
+}
+
+async function refreshFactories() {
+  if (facState.loading) return;
+  facState.loading = true;
+  // 不主动清提示：自动刷新每 5 秒来一次，清了的话「收成 XX×N」这种结果刚出来就没了。
+  // 想清空的场景只有用户手点「刷新工厂」，那个入口自己清。
+  try {
+    renderFactories(await call('/api/factory'));
+  } catch (error) {
+    factoryHint(error.message, 'bad');
+  } finally {
+    facState.loading = false;
+  }
+}
+
+$('factory-refresh').onclick = () => {
+  factoryHint('', 'warn');
+  refreshFactories();
+};
+
+// 一键收成：一次把所有工厂的囤积成品收掉，回来直接刷新视图（响应里已经带新状态）。
+$('factory-gain').onclick = async () => {
+  $('factory-gain').disabled = true;
+  factoryHint('正在收取所有工厂的成品 ...', 'warn');
+  try {
+    const data = await call('/api/factory/gain', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    factoryHint(data.note || '', 'ok');
+    renderFactories(data);
+  } catch (error) {
+    factoryHint(error.message, 'bad');
+    $('factory-gain').disabled = false;
+  }
+};
+
+// 页面停在工厂时才轮询，别的页不看它，省得跟总览抢连接。
+setInterval(() => {
+  if (activeTab !== 'factory') return;
+  if (!$('factory-auto').checked) return;
+  if (!current || !snapshot.connected) return;
+  refreshFactories();
+}, 5000);
+
 // ---- 表格 ------------------------------------------------------------------
 // 单元格可以是字符串、{num}、{chip}、{cell: 图标项}、{cells: [图标项]}
 function putCell(td, spec) {
@@ -1142,17 +1441,21 @@ $('cap-stop').onclick = async () => {
 };
 
 // ---- 启动 ------------------------------------------------------------------
+// 记住当前在看哪一页：工厂页的自动刷新只在它被选中时才跑。
+let activeTab = 'overview';
 document.querySelectorAll('#tabs button').forEach((button) => {
   button.onclick = () => {
+    activeTab = button.dataset.tab;
     document.querySelectorAll('#tabs button').forEach((other) => other.classList.toggle('on', other === button));
     for (const section of document.querySelectorAll('main > section')) {
       section.classList.toggle('hidden', section.id !== 'tab-' + button.dataset.tab);
     }
-    if (button.dataset.tab === 'account') {
+    if (activeTab === 'account') {
       renderAccounts();
       pollCapture();
     }
-    if (button.dataset.tab === 'idle') refreshLoop();
+    if (activeTab === 'idle') refreshLoop();
+    if (activeTab === 'factory') refreshFactories();
   };
 });
 

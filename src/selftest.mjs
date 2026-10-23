@@ -1353,6 +1353,113 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 工厂页：读出队列倒计时与「这个等级能造什么」。判定只看 BuildingProduceCfg，
+// 所以用合成配置就能跑，不依赖 CDN 快照。
+{
+  const { factoryRecipes, viewFactories } = await import('./factories.mjs');
+  const config = {
+    tables: {
+      BuildingProduceCfg: { data: [
+        { buildType: '食品厂', itemId: '烤鱼', limitType: '', unlockLevel: 1, produceTime: 300, costItem: [['鱼', 1], ['木材', 5]] },
+        { buildType: '食品厂', itemId: '刺身拼盘', limitType: '', unlockLevel: 3, produceTime: 600, costItem: [['生鱼片', 6]] },
+        { buildType: '食品厂', itemId: '海藻酒', limitType: '', unlockLevel: 9, produceTime: 1200, costItem: [['海藻', 6]] },
+        { buildType: '食品厂B', itemId: '酒精', limitType: '', unlockLevel: 1, produceTime: 3600, costItem: [['小麦', 3]] },
+        { buildType: '军工厂', itemId: '耐火砖', limitType: '', unlockLevel: 1, produceTime: 7200, costItem: [['工事建材', 1]] },
+      ] },
+    },
+  };
+
+  // 「食品厂B」不能因为前缀是「食品厂」就串到食品厂的配方 —— 跟 buildingId 解析同一套最长后缀规则。
+  assert.deepEqual(factoryRecipes(config, '食品厂').map((row) => row.itemId), ['烤鱼', '刺身拼盘', '海藻酒']);
+  assert.deepEqual(factoryRecipes(config, '食品厂B').map((row) => row.itemId), ['酒精']);
+  assert.deepEqual(factoryRecipes(config, '装备厂'), [], '没有配方的工厂返回空数组，不是 undefined');
+  assert.deepEqual(factoryRecipes(config, null), [], '认不出类型时也不能炸');
+
+  const now = 1_700_000_000;
+  const survey = {
+    now,
+    stock: new Map([['鱼', 9], ['木材', 3], ['生鱼片', 10]]),
+    factorySlots: 2,
+    stockCap: 50,
+    factories: [
+      // 队列已满（2/2），而且队列里已经有一个烤鱼；待收 5 个
+      {
+        buildingId: '1食品厂', type: '食品厂', level: 3,
+        queue: [
+          { idx: 1, productId: '烤鱼', finishAt: now + 125 },
+          { idx: 2, productId: '刺身拼盘', finishAt: 0 },
+        ],
+        finished: [{ id: '烤鱼', num: 5 }],
+        autoProductId: null,
+      },
+      { buildingId: '1A食品厂B', type: '食品厂B', level: 1, queue: [], finished: [], autoProductId: '' },
+    ],
+  };
+  const view = viewFactories(survey, { config });
+  const [main, second] = view.factories;
+
+  assert.equal(main.full, true, '2 个队列项 + 上限 2 = 满');
+  assert.equal(main.finishedTotal, 5, '待收成品数量要累加');
+  assert.equal(main.queue[0].produceTime, 300, '队列项要从配方表补上 produceTime，进度条才有分母');
+  assert.equal(main.queue[0].pending, false, '有 finishTime 的是队首，正在做');
+  assert.equal(main.queue[1].pending, true, 'finishTime 为 0 的是排队项，不能显示成可收取');
+  assert.equal(main.queue[1].remain, 0, '排队项 remain 夹到 0，不出负数倒计时');
+
+  // 队首做完但还没被收：finishAt 已经过去 → 仍在做（不是排队），remain 夹到 0 显示「可收取」。
+  const done = viewFactories({
+    ...survey,
+    factories: [{ ...survey.factories[0], queue: [{ idx: 1, productId: '烤鱼', finishAt: now - 5 }] }],
+  }, { config });
+  assert.equal(done.factories[0].queue[0].pending, false, '已到点的队首不是排队项');
+  assert.equal(done.factories[0].queue[0].remain, 0, '已到点的队首不做负数倒计时');
+
+  const baked = main.recipes.find((row) => row.itemId === '烤鱼');
+  assert.equal(baked.unlocked, true, 'lv1 的配方在 lv3 已解锁');
+  assert.equal(baked.queuedCount, 1, '队列里有 1 个烤鱼：只标注数量，不阻止继续排');
+  assert.equal(baked.enough, false, '木材 3 < 5，材料不够');
+  assert.deepEqual(baked.costs.map((row) => [row.id, row.have, row.num]), [['鱼', 9, 1], ['木材', 3, 5]]);
+
+  const locked = main.recipes.find((row) => row.itemId === '海藻酒');
+  assert.equal(locked.unlocked, false, 'lv9 的配方在 lv3 未解锁');
+  assert.equal(locked.enough, false, '海藻是 0 个');
+
+  const only = second.recipes.find((row) => row.itemId === '酒精');
+  assert.equal(second.recipes.length, 1, '食品厂B 只认自己的配方');
+  assert.equal(only.enough, false, '小麦 0 < 3');
+
+  // 仓库到上限时即使材料够也不能再造：atCap 是前端禁用的依据之一。
+  const capped = viewFactories({ ...survey, stock: new Map([['烤鱼', 50], ['鱼', 99], ['木材', 99]]), stockCap: 50 }, { config });
+  assert.equal(capped.factories[0].recipes.find((row) => row.itemId === '烤鱼').atCap, true, '产品到存量上限要标 atCap');
+  assert.equal(capped.factories[0].recipes.find((row) => row.itemId === '烤鱼').enough, true, 'atCap 与材料够不够是两件事');
+
+  // 持有量要算「仓库 + 工厂待收 + 队列在造」，只算仓库会漏掉待收那部分而误放行。
+  // 这个工厂：待收 烤鱼×5 + 队列里 1 个烤鱼 = 6，所以仓库 44 就已经顶到 50。
+  const edge = viewFactories({ ...survey, stock: new Map([['烤鱼', 44], ['鱼', 99], ['木材', 99]]), stockCap: 50 }, { config });
+  const edgeFish = edge.factories[0].recipes.find((row) => row.itemId === '烤鱼');
+  assert.equal(edgeFish.inStock, 44, 'inStock 只算仓库');
+  assert.equal(edgeFish.inFactory, 6, 'inFactory = 待收 5 + 队列 1');
+  assert.equal(edgeFish.held, 50, 'held 是三者之和');
+  assert.equal(edgeFish.atCap, true, '仓库 44 + 工厂 6 = 50，恰好到上限就该判满');
+  const under = viewFactories({ ...survey, stock: new Map([['烤鱼', 43], ['鱼', 99], ['木材', 99]]), stockCap: 50 }, { config });
+  assert.equal(under.factories[0].recipes.find((row) => row.itemId === '烤鱼').atCap, false, '差 1 个时不算满');
+  assert.equal(edgeFish.capKind, 'total', '两边都没单独到上限、合计到了 → total');
+
+  // capKind 用来决定提示给什么建议：工厂囤满该「收成」，仓库满则收成没用（只会更满）。
+  const factoryFull = viewFactories({
+    ...survey,
+    stock: new Map([['鱼', 99], ['木材', 99]]),
+    factories: [{ ...survey.factories[0], queue: [], finished: [{ id: '烤鱼', num: 50 }] }],
+  }, { config });
+  assert.equal(factoryFull.factories[0].recipes.find((row) => row.itemId === '烤鱼').capKind, 'factory', '工厂囤满 50 → capKind=factory');
+  const stockFull = viewFactories({
+    ...survey,
+    stock: new Map([['烤鱼', 50], ['鱼', 99], ['木材', 99]]),
+    factories: [{ ...survey.factories[0], queue: [], finished: [] }],
+  }, { config });
+  assert.equal(stockFull.factories[0].recipes.find((row) => row.itemId === '烤鱼').capKind, 'stock', '仓库满 50 → capKind=stock');
+  checked += 1;
+}
+
 // 协议日志会记出站 body（查「这一轮排了什么」靠它），但 LoginRequest 的 body 里是
 // openId / token / sign。这组断言是防回归的锁：谁把 LoginRequest 从 SECRET_FRAMES 拿掉，
 // 凭证就会开始往 data/protocol.log 里写。
@@ -1369,4 +1476,39 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 日志脱敏）`);
+// 回包归档：落盘必须是同步的（CLI 连一次就退出，异步缓冲会丢尾巴），
+// 目录按本地日期切，噪音帧不写，文件名不允许逃出目录。
+{
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const archive = await import('./archive.mjs');
+
+  assert.equal(archive.clipBody({ a: 1 }), clipBody({ a: 1 }), 'clipBody 只有 archive 一份实现，client 是转出去的');
+  assert.ok(archive.SECRET_FRAMES.has('LoginRequest'), '凭证帧要在 archive 的排除表里');
+
+  assert.ok(archive.NOISE_FRAMES.has('PingRequest'), '心跳不该进日志与归档');
+  assert.ok(archive.NOISE_FRAMES.has('Ack'), '序号确认不该进日志与归档');
+  assert.equal(archive.NOISE_FRAMES.has('AllItemResponse'), false, '业务回包要留');
+
+  assert.equal(archive.safeName('a/b c'), 'a_b_c', '文件名不能带路径分隔符');
+  assert.equal(archive.safeName('..'), '..', '点号本身允许，但外面还有一层日期目录兜着');
+
+  const noon = new Date(2026, 9, 23, 12, 0, 0).getTime();
+  assert.equal(archive.dayOf(noon), '2026-10-23', '按本地日期切目录，不是 UTC');
+  assert.equal(archive.archivePath('AllItemResponse', noon, '/tmp/r'), path.join('/tmp/r', '2026-10-23', 'AllItemResponse.jsonl'));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-archive-'));
+  const file = path.join(dir, 'x.jsonl');
+  archive.appendLine(file, 'a\n');
+  archive.appendLine(file, 'b\n');
+  assert.equal(fs.readFileSync(file, 'utf8'), 'a\nb\n', '同步写：函数返回时字节已经在磁盘上');
+  archive.appendLine(file, 'cccc\n', { rotateAt: 4 });
+  assert.equal(fs.existsSync(`${file}.1`), true, '超过上限要轮转，不能让单个日志无限涨');
+  assert.equal(fs.readFileSync(file, 'utf8'), 'cccc\n', '轮转后新文件从头写');
+  assert.equal(fs.readFileSync(`${file}.1`, 'utf8'), 'a\nb\n', '旧内容整段留在 .1');
+  fs.rmSync(dir, { recursive: true, force: true });
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 日志脱敏与回包归档）`);

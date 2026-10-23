@@ -1,5 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { createCodec } from './codec.mjs';
+import { attach, SECRET_FRAMES, clipBody } from './archive.mjs';
+
+// 落盘相关的两个定义已经挪到 archive.mjs（protocol.log 与 responses/ 归档共用同一份判断），
+// 这里原样转出去，调用点与自检不用改。
+export { SECRET_FRAMES, clipBody };
 
 export const MAX_SEQ = 2147483647;
 const HALF_SEQ = (MAX_SEQ - 1) / 2;
@@ -12,25 +17,7 @@ export const HEARTBEAT_DEADLINE_MS = 604800000 + TICK_INTERVAL_MS;
 
 export const DEFAULT_GATEWAY = 'wss://dhyaoj-gate.khlgamen.com/ws';
 
-// 出站帧的 body 会被写进协议日志（data/protocol.log）与 CLI 的 send 行 ——
-// 这是事后查「这一轮到底排了什么产品」的唯一取证点。但 LoginRequest 的 body 里
-// 带着 openId / token / sign，属于凭证，**任何情况下都不许落盘或打到终端**。
-// 需要排除新帧时往这里加，不要在调用点各写一份判断。
-export const SECRET_FRAMES = new Set(['LoginRequest']);
-
-// 日志用的简短 JSON：截断到 n 字符，避免一条 OnWaterResponse 把日志刷爆。
-export function clipBody(body, n = 400) {
-  if (body === null || body === undefined) return '';
-  let text;
-  try {
-    text = typeof body === 'string' ? body : JSON.stringify(body);
-  } catch {
-    return '[unserializable]';
-  }
-  if (!text) return '';
-  return text.length > n ? `${text.slice(0, n)}…` : text;
-}
-
+// 出站帧的 body 会被写进协议日志（data/protocol.log）与回包归档 —— 见 archive.mjs。
 export function nextSeqNo(seq) {
   return seq === MAX_SEQ ? 1 : seq + 1;
 }
@@ -86,7 +73,11 @@ export class GameClient extends EventEmitter {
 
   async connect(loginBody = this.login, { timeout = LOGIN_TIMEOUT_MS } = {}) {
     if (this.connected) throw new Error('already connected');
+    this.login = loginBody ?? this.login;
     this.stopping = false;
+    // 落盘挂在这里而不是各命令里：CLI 的十几个子命令、网页控制台、自动循环全都走 connect，
+    // 挂一次就全覆盖，也不会出现「新加的命令忘了存」。server 已经挂过就是幂等空操作。
+    attach(this);
     this.setState('CONNECTING', this.url);
 
     const socket = new WebSocket(this.url);

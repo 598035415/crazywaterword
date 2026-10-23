@@ -28,8 +28,9 @@ export const AUTO_PACK_ALLOWLIST = ['原料自选包', '工事材料自选包'];
 // 工事材料在 ItemCfg 里的 type 是「加工品」（跟 158 种中间产物混在一起），认不出来，
 // 所以从「用哪个包能换到它」反查 —— SelectPackLibCfg 本来就是这张对应表。
 export const WORK_MATERIAL_PACK = '工事材料自选包';
-const STOCK_PARAM = '产品存量初始上限';
-const SLOTS_PARAM = '制造位上限';
+// 工厂页（factories.mjs）也要按同样的表查这两项常量，导出出去免得两套口径。
+export const STOCK_PARAM = '产品存量初始上限';
+export const SLOTS_PARAM = '制造位上限';
 const POPULATION_PARAM = '初始人口上限';
 
 // 仓库材料清单：建造 / 升级 / 交订单 / 排产真正会消耗掉的那些东西，总览页单独列一栏。
@@ -68,15 +69,15 @@ export function materialGroups(config) {
 
 // 客户端 Resource 枚举：1=EXP 3=GOLD 4=RUBY 5=ARENA_POINT 6=LEAGUE_POINT。
 // AllResourceResponse.list[].res 是数字，配置表的消耗项写的是名字，两边靠这张表对齐。
-const RESOURCE_NAMES = { 1: 'EXP', 3: 'GOLD', 4: 'RUBY', 5: 'ARENA_POINT', 6: 'LEAGUE_POINT' };
+export const RESOURCE_NAMES = { 1: 'EXP', 3: 'GOLD', 4: 'RUBY', 5: 'ARENA_POINT', 6: 'LEAGUE_POINT' };
 
-function rowsOf(config, name) {
+export function rowsOf(config, name) {
   return config?.tables?.[name]?.data ?? [];
 }
 
 // 这些常量散在几张 param 表里（人口/存量在 GameParamCfg，制造位在 BuildingProduceParamCfg），
 // 名字不重复，所以统一按名字查。
-function paramOf(config, name) {
+export function paramOf(config, name) {
   for (const table of ['GameParamCfg', 'BuildingProduceParamCfg']) {
     const row = rowsOf(config, table).find((r) => r.paramName === name);
     if (row) return row.paramValue ?? 0;
@@ -651,7 +652,7 @@ export async function runWorld(client, protocol, plan, {
 // PickUpFloaterResponse.reward 是 DisplayAssetPackage{asset: DisplayAsset[]}，
 // 每个 DisplayAsset 是 {type, id, num}。num 是 protobuf int64：normalize 过的会是数字，
 // 没 normalize 的会是 {low, high, unsigned} 对象，两种形状都得吃得下。
-function assetCount(num) {
+export function assetCount(num) {
   if (typeof num === 'number') return Number.isFinite(num) ? num : 0;
   if (num && typeof num === 'object') return Number(num.low ?? 0) + Number(num.high ?? 0) * 2 ** 32;
   return Number(num ?? 0) || 0;

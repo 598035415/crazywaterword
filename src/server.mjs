@@ -2,7 +2,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
+import { GameClient } from './client.mjs';
+import { attach, ARCHIVE_ROOT, dayOf, listDays, summarizeDay } from './archive.mjs';
 import { loadProtocol } from './proto.mjs';
 import { PAGE } from './page.mjs';
 import { listWorlds, enterWorld, describeRole } from './worlds.mjs';
@@ -14,14 +15,15 @@ import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
+import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
 import { startCapture, stopCapture, captureState, DEFAULT_PROXY_PORT } from './capture.mjs';
 import { iconIndex, atlasFile, itemIcon, resourceIcon, materialIcon, heroIcon, heroCard, buildingIcon } from './art.mjs';
 
 const LOG_LIMIT = 400;
-// 协议帧不再进界面，但仍然要能事后查。默认只写文件，CW_DEBUG=1 时才同时打到终端。
-const TRACE_PATH = path.resolve(import.meta.dirname, '../data/protocol.log');
+// 协议帧不再进界面，但仍然要能事后查：时序流水在 data/protocol.log，
+// 完整回包按接口分文件存在 data/responses/<日期>/ —— 两套都由 archive.mjs 负责。
 
 const STATE_TEXT = {
   IDLE: '未连接',
@@ -56,21 +58,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     return entry;
   }
 
-  // 协议层细节（帧、序号、字节数、原始 JSON）只落盘，不进运行记录。
-  let traceStream = null;
-  function trace(session, line) {
-    const text = `${new Date().toISOString()} [${session.id.slice(0, 8)}] ${line}\n`;
-    if (process.env.CW_DEBUG === '1') process.stdout.write(text);
-    try {
-      if (!traceStream) {
-        fs.mkdirSync(path.dirname(TRACE_PATH), { recursive: true });
-        traceStream = fs.createWriteStream(TRACE_PATH, { flags: 'a' });
-      }
-      traceStream.write(text);
-    } catch {
-      /* 写不进去就算了，协议日志不是功能 */
-    }
-  }
+  // 协议层细节（帧、序号、字节数、原始 JSON）只落盘，不进运行记录：
+  // 归档在 wire() 里统一挂上，这里没有 trace 函数了。
 
   function newSession(id) {
     return {
@@ -100,20 +89,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
   }
 
   function wire(session, instance) {
+    // 出站 body 与完整回包都交给 archive：protocol.log 只留业务帧（心跳/序号确认不进），
+    // data/responses/<日期>/<消息名>.jsonl 存全量不截断。tag 用账号前 8 位，和日志前缀一致。
+    attach(instance, { tag: session.id.slice(0, 8) });
     instance.on('state', ({ state, detail }) => emit(session, 'state', STATE_TEXT[state] ?? state, detail ? { detail } : undefined));
-    // 出站帧必须带上 body：这是事后查「这一轮到底排产了哪个产品」的唯一取证点
-    // （收包那条 line 105 只覆盖 <- 方向）。LoginRequest 带 token/sign，永远不写。
-    instance.on('frame', ({ dir, name, seq, bytes, body }) => {
-      const head = `${dir === 'out' ? '->' : '<-'} [${name}] seq=${seq} ${bytes.byteLength}B`;
-      if (dir === 'out' && body && !SECRET_FRAMES.has(name)) {
-        const text = clipBody(body);
-        trace(session, text ? `${head} ${text}` : head);
-        return;
-      }
-      trace(session, head);
-    });
-    instance.on('message', ({ seq, name, body }) => trace(session, `[${name}] seq=${seq} ${JSON.stringify(body).slice(0, 400)}`));
-    instance.on('pong', ({ latencyMs, offsetMs }) => trace(session, `pong ${latencyMs}ms offset=${offsetMs}ms`));
     instance.on('drop', ({ name, reason }) => emit(session, 'warn', `漏收了一条 ${name} 的应答（${reason}），本轮跳过`));
     instance.on('warn', (message) => emit(session, 'warn', message === 'ping timeout' ? '服务器心跳超时，连接可能已经断了' : message));
     instance.on('fatal', ({ reason }) => emit(session, 'error', reason === 'SCChannelExpired' ? '这个账号在别处登录了，本条连接被顶掉' : `连接被服务器中断（${reason}）`));
@@ -278,6 +257,28 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     };
   }
 
+  // 工厂页：所有工厂 + 队列（含剩余秒数）+ 每个工厂这个等级能造的配方（够不够材料都算好）。
+  async function factory(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyFactories(instance, protocol, { config });
+    const view = viewFactories(survey, { config });
+    return {
+      ...view,
+      factories: view.factories.map((entry) => ({
+        ...entry,
+        icon: buildingIcon(entry.type),
+        queue: entry.queue.map((job) => ({ ...job, icon: itemIcon(job.productId) })),
+        finished: entry.finished.map((asset) => ({ ...asset, icon: itemIcon(asset.id) })),
+        recipes: entry.recipes.map((recipe) => ({
+          ...recipe,
+          icon: itemIcon(recipe.itemId),
+          costs: recipe.costs.map((cost) => ({ ...cost, icon: itemIcon(cost.id) })),
+        })),
+      })),
+    };
+  }
+
   async function heroes(session, account) {
     const instance = await ensureConnected(session, account);
     const heroList = await instance.request('AllHeroRequest', {}, 'AllHeroResponse', 15000);
@@ -360,7 +361,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const needConfirm = (payload) => {
       if (payload.confirm !== true) throw new Error('这个操作会改动游戏里的状态，需要先确认');
     };
-    const longRunning = /^(GET|POST) \/api\/(heroes|dailies|tasks|world|overview|loop)(\/|$)/.test(route);
+    const longRunning = /^(GET|POST) \/api\/(heroes|dailies|tasks|world|overview|loop|factory)(\/|$)/.test(route);
     let scoped = null;
     // 所有账号相关的路由都先过这里：拿到账号、对应会话，长请求再挂个忙碌标记。
     const scoped_ = (url) => {
@@ -513,6 +514,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       }
 
       // ---- 只读视图 ----
+      // 今天归档了什么：哪个接口、多少条、多大的文件，以及落在哪个目录。
+      // 不碰网关、不碰账号，纯文件系统读取，所以不带 ?account。
+      if (route === 'GET /api/archive') {
+        const day = parsed.searchParams.get('day') || dayOf();
+        json({ root: ARCHIVE_ROOT, day, days: listDays(), entries: summarizeDay(ARCHIVE_ROOT, day) });
+        return;
+      }
       if (route === 'GET /api/overview') {
         const { account, session } = scoped_(parsed);
         json(await overview(session, account));
@@ -538,6 +546,100 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         json(await world(session, account, {
           pickUpFloaters: parsed.searchParams.get('pick') === '1',
         }));
+        return;
+      }
+      // ---- 工厂 ----
+      if (route === 'GET /api/factory') {
+        const { account, session } = scoped_(parsed);
+        json(await factory(session, account));
+        return;
+      }
+      // 一键收成：把所有工厂的囤积成品一次收完，收益按产品名合并后返回。
+      // 逐座收、一座失败不连累其它（原因会一起带回去），收完再读一次状态给页面。
+      if (route === 'POST /api/factory/gain') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const before = await surveyFactories(instance, protocol, { config });
+        if (!before.factories.some((entry) => entry.finished.length > 0)) {
+          json({ ok: true, note: '现在没有待收的成品', gained: [], results: [], ...(await factory(session, account)) });
+          return;
+        }
+        const { targets, results, gained } = await gainAllProducts(instance, protocol, before.factories);
+        const failed = results.filter((entry) => !entry.ok);
+        const gainText = gained.length ? gained.map((entry) => `${entry.id}×${entry.num}`).join('、') : '没收到东西';
+        const note = `收成 ${results.length - failed.length}/${targets} 座工厂：${gainText}`
+          + (failed.length ? `；失败 ${failed.map((entry) => `${entry.buildingId}（${entry.error}）`).join('、')}` : '');
+        emit(session, failed.length ? 'warn' : 'info', note);
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        json({ ok: true, note, gained: gained.map((entry) => ({ ...entry, icon: itemIcon(entry.id) })), results, ...(await factory(session, account)) });
+        return;
+      }
+      // 手动排产：先按当前状态挡掉明显发不出去的请求（队列满 / 没解锁 / 材料不够），
+      // 免得靠 sendWatch 猜服务端那条 prompt 是什么意思。
+      if (route === 'POST /api/factory/produce') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        if (!payload.buildingId || !payload.productId) throw new Error('要指定 buildingId 与 productId');
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const before = await surveyFactories(instance, protocol, { config });
+        const target = before.factories.find((entry) => entry.buildingId === payload.buildingId);
+        if (!target) throw new Error(`${payload.buildingId} 不在这个账号的工厂列表里`);
+        const recipe = factoryRecipes(config, target.type).find((entry) => entry.itemId === payload.productId);
+        if (!recipe) throw new Error(`${target.buildingId}（${target.type ?? '未知类型'}）没有 ${payload.productId} 这条配方`);
+        if (target.level < recipe.unlockLevel) throw new Error(`${target.buildingId} 还是 lv${target.level}，${payload.productId} 要 lv${recipe.unlockLevel} 才解锁`);
+        if (target.queue.length >= before.factorySlots) throw new Error(`${target.buildingId} 的制造位满了（${target.queue.length}/${before.factorySlots}）`);
+        if (recipe.costItem.length > 0) {
+          const lacking = recipe.costItem
+            .map((cost) => ({ id: cost.id, num: cost.num, have: before.stock.get(cost.id) ?? 0 }))
+            .filter((cost) => cost.have < cost.num);
+          if (lacking.length > 0) {
+            // 材料不齐时客户端会弹「用钻石补」，本工具永远不用钻石，直接不发。
+            throw new Error(`材料不够：${lacking.map((cost) => `${cost.id} ${cost.have}/${cost.num}`).join('、')}`);
+          }
+        }
+        // 持有量 = 仓库 + 这个工厂待收的 + 队列里还排着的。只算仓库会漏掉待收那部分，
+        // 服务端判 storage full 的口径更宽（实测淡水仓库 23 个时仍可能被拒）。
+        const inStock = before.stock.get(payload.productId) ?? 0;
+        const inFactory = target.finished.filter((asset) => asset.id === payload.productId).reduce((sum, asset) => sum + asset.num, 0)
+          + target.queue.filter((job) => job.productId === payload.productId).length;
+        const held = inStock + inFactory;
+        if (before.stockCap > 0 && held >= before.stockCap) {
+          const advice = inFactory >= before.stockCap
+            ? '先「一键收成」把工厂里囤的成品收走'
+            : inStock >= before.stockCap
+              ? '仓库里这批已经到上限，得先把它消耗掉（收成只会让仓库更满）'
+              : '先收成再消耗掉一些';
+          throw new Error(`${payload.productId} 已经到上限了：仓库 ${inStock} + 工厂待收/在造 ${inFactory} = ${held}/${before.stockCap}。${advice}。`);
+        }
+        try {
+          await startProduce(instance, { buildingId: payload.buildingId, productId: payload.productId });
+        } catch (error) {
+          // 服务端驳回时只有一句英文 prompt（storage full / feature locked…），
+          // 这里翻成「哪个产品、卡在哪、怎么办」，不然页面上只看到 server prompt: storage full。
+          const raw = String(error?.message ?? '');
+          if (/storage full/i.test(raw)) {
+            throw new Error(`${payload.buildingId} 造不了 ${payload.productId}：服务端说仓库满了（storage full）。`
+              + `产品存量上限 ${before.stockCap || '?'} 个，我这边看到仓库 ${inStock}、工厂待收/在造 ${inFactory}。`
+              + '先「一键收成」把工厂里囤的收走，还不够就把它消耗掉（交订单 / 建造）再来造。');
+          }
+          if (/not enough|insufficient|lack|no enough/i.test(raw)) {
+            throw new Error(`${payload.buildingId} 造不了 ${payload.productId}：服务端说材料不够（${raw}）。`);
+          }
+          if (/feature locked/i.test(raw)) {
+            throw new Error(`${payload.buildingId} 造不了 ${payload.productId}：这个功能还没解锁（feature locked）。`);
+          }
+          throw error;
+        }
+        const costText = recipe.costItem.map((cost) => `${cost.id}×${cost.num}`).join(' ');
+        emit(session, 'info', `工厂 ${payload.buildingId} 开始制造 ${payload.productId}（${recipe.produceTime}s${costText ? `，耗 ${costText}` : ''}）`);
+        // 服务端入队要一小会儿，等它写进 factoryQ 再读回去，页面才不会显示成「没排上」。
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        json({ ok: true, note: `${payload.buildingId} 开始制造 ${payload.productId}`, ...(await factory(session, account)) });
         return;
       }
       if (route === 'GET /api/worlds') {

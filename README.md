@@ -29,6 +29,7 @@
 | 英雄 | 升级、升星、升技能（判定条件照抄客户端红点逻辑） |
 | 海面世界 | 收成品、竣工、建造新建筑、交居民订单、按订单缺口排产、余料升级、加速 |
 | 自动循环 | 上面三块按轮执行，可只读探测、可长期挂机 |
+| 回包归档 | 每条请求/推送按接口全量落盘到 `data/responses/<日期>/`，时序流水另存 `data/protocol.log` |
 | 网页控制台 | 本地页面，中文业务视图，一键领取 / 一键完成 / 自动循环 / 账号与凭证管理 |
 
 ## 它不是什么
@@ -103,7 +104,13 @@ node src/app.mjs            # 默认就是这个
   自动循环每轮都会看一次，但只有「距上次执行」超过这个间隔才真的发请求，其余轮次直接跳过并说明还差多久；
 - **英雄** —— 英雄卡片与养成计划；
 - **日常** —— 日常任务表（中文，并说明「为什么不可做」）；
-- **账号** —— 多账号切换、扫码添加、凭证查看（默认打码）。
+- **账号** —— 多账号切换、扫码添加、凭证查看（默认打码）；
+- **工厂** —— 每座工厂的制造队列（队首倒计时、后面的排队项）、囤积成品，以及这个等级能造的配方：
+  点一下配方选中，再点「制造」就直接排产（不二次确认）。配方上直接标「满」（持有量 = 仓库 + 工厂待收/在造，
+  到 `产品存量初始上限`）和「缺料」；造不了时点「制造」**不发请求**，而是把卡在哪写成红字：
+  未解锁要几级、缺哪个材料（现有/需要）、哪一处堆到上限、该怎么解（工厂囤满 → 收成；仓库满 → 得先消耗，
+  收成只会更满）。服务端的英文 prompt（`storage full` / `not enough` / `feature locked`）也会翻成人话。
+  顶部「一键收成」把每座工厂的囤积成品一次收完（逐座 `GainFactoryProduceRequest`，收益按产品名合并）。
 
 ---
 
@@ -137,7 +144,9 @@ node src/app.mjs <子命令> [参数]
 网页请求体里带 `confirm: true`。不加就只打印计划，一个字节都不发出去。
 
 常用环境变量：`CW_ACCOUNT`（选账号）、`CW_PORT`（控制台端口）、`CW_DATA_DIR`、
-`CW_CONFIG_PACK`、`CW_PROXY_PORT`、`CW_NO_BROWSER`、`CW_DEBUG`。
+`CW_CONFIG_PACK`、`CW_PROXY_PORT`、`CW_NO_BROWSER`、`CW_DEBUG`、
+`CW_ARCHIVE=0`（关掉回包归档）、`CW_TRACE_MAX`（协议流水单文件上限，默认 32MB）、
+`CW_ARCHIVE_MAX`（单条回包归档上限，默认 16MB，超了只留元信息）。
 
 ---
 
@@ -150,9 +159,43 @@ node src/app.mjs <子命令> [参数]
   + `uint8 标志`（0 = 原始，非零 = LZ4）+ protobuf 载荷。
 - 协议定义来自客户端自带的 protobufjs **static module** 产物 —— 它没有任何反射元数据，
   字段号和字段名只能从生成的 `encode` / `decode` 函数体里读回来（`tools/describe.mjs`）。
-- 每一帧都写进 `data/protocol.log`：出站带 body（`LoginRequest` 除外，它的 body 里是 token/sign），
-  入站带解出来的 JSON。想查「这一轮到底排产了哪个产品」，就看
-  `-> [StartFactoryProduceRequest] seq=… {"buildingId":"1食品厂","productId":"烤鱼"}` 这一行。
+- 每条收发都落盘，分两套（`src/archive.mjs`）：
+  - `data/protocol.log` —— 时序流水，看「这一轮先发什么、后回什么」。一行一眼能看完，所以 body
+    截到 400 字符（截断带 `…` 标记），心跳/序号确认（`PingRequest`/`PingResponse`/`Ack`/`Nack`）
+    不进、`LoginRequest` 的 body 永不进。单文件超过 32MB 自动轮转成 `protocol.log.1`。
+  - `data/responses/<本地日期>/<消息名>.jsonl` —— 原始回包档案，**全量、不截断**，一行一条
+    `{"t":…,"dir":"in","seq":…,"acc":"…","body":{…}}`，191 个接口各一个文件。
+    重建背包/海面/任务快照这类离线分析从这里读，别再从 47MB 的流水里 grep。
+- 想查「这一轮到底排产了哪个产品」，就看
+  `-> [StartFactoryProduceRequest] seq=… {"buildingId":"1食品厂","productId":"烤鱼"}` 这一行
+  （流水和 `StartFactoryProduceRequest.jsonl` 里都有）。
+- 落盘是**同步写**（`openSync` + `writeSync`，不留异步缓冲）：CLI 里 `state` 这种命令连一次、
+  打几条就退出，`createWriteStream` 会丢掉尾巴上那几条 —— 而那几条往往正是你想看的。
+
+
+### 回包归档怎么查
+
+```bash
+node tools/archive.mjs days                     # 有归档的日期
+node tools/archive.mjs list                     # 今天每个接口的条数 / 入站 / 出站 / 体积
+node tools/archive.mjs tail AllItemResponse 1   # 某接口最后 1 条完整回包
+node tools/archive.mjs path AllItemResponse     # 文件路径（配合 grep / jq）
+```
+
+控制台另有一个只读接口：`GET /api/archive?day=2026-10-23`（不碰网关、不带 `?account`）。
+
+老的 `data/protocol.log` 里入站 body 曾被截到 400 字符，可以回填成结构化档案：
+
+```bash
+node tools/archive-backfill.mjs --dry    # 先看统计，不写盘
+node tools/archive-backfill.mjs          # 增量回填，断点记在 data/responses/.backfill.json
+node tools/archive-backfill.mjs --reset  # 忽略断点重导
+```
+
+被截断的半条不会丢：标 `"partial":true`，原文放进 `body.raw` —— 半条也比没有强，
+但要能一眼看出它不是完整回包。目录按本地日期切，清旧档案就是删一个日期目录。
+流水轮转过的话会把 `protocol.log.1` 一起读（先 .1 后主文件，各存各的 offset），
+不会因为一次轮转把上一代数据漏掉。
 
 ### 账号与区服
 
@@ -198,6 +241,7 @@ node src/app.mjs <子命令> [参数]
 src/
   app.mjs        CLI 入口与各子命令
   client.mjs     网关连接、心跳、请求/推送的路由与 prompt 归属
+  archive.mjs    落盘层：protocol.log 流水 + responses/<日期>/<接口>.jsonl 全量回包
   codec.mjs      自定义帧 + protobuf 编解码
   proto.mjs      协议表加载
   accounts.mjs   多账号存储（data/accounts.json）
@@ -207,6 +251,7 @@ src/
   dailies.mjs    日常任务、活跃度宝箱、每日赠礼
   heroes.mjs     英雄养成
   world.mjs      海面世界：建造/工厂/订单/资源田
+  factories.mjs  工厂页：制造队列、配方解锁判定、手动排产
   loop.mjs       自动循环
   actions.mjs    动作目录（请求名、参数、是否改状态）
   server.mjs     HTTP + SSE，多会话
@@ -226,6 +271,8 @@ tools/
   fetch-map.mjs            下载 world_map 地图 JsonAsset
   describe.mjs             从 static module 里读回字段
   build-names.mjs          抠出内联的 id→名字枚举
+  archive.mjs              回包归档的查看器（days / list / tail / path）
+  archive-backfill.mjs     把老的 protocol.log 回填成结构化归档（增量、可 --dry）
   wxapkg.mjs               解密并解包 PC 微信小程序包
   probe-*.mjs              只读探针
   selftest-*.mjs           工具侧自检
@@ -291,8 +338,9 @@ docs/
 node src/selftest.mjs
 ```
 
-30 组离线检查，覆盖协议帧编解码、LZ4、账号仓库（迁移/选中/替换）、配置表与素材索引、
-二维码、海面计划器（含建造与竣工互斥）、活跃度宝箱（日/周两套门槛）、每日赠礼。
+40 组离线检查，覆盖协议帧编解码、LZ4、账号仓库（迁移/选中/替换）、配置表与素材索引、
+二维码、海面计划器（含建造与竣工互斥）、工厂视图（配方解锁/排队项与队首的区分/材料与存量上限）、
+活跃度宝箱（日/周两套门槛）、每日赠礼、日志脱敏与回包归档（同步落盘、轮转、噪音过滤、目录切分）。
 工具侧另有 `tools/selftest-mitm.mjs`、`tools/selftest-describe.mjs`、`tools/selftest-registry.mjs`。
 
 ---
