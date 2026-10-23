@@ -416,6 +416,10 @@ node tools/selftest-describe.mjs    # 字段布局还原自检
 `GameClient.sendWatch(name, body, {window})` 为无响应请求开一个观察窗口（守到 prompt 即被拒，
 窗口内没动静即成功），`GameClient.attributePrompt()` 按上面的顺序规则认领。
 
+同类请求还包括 `StartFactoryProduceRequest`、`UpgradeBuildingRequest`、`BuildBuildingRequest`、
+`SelectPackRequest`（自选包兑换）等。**完整清单维护在 `src/selftest.mjs` 的 `SILENT` 集合里**，
+并在那里做集合比对：新增动作如果把某个没有 Response 的请求写成有 Response，自检会直接失败。
+
 ### 11.4 本轮实测结果
 
 英雄养成：7 个英雄全部从 lv45 升到玩家等级允许的上限 lv55；蜜雪 2→8 星、杰森 1→2 星

@@ -6,7 +6,7 @@
 
 import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
-import { surveyWorld, planWorld, runWorld } from './world.mjs';
+import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -19,6 +19,9 @@ export async function runLoop(client, protocol, {
   allowPaid = false,
   allowSpeedUp = false,
   allowReroll = false,
+  useSelectPack = true,
+  maxPackPerRound,
+  pickUpFloaters = false,
   sleep = defaultSleep,
   stop = { aborted: false },
   onRound,
@@ -60,12 +63,13 @@ export async function runLoop(client, protocol, {
 
     // 3. 海面世界
     const worldSurvey = await surveyWorld(client, protocol, { config, player });
-    const worldPlan = planWorld(worldSurvey, { config, allowSpeedUp, allowReroll });
+    const worldPlan = planWorld(worldSurvey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters });
     summary.world = {
       planned: worldPlan.actions.length,
       notes: [...worldSurvey.notes, ...worldPlan.notes],
       population: `${worldSurvey.population}/${worldSurvey.maxPopulation}`,
       results: [],
+      floaterLoot: null,
     };
     if (worldPlan.actions.length > 0) {
       const { results, rejected: stillRejected } = await runWorld(client, protocol, worldPlan, {
@@ -75,6 +79,7 @@ export async function runLoop(client, protocol, {
       });
       rejected.world = stillRejected;
       summary.world.results = results;
+      summary.world.floaterLoot = summarizeFloaters(results);
     }
 
     history.push(summary);
@@ -85,14 +90,64 @@ export async function runLoop(client, protocol, {
   return { history, rejected };
 }
 
+// 动作 kind → 中文名。循环每轮按 kind 聚合，比一条条列 71 行可读得多。
+const KIND_TEXT = {
+  gainFactory: '收成品',
+  collectProduct: '收建筑产物',
+  finishUpgrade: '竣工',
+  build: '建造',
+  finishOrder: '交订单',
+  denyOrder: '拒单',
+  startProduce: '排产',
+  upgrade: '升级',
+  speedUpUpgrade: '加速建造',
+  speedUpProduce: '加速生产',
+  selectPack: '兑材料',
+  pickUpFloater: '拾荒',
+};
+
+// 每一部分的明细：成功的按 kind 聚合、失败逐条列（最多 limit 条）、跳过的按原因聚合。
+function detailLines(part, limit = 4) {
+  const lines = [];
+  const okBy = new Map();
+  for (const entry of part.results) {
+    if (entry.skipped || !entry.ok) continue;
+    const name = KIND_TEXT[entry.step?.kind] ?? entry.step?.kind ?? '其他';
+    okBy.set(name, (okBy.get(name) ?? 0) + 1);
+  }
+  if (okBy.size) lines.push(`    成功 ${[...okBy].map(([name, n]) => `${name}×${n}`).join('  ')}`);
+
+  const fails = part.results.filter((entry) => !entry.skipped && entry.ok === false);
+  for (const entry of fails.slice(0, limit)) {
+    lines.push(`    失败 ${entry.step?.label ?? '?'}：${entry.error}`);
+  }
+  if (fails.length > limit) lines.push(`    失败 另有 ${fails.length - limit} 条`);
+
+  const skipBy = new Map();
+  for (const entry of part.results) {
+    if (!entry.skipped) continue;
+    const why = entry.error ?? '跳过';
+    skipBy.set(why, (skipBy.get(why) ?? 0) + 1);
+  }
+  if (skipBy.size) lines.push(`    跳过 ${[...skipBy].map(([why, n]) => `${n}×${why}`).join('  ')}`);
+  return lines;
+}
+
 export function formatLoopRound(summary) {
   const ok = (results) => results.filter((entry) => entry.ok).length;
   const failed = (results) => results.filter((entry) => entry.ok === false && !entry.skipped).length;
-  const line = (name, part) => `  ${name} 计划 ${part.planned}，成功 ${ok(part.results)}，失败 ${failed(part.results)}`;
+  const skipped = (results) => results.filter((entry) => entry.skipped).length;
+  const line = (name, part) => `  ${name} 计划 ${part.planned}，成功 ${ok(part.results)}，失败 ${failed(part.results)}`
+    + (skipped(part.results) ? `，跳过 ${skipped(part.results)}` : '');
+  const floater = summary.world.floaterLoot ? formatFloaters(summary.world.floaterLoot) : '';
   return [
     `第 ${summary.round} 轮`,
     line('任务', summary.tasks),
+    ...detailLines(summary.tasks),
     line('日常', summary.dailies),
+    ...detailLines(summary.dailies),
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
+    ...detailLines(summary.world),
+    ...(floater ? [`  ${floater}`] : []),
   ].join('\n');
 }

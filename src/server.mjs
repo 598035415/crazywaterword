@@ -12,7 +12,7 @@ import { qrSvg } from './vendor/qrcode.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
 import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
-import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset } from './world.mjs';
+import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -212,11 +212,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     return { ...survey, text: formatTaskPlan(survey) };
   }
 
-  async function world(session, account) {
+  async function world(session, account, { pickUpFloaters = false } = {}) {
     const instance = await ensureConnected(session, account);
     const config = loadConfigSafe();
     const survey = await surveyWorld(instance, protocol, { config, player: session.player });
-    const plan = planWorld(survey, { config });
+    const plan = planWorld(survey, { config, pickUpFloaters });
     let map = null;
     try {
       map = loadMapAsset(Number(session.player?.scenarioId ?? 0));
@@ -503,7 +503,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       }
       if (route === 'GET /api/world') {
         const { account, session } = scoped_(parsed);
-        json(await world(session, account));
+        json(await world(session, account, { pickUpFloaters: parsed.searchParams.get('pick') === '1' }));
         return;
       }
       if (route === 'GET /api/worlds') {
@@ -598,7 +598,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
         const survey = await surveyWorld(instance, protocol, { config, player: session.player });
-        const plan = planWorld(survey, { config, allowSpeedUp: payload.speedUp === true, allowReroll: payload.reroll === true });
+        const plan = planWorld(survey, {
+          config,
+          allowSpeedUp: payload.speedUp === true,
+          allowReroll: payload.reroll === true,
+          // 材料不齐时默认拿自选包补；前端传 selectPack:false 可关，maxPack 可改每轮上限。
+          useSelectPack: payload.selectPack !== false,
+          maxPackPerRound: Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined,
+          // 拾荒默认不做，前端勾了「自动拾荒」才扫海面漂浮物。
+          pickUpFloaters: payload.pickFloaters === true,
+        });
         const { results } = await runWorld(instance, protocol, plan, {
           allowMutate: true,
           onStep: (entry) => {
@@ -606,9 +615,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `海面 ${entry.step.label}` : `海面 ${entry.step.label} 失败：${entry.error}`);
           },
         });
+        const floaterLoot = summarizeFloaters(results);
+        const floaterText = formatFloaters(floaterLoot);
+        if (floaterText) emit(session, 'info', floaterText);
         await new Promise((resolve) => setTimeout(resolve, 1200));
-        const after = await world(session, account);
-        json({ results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })), plan: after.plan, text: after.text, population: after.population });
+        const after = await world(session, account, { pickUpFloaters: payload.pickFloaters === true });
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          plan: after.plan, text: after.text, population: after.population,
+          floaterText, floaterLoot,
+        });
         return;
       }
       // 循环：开启后立刻返回，进度走 /api/loop 与事件流。
@@ -642,6 +658,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           allowPaid: payload.paid === true,
           allowSpeedUp: payload.speedUp === true,
           allowReroll: payload.reroll === true,
+          pickUpFloaters: payload.pickFloaters === true,
           stop: loop.stop,
           onRound: (summary) => {
             loop.completed = summary.round;

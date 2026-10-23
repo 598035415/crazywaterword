@@ -11,7 +11,7 @@ import { getConfig } from './config.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
 import { surveyDailies, runDailies, formatSurvey, planChests, planDailyGift } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
-import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
+import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 
 const READ_ONLY_PROBES = [
@@ -52,6 +52,15 @@ function loadConfigSafe() {
     console.log(`warn: 未加载配置表 (${error.message})`);
     return null;
   }
+}
+
+// 读 `--flag 12` 这种带数值的参数。没写、或写的不是数字都返回 undefined，
+// 让下游用它自己的默认值，而不是吃一个 NaN。
+function numericArg(flag) {
+  const index = process.argv.indexOf(flag);
+  if (index < 0) return undefined;
+  const value = Number(process.argv[index + 1]);
+  return Number.isFinite(value) ? value : undefined;
 }
 
 async function headless({ seconds = 60, probes = true }) {
@@ -476,7 +485,9 @@ async function tasks({ allowMutate, dryRun }) {
 
 // 海面世界：收成品 / 竣工 / 交单 / 排产 / 余料升级建筑。--dry 只列计划，--yes 才真发请求。
 // --speed-up 才允许花「加速器」（钻石永远不碰）；--reroll 才允许拒绝材料不齐的订单。
-async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll }) {
+// 材料不齐时默认会拿「原料自选包 / 工事材料自选包」兑出来补（--no-pack 关掉，--max-pack 改上限）。
+// --pick 才扫海面漂浮物（拾荒），结束后打印所得。
+async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, pickUpFloaters = false }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -488,9 +499,10 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll }) {
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyWorld(client, protocol, { config, player: response.playerInfo });
-    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll });
+    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters });
     console.log(`\n${formatWorldPlan(survey, plan)}\n`);
-    console.log(`共 ${plan.actions.length} 个动作${allowSpeedUp ? '' : '（未开 --speed-up，不会花' + SPEED_UP_ITEM + '）'}`);
+    console.log(`共 ${plan.actions.length} 个动作${allowSpeedUp ? '' : '（未开 --speed-up，不会花' + SPEED_UP_ITEM + '）'}`
+      + `${pickUpFloaters ? `，含拾荒 ${(survey.floaters ?? []).length} 件漂浮物` : '（未开 --pick，不拾荒）'}`);
 
     if (dryRun) {
       console.log('--dry：只列计划，未执行');
@@ -498,13 +510,16 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll }) {
     }
 
     console.log('\n执行:');
-    const { rejected } = await runWorld(client, protocol, plan, {
+    const { rejected, results } = await runWorld(client, protocol, plan, {
       allowMutate,
       onStep: (entry) => {
         if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
         else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
       },
     });
+    // 拾荒所得单独汇总一行：逐条日志太碎，看不出这一轮到底捡到了什么。
+    const floaterText = formatFloaters(summarizeFloaters(results));
+    if (floaterText) console.log(`\n${floaterText}`);
     if (rejected.size) console.log(`本轮被拒 ${rejected.size} 条`);
 
     // 前面对照只认重新探测的结果。
@@ -802,6 +817,9 @@ async function main() {
       allowSpeedUp: process.argv.includes('--speed-up'),
       allowReroll: process.argv.includes('--reroll'),
       allowPaid: process.argv.includes('--paid'),
+      useSelectPack: !process.argv.includes('--no-pack'),
+      maxPackPerRound: numericArg('--max-pack'),
+      pickUpFloaters: process.argv.includes('--pick'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -824,6 +842,9 @@ async function main() {
       dryRun: process.argv.includes('--dry'),
       allowSpeedUp: process.argv.includes('--speed-up'),
       allowReroll: process.argv.includes('--reroll'),
+      useSelectPack: !process.argv.includes('--no-pack'),
+      maxPackPerRound: numericArg('--max-pack'),
+      pickUpFloaters: process.argv.includes('--pick'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;

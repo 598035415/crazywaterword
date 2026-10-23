@@ -596,6 +596,191 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 材料不齐时用自选包兜底：SelectPackRequest 的 num 是「要换到的数量」，
+// 兑换动作必须排在用到它的动作之前，且不能把包一次性烧光。
+{
+  const { planWorld, stepKey } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [] },
+    BuildingProduceCfg: { data: [] },
+    BuildingUpgradeCfg: { data: [] },
+    // SelectPackLibCfg 的形状是 (itemId = 包, selectItemId = 能换出的材料, num = 每包产出)。
+    // 「蓝装材料自选包」是故意放进来当反例的：它能换布匹，但属于稀有包，计划器不许碰。
+    SelectPackLibCfg: { data: [
+      { itemId: '原料自选包', selectItemId: '木材', type: '道具', num: 1, season: 1 },
+      { itemId: '原料自选包', selectItemId: '玻璃', type: '道具', num: 1, season: 1 },
+      { itemId: '原料自选包', selectItemId: '海藻', type: '道具', num: 1, season: 1 },
+      { itemId: '工事材料自选包', selectItemId: '工事建材', type: '道具', num: 1, season: 1 },
+      { itemId: '蓝装材料自选包', selectItemId: '布匹', type: '道具', num: 1, season: 1 },
+      { itemId: '橙宠基因自选包', selectItemId: '基因碎片', type: '道具', num: 1, season: 1 },
+    ] },
+  } };
+
+  const surveyFor = ({ packs = 0, packName = '原料自选包', material = '木材', have = 0, need = 5, orders = 1 } = {}) => {
+    const stock = new Map([[material, have], [packName, packs]]);
+    return {
+      now: 1000, player: { level: 50 }, population: 10, maxPopulation: 99,
+      stockCap: 9999, factorySlots: 2, stock,
+      have: (id) => stock.get(id) ?? 0,
+      buildings: [], factories: [],
+      orders: Array.from({ length: orders }, (_, i) => ({
+        index: i + 1,
+        requirements: [{ id: material, num: need }],
+        missing: [{ id: material, num: Math.max(0, need - have) }],
+        rewardExp: 100,
+      })),
+    };
+  };
+  const packsOf = (plan) => plan.actions.filter((a) => a.kind === 'selectPack');
+
+  // 包够：兑换补齐 → 订单可交，而且兑换排在交单前面。
+  const enough = planWorld(surveyFor({ packs: 5 }), { config });
+  const enoughKinds = enough.actions.map((a) => a.kind);
+  assert.equal(packsOf(enough).length, 1, 'one shortage produces exactly one exchange');
+  assert.equal(packsOf(enough)[0].body.selectItemId, '木材', 'the exchange names the material');
+  assert.equal(packsOf(enough)[0].body.itemId, '原料自选包', 'the exchange names the pack');
+  assert.equal(packsOf(enough)[0].body.num, 5, 'the exchange covers the whole gap');
+  assert.ok(enoughKinds.includes('finishOrder'), 'with the gap covered the order goes through');
+  assert.ok(enoughKinds.indexOf('selectPack') < enoughKinds.indexOf('finishOrder'),
+    'the exchange must run before the order that needs it');
+
+  // 包不够：只兑得出这么多，订单保留并说明原因，绝不半真半假地交单。
+  const short = planWorld(surveyFor({ packs: 3 }), { config });
+  assert.equal(packsOf(short)[0].body.num, 3, 'only as many as the packs can cover');
+  assert.equal(short.actions.some((a) => a.kind === 'finishOrder'), false, 'still 2 short, so no order');
+  assert.ok(short.notes.some((note) => note.includes('材料不足')), 'the kept order says why');
+
+  // 关掉开关就完全不碰包。
+  const off = planWorld(surveyFor({ packs: 5 }), { config, useSelectPack: false });
+  assert.equal(off.actions.some((a) => a.kind === 'selectPack'), false, '--no-pack must never consume packs');
+
+  // 每轮上限：包再多也不许一轮烧完。
+  const capped = planWorld(surveyFor({ packs: 10, need: 8 }), { config, maxPackPerRound: 2 });
+  assert.equal(packsOf(capped)[0].body.num, 2, 'the per-round cap wins over the actual surplus');
+
+  // 库存本来就够，一个包都不该动。
+  const stocked = planWorld(surveyFor({ packs: 5, have: 9 }), { config });
+  assert.equal(stocked.actions.some((a) => a.kind === 'selectPack'), false, 'no exchange when the stock already covers it');
+
+  // 稀有包不参与自动兜底：「布匹」只存在于蓝装材料自选包里，缺它也不许碰那个包。
+  const rare = planWorld(surveyFor({ packs: 99, packName: '蓝装材料自选包', material: '布匹' }), { config });
+  assert.equal(rare.actions.some((a) => a.kind === 'selectPack'), false,
+    'rare packs (equip/gene/fragment) must never be spent by the planner');
+  assert.ok(rare.notes.some((note) => note.includes('没有能换它的自选包')),
+    'and the reason is recorded, not silently swallowed');
+
+  // 工事材料自选包在白名单里，缺工事建材时可以兑。
+  const fort = planWorld(surveyFor({ packs: 4, packName: '工事材料自选包', material: '工事建材' }), { config });
+  assert.equal(packsOf(fort)[0]?.body.itemId, '工事材料自选包', 'the fort-material pack is allowed');
+  assert.equal(packsOf(fort)[0]?.body.num, 4, 'and capped by how many you own');
+
+  // 白名单可收窄：只留原料包时，缺工事建材就不兑了。
+  const narrow = planWorld(surveyFor({ packs: 4, packName: '工事材料自选包', material: '工事建材' }), {
+    config, allowPacks: ['原料自选包'],
+  });
+  assert.equal(narrow.actions.some((a) => a.kind === 'selectPack'), false,
+    'allowPacks narrows what may be spent');
+
+  // 材料不在任何自选包的覆盖范围里：不兑、并记下原因（原料包换不了工事建材之外的怪材料）。
+  const uncovered = planWorld(surveyFor({ packs: 5 }), {
+    config: { tables: { ...config.tables, SelectPackLibCfg: { data: [] } } },
+  });
+  assert.equal(uncovered.actions.some((a) => a.kind === 'selectPack'), false, 'nothing to exchange with an empty lib');
+  assert.ok(uncovered.notes.some((note) => note.includes('没有能换它的自选包')), 'and it says so');
+
+  // 两条订单抢同一批木材：各自的缺口都要补，总数正好是两条合计。
+  const two = planWorld(surveyFor({ packs: 10, orders: 2 }), { config });
+  assert.equal(packsOf(two).reduce((n, a) => n + a.body.num, 0), 10, 'both orders get their share');
+  assert.equal(two.actions.filter((a) => a.kind === 'finishOrder').length, 2, 'and both go through');
+
+  // 兑换动作靠材料名区分，否则多个兑换会撞成一个 key 被「刚被拒过」误伤。
+  assert.equal(stepKey({ kind: 'selectPack', body: { selectItemId: '玻璃' } }), 'selectPack:玻璃');
+  assert.notEqual(
+    stepKey({ kind: 'selectPack', body: { selectItemId: '木材' } }),
+    stepKey({ kind: 'selectPack', body: { selectItemId: '玻璃' } }),
+  );
+  checked += 1;
+}
+
+// 拾荒：默认不做，勾了才把海面漂浮物逐件捡起来；所得按 DisplayAsset 汇总。
+// 难点在 num —— 它是 protobuf int64，normalize 过的会是数字，没 normalize 的是 {low, high}。
+{
+  const { planWorld, summarizeFloaters, formatFloaters } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [] }, BuildingProduceCfg: { data: [] }, BuildingUpgradeCfg: { data: [] },
+  } };
+  const surveyWithFloaters = (n) => ({
+    now: 1000, player: { level: 50 }, population: 10, maxPopulation: 99,
+    stockCap: 9999, factorySlots: 2, stock: new Map(),
+    have: () => 0,
+    buildings: [], factories: [], orders: [],
+    floaters: Array.from({ length: n }, (_, i) => ({ floaterId: `f${i + 1}`, num: 1 })),
+  });
+
+  const off = planWorld(surveyWithFloaters(3), { config });
+  assert.equal(off.actions.some((a) => a.kind === 'pickUpFloater'), false, '拾荒默认关闭，不勾就不捡');
+
+  const on = planWorld(surveyWithFloaters(3), { config, pickUpFloaters: true });
+  const picks = on.actions.filter((a) => a.kind === 'pickUpFloater');
+  assert.equal(picks.length, 1, '一次请求就能提交全部漂浮物（floaterId 是 repeated string）');
+  assert.deepEqual(picks[0].body, { floaterId: ['f1', 'f2', 'f3'] },
+    'id 必须打包成数组：传字符串会被按字符拆成 N 个单字 id，服务端回 invalid floater id');
+  assert.equal(picks[0].response, 'PickUpFloaterResponse', '拾荒要拿回报，必须走带响应的 request 而不是 sendWatch');
+
+  const capped = planWorld(surveyWithFloaters(5), { config, pickUpFloaters: true, maxPickups: 2 });
+  assert.deepEqual(capped.actions.find((a) => a.kind === 'pickUpFloater')?.body.floaterId, ['f1', 'f2'],
+    '每轮上限只截前 N 件');
+  assert.ok(capped.notes.some((note) => note.includes('额度用完')), '超出上限的部分要说明');
+
+  const results = [
+    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [{ id: '木材', num: 3 }, { id: '淡水', num: 1 }] } } },
+    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [{ id: '木材', num: { low: 2, high: 0, unsigned: false } }] } } },
+    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [] } } },
+    { step: { kind: 'pickUpFloater' }, ok: true, body: { reward: { asset: [] }, deniedFloaterIds: ['x'] } },
+    { step: { kind: 'pickUpFloater' }, ok: false, error: '被拒' },
+    { step: { kind: 'gainFactory' }, ok: true, body: { reward: { asset: [{ id: '不该计入', num: 99 }] } } },
+  ];
+  const loot = summarizeFloaters(results);
+  assert.equal(loot.picked, 2, '两件有回报');
+  assert.equal(loot.empty, 2, '两件捡到但没回报');
+  assert.equal(loot.failed, 1, '一件失败');
+  assert.equal(loot.denied, 1, '一件被服务端标成 denied');
+  assert.deepEqual(loot.items, [{ id: '木材', num: 5 }, { id: '淡水', num: 1 }],
+    '同物品累加，且不把别的动作算进拾荒所得');
+  assert.ok(formatFloaters(loot).includes('木材×5'), '汇总行要能直接读');
+  assert.equal(formatFloaters(summarizeFloaters([])), '', '没拾荒就别打印空行');
+  checked += 1;
+}
+
+// 加速：数量必须是有限数字。库存算成 NaN 时宁可这次不加速，也不能把 NaN 当数量发出去
+// —— 服务端会回 invalid speed-up count，而 55 条同类动作会跟着被 blocked 掉。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [] }, BuildingProduceCfg: { data: [] }, BuildingUpgradeCfg: { data: [] },
+  } };
+  const surveyWithSpeeders = (speeders) => ({
+    now: 1000, player: { level: 50 }, population: 10, maxPopulation: 99,
+    stockCap: 9999, factorySlots: 2,
+    stock: new Map([['加速器', speeders]]),
+    have: (id) => (id === '加速器' ? speeders : 0),
+    buildings: [{ buildingId: '1A', type: '民居', level: 1, product: [], buildFinishTime: 1600, factory: null }],
+    factories: [], orders: [], floaters: [],
+  });
+
+  const step = planWorld(surveyWithSpeeders(10), { config, allowSpeedUp: true })
+    .actions.find((a) => a.kind === 'speedUpUpgrade');
+  assert.ok(step, '有加速器又在建造中，应该排一条加速');
+  assert.ok(Number.isFinite(step.body.speedUp.useNum) && step.body.speedUp.useNum > 0,
+    '加速数量必须是有限正数（历史上这里出过 NaN）');
+  assert.equal(step.body.speedUp.useNum, 10, '10 分钟路程用 10 个加速器');
+
+  const nan = planWorld(surveyWithSpeeders(NaN), { config, allowSpeedUp: true });
+  assert.equal(nan.actions.some((a) => a.kind === 'speedUpUpgrade'), false,
+    '库存是 NaN 时不许发加速请求');
+  checked += 1;
+}
+
 // 建造：OnWaterResponse 里 level=0 的建筑是已解锁未建的空位，走 BuildBuildingRequest，
 // 判据是 BuildingUpgradeCfg 的 level 1 行（实测 49 种建筑这一行全是 costTime 0 / consume 空）。
 {
@@ -731,7 +916,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     'BuildBuildingRequest', 'GotFreeDailyPackRequest',
     'DenyOrderRequest', 'SpeedUpFactoryProduceRequest', 'SetBuildingAutoWorkRequest',
     'QuickGotReadEmailRequest', 'DrawDailyRewardRequest', 'DrawWeeklyRewardRequest', 'MonthCardDailyRewardRequest',
-    'ChallengeResFieldRequest', 'GiveUpResFieldRequest',
+    'ChallengeResFieldRequest', 'GiveUpResFieldRequest', 'SelectPackRequest',
   ]);
   const sent = [];
   const client = {
@@ -748,7 +933,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     }
     if (!action.mutate) continue;
     sent.length = 0;
-    await runAction(client, protocol, id, { buildingId: 'x', productId: 'y', taskId: 1, index: 1, gridIdx: 1, useNum: 1, level: 1, isOn: true, id: 1 }, { allowMutate: true });
+    await runAction(client, protocol, id, { buildingId: 'x', productId: 'y', taskId: 1, index: 1, gridIdx: 1, useNum: 1, level: 1, isOn: true, id: 1, itemId: '原料自选包', selectItemId: '木材', num: 1, floaterId: 'f1' }, { allowMutate: true });
     assert.equal(sent.length, 1, `${id} sends exactly one message`);
     assert.equal(sent[0].via, action.response ? 'request' : 'watch', `${id} must go through ${action.response ? 'request' : 'watch'}`);
   }

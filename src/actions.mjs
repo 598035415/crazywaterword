@@ -189,6 +189,23 @@ export const ACTIONS = {
     params: ['buildingId', 'productId'],
     body: ({ buildingId, productId }) => ({ buildingId, productId }),
   },
+  selectPack: {
+    request: 'SelectPackRequest',
+    response: null,
+    mutate: true,
+    desc: '用自选包（原料自选包 / 工事材料自选包）兑换指定材料，会消耗包',
+    params: ['itemId', 'selectItemId', 'num'],
+    body: ({ itemId, selectItemId, num }) => ({ itemId, selectItemId, num: Number(num) }),
+  },
+  pickUpFloater: {
+    request: 'PickUpFloaterRequest',
+    response: 'PickUpFloaterResponse',
+    mutate: true,
+    desc: '捡起海面的漂浮物（拾荒），floaterId 是 repeated string，一次可提交多件',
+    params: ['floaterId'],
+    // 单个字符串会被 protobufjs 按字符拆开，这里统一成数组。
+    body: ({ floaterId }) => ({ floaterId: Array.isArray(floaterId) ? floaterId : [floaterId] }),
+  },
   upgradeBuilding: {
     request: 'UpgradeBuildingRequest',
     response: null,

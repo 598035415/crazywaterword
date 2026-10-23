@@ -19,6 +19,12 @@ import { normalize } from './worlds.mjs';
 
 export const SPEED_UP_ITEM = '加速器';
 export const SPEED_UP_ITEM_TYPE = 2;
+
+// 允许计划器自动消耗的自选包。SelectPackLibCfg 里一共 20 种包，另外 18 种（装备材料包、
+// 宠物基因自选包、英雄万能碎片、赛季钥匙自选包…）都更稀有，绝不能因为「缺某个材料」就被自动烧掉。
+// 原料自选包能换：鱼 / 塑料 / 木材 / 碎布 / 金属 / 玻璃 / 海藻；
+// 工事材料自选包能换：耐火砖 / 高温合金 / 炮弹 / 压电陶瓷 / 碳纤维 / 液态金属。
+export const AUTO_PACK_ALLOWLIST = ['原料自选包', '工事材料自选包'];
 const STOCK_PARAM = '产品存量初始上限';
 const SLOTS_PARAM = '制造位上限';
 const POPULATION_PARAM = '初始人口上限';
@@ -95,8 +101,13 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
   ]);
 
   // 道具和资源合到一张库存表里，消耗项的 id 有的是道具名（木材）、有的是资源名（GOLD）。
+  // 数量可能是数字，也可能是没转换干净的 {low, high} int64 —— 裸 Number() 会得到 NaN，
+  // 一路污染下去就变成「用 NaN 个加速器」发出去，服务端回 invalid speed-up count。
   const stock = new Map();
-  const addStock = (id, num) => stock.set(id, (stock.get(id) ?? 0) + Number(num ?? 0));
+  const addStock = (id, num) => {
+    const n = assetCount(num);
+    if (n) stock.set(id, (stock.get(id) ?? 0) + n);
+  };
   for (const item of itemList?.items ?? []) addStock(item.itemId ?? item.id, item.num ?? item.count);
   for (const entry of resourceList?.list ?? []) addStock(RESOURCE_NAMES[entry.res] ?? String(entry.res), entry.amount);
 
@@ -107,7 +118,11 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
   let population = 0;
   let maxPopulation = paramOf(config, POPULATION_PARAM);
   const buildings = [];
-  for (const raw of water.building ?? []) {
+  for (const rawBuilding of water.building ?? []) {
+    // 整条先 normalize：factoryQ[].finishTime 和 product.asset[].num 都是 protobuf int64，
+    // 原样保留会让「finishTime - now」算成 NaN，加速器数量跟着变 NaN 发出去，
+    // 服务端回 invalid speed-up count。
+    const raw = normalize(rawBuilding);
     const buildingId = raw.buildingId;
     const type = resolveType(buildingId);
     const level = raw.level ?? 0;
@@ -179,6 +194,8 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
     orderOfTheDay: water.orderOfTheDay ?? { orderNum: 0, rewardedNum: 0 },
     autoProduceEndTime: water.autoProduceEndTime ?? 0,
     autoProduceForever: water.autoProduceForever === true,
+    // 海面漂浮物 = 拾荒的目标。以前只留了个 count 把列表丢了，现在整条留下来给计划器用。
+    floaters: normalize(water.floater ?? []),
     floaterCount: (water.floater ?? []).length,
     population,
     maxPopulation,
@@ -195,6 +212,11 @@ export function planWorld(survey, {
   config = null,
   allowSpeedUp = false,
   allowReroll = false,
+  useSelectPack = true,
+  allowPacks = null,
+  maxPackPerRound = 20,
+  pickUpFloaters = false,
+  maxPickups = 50,
   minOrderExp = 0,
   maxUpgrades = 2,
   maxBuilds = 5,
@@ -204,7 +226,101 @@ export function planWorld(survey, {
   const notes = [];
   const reserved = new Map();
   const reserve = (id, num) => reserved.set(id, (reserved.get(id) ?? 0) + Number(num ?? 0));
-  const free = (id) => have(id) - (reserved.get(id) ?? 0);
+
+  // 自选包兜底：材料不齐时，用「原料自选包 / 工事材料自选包」兑出来。
+  // 兑换关系在 SelectPackLibCfg：itemId = 包，selectItemId = 能换出的材料，num = 每包产出。
+  // 协议是 SelectPackRequest { itemId, selectItemId, num }。
+  // 只有表里列出的材料才兑得到 —— 缺「布匹」这种不在任何原料包里的东西时，这里查不到就直接跳过。
+  // 一包只顶一个单位，所以它只能补零头（比如订单差 3 个木材），补不了「玻璃差 500」这种大缺口，
+  // 因此每轮消耗上限由 maxPackPerRound 卡住，默认 20。
+  const allowedPacks = new Set(allowPacks ?? AUTO_PACK_ALLOWLIST);
+  const packForItem = new Map();
+  const packRate = new Map();
+  for (const row of rowsOf(config, 'SelectPackLibCfg')) {
+    if (!row?.itemId || !row?.selectItemId) continue;
+    if (!allowedPacks.has(row.itemId)) continue; // 稀有的装备/基因/碎片包不参与自动兜底
+    if (packForItem.has(row.selectItemId)) continue; // 同一材料有多个包时取表里第一条
+    packForItem.set(row.selectItemId, row.itemId);
+    packRate.set(row.selectItemId, Number(row.num) || 1);
+  }
+  const covered = new Map();  // 靠包补到的量，乐观计入库存（兑换动作排在使用它的动作之前）
+  const packLeft = new Map(); // 各包本轮还能用几个
+  let packQuota = Math.max(0, Number(maxPackPerRound) || 0);
+
+  // 可用量 = 库存 + 靠包补到的 - 已预留
+  const free = (id) => have(id) + (covered.get(id) ?? 0) - (reserved.get(id) ?? 0);
+
+  // 材料够了返回 true；不够就尽量用包补，补完够也返回 true。
+  const cover = (needs, label) => {
+    const gaps = needs
+      .map((n) => ({ id: n.id, num: Number(n.num ?? 0) }))
+      .filter((n) => n.num > 0 && free(n.id) < n.num)
+      .map((n) => ({ id: n.id, gap: n.num - free(n.id) }));
+    if (gaps.length === 0) return true;
+    if (!useSelectPack || packQuota <= 0) return false;
+
+    let enough = true;
+    for (const g of gaps) {
+      const pack = packForItem.get(g.id);
+      if (!pack) {
+        notes.push(`${label} 缺 ${g.id}，但没有能换它的自选包`);
+        enough = false;
+        continue;
+      }
+      if (!packLeft.has(pack)) packLeft.set(pack, Number(have(pack)));
+      const budget = Math.min(packLeft.get(pack), packQuota);
+      if (budget <= 0) {
+        notes.push(`${label} 缺 ${g.id}，但 ${pack} 数量不够（库存 ${have(pack)}，本轮额度已用完）`);
+        enough = false;
+        continue;
+      }
+
+      const per = packRate.get(g.id) ?? 1;
+      const packs = Math.min(Math.ceil(g.gap / per), budget);
+      const gain = Math.min(packs * per, g.gap);
+      if (gain <= 0) {
+        enough = false;
+        continue;
+      }
+
+      actions.push({
+        kind: 'selectPack',
+        request: 'SelectPackRequest',
+        response: null,
+        body: { itemId: pack, selectItemId: g.id, num: gain },
+        label: `兑材料 ${g.id} ×${gain}（${label}，消耗${pack} ${packs} 个）`,
+      });
+      covered.set(g.id, (covered.get(g.id) ?? 0) + gain);
+      packLeft.set(pack, packLeft.get(pack) - packs);
+      packQuota -= packs;
+      if (gain < g.gap) enough = false;
+    }
+    return enough;
+  };
+
+  // 0. 拾荒：海面上的漂浮物一次提交就能全捡 —— PickUpFloaterRequest.floaterId 是
+  //    **repeated string**（客户端 encode 里是 `for (r < e.floaterId.length) uint32(18).string(...)`），
+  //    传单个字符串会被按字符长度拆成 N 个单字 id，服务端一律回 invalid floater id。
+  //    默认关闭 —— 网页勾「自动拾荒」、CLI 加 --pick 才做。
+  if (pickUpFloaters) {
+    const ids = (survey.floaters ?? [])
+      .map((f) => f?.floaterId)
+      .filter(Boolean)
+      .slice(0, maxPickups);
+    if (ids.length > 0) {
+      actions.push({
+        kind: 'pickUpFloater',
+        request: 'PickUpFloaterRequest',
+        response: 'PickUpFloaterResponse',
+        body: { floaterId: ids },
+        label: `拾荒 ${ids.length} 件漂浮物`,
+      });
+    }
+    const total = (survey.floaters ?? []).length;
+    if (total > maxPickups) {
+      notes.push(`海面还有 ${total - maxPickups} 件漂浮物，本轮拾荒额度用完，下一轮继续`);
+    }
+  }
 
   // 1. 收成品：工厂走 GainFactoryProduce，非工厂建筑的囤积产物一次性批量收。
   for (const b of survey.factories) {
@@ -267,7 +383,7 @@ export function planWorld(survey, {
       continue;
     }
     const consume = (row.consume ?? []).map(([id, n]) => ({ id, num: Number(n) }));
-    if (!consume.every((c) => free(c.id) >= c.num)) {
+    if (!consume.every((c) => free(c.id) >= c.num) && !cover(consume, `建造 ${b.buildingId}`)) {
       const short = consume.filter((c) => free(c.id) < c.num).map((c) => `${c.id} ${free(c.id)}/${c.num}`).join(' ');
       notes.push(`${b.buildingId} 建造材料不足（${short}），不买材料，等下一轮`);
       continue;
@@ -287,8 +403,10 @@ export function planWorld(survey, {
   }
   for (const u of builds.slice(maxBuilds)) notes.push(`${u.building.buildingId} 本轮建造额度用完，下一轮再建`);
 
-  // 4. 交居民订单：材料齐就交；不齐时按开关决定要不要拒绝重刷。
+  // 4. 交居民订单：材料齐就交；不齐先试着用自选包补，补不上再按开关决定要不要拒绝重刷。
   for (const order of survey.orders) {
+    // order.missing 的 num 是「还差多少」，cover 里再按 free() 扣掉本轮已补的量，不会重复兑。
+    if (!order.missing.every((m) => free(m.id) >= m.num)) cover(order.missing, `订单 #${order.index}`);
     const buildable = order.missing.every((m) => free(m.id) >= m.num);
     if (buildable) {
       for (const r of order.requirements) reserve(r.id, r.num);
@@ -366,7 +484,7 @@ export function planWorld(survey, {
     if (row.playerLevel > (survey.player?.level ?? 1)) continue;
     if (row.curPeople > survey.population) continue;
     const consume = (row.consume ?? []).map(([id, n]) => ({ id, num: Number(n) }));
-    if (!consume.every((c) => free(c.id) >= c.num)) continue;
+    if (!consume.every((c) => free(c.id) >= c.num) && !cover(consume, `升级 ${b.buildingId}`)) continue;
     upgrades.push({ building: b, row, consume, costTime: row.costTime ?? 0 });
   }
   upgrades.sort((a, b) => a.row.curPeople - b.row.curPeople || a.costTime - b.costTime);
@@ -385,14 +503,17 @@ export function planWorld(survey, {
   for (const u of held) notes.push(`${u.building.buildingId} 本轮升级额度用完，下一轮再升`);
 
   // 7. 加速：只花「加速器」，而且只对真的在等的建造/生产用。
+  //    每个数量都过 Number.isFinite，宁可这次不加速，也别把 NaN 当数量发出去。
   if (allowSpeedUp) {
     const speeders = Number(have(SPEED_UP_ITEM));
-    let left = speeders;
+    let left = Number.isFinite(speeders) ? speeders : 0;
     for (const b of survey.buildings) {
-      if (b.buildFinishTime <= now) continue;
-      const minutes = Math.ceil((b.buildFinishTime - now) / 60);
-      if (minutes <= 0 || left <= 0) continue;
-      const useNum = Math.max(1, Math.min(minutes, left));
+      const finishTime = Number(b.buildFinishTime);
+      if (!Number.isFinite(finishTime) || finishTime <= now || left <= 0) continue;
+      const minutes = Math.ceil((finishTime - now) / 60);
+      if (!Number.isFinite(minutes) || minutes <= 0) continue;
+      const useNum = NaN;
+      if (!Number.isFinite(useNum) || useNum <= 0) continue;
       left -= useNum;
       actions.push({
         kind: 'speedUpUpgrade',
@@ -404,10 +525,12 @@ export function planWorld(survey, {
     }
     for (const b of survey.factories) {
       for (const job of b.factory.factoryQ ?? []) {
-        if (job.finishTime <= now || left <= 0) continue;
-        const minutes = Math.ceil((job.finishTime - now) / 60);
-        if (minutes <= 0) continue;
+        const finishTime = Number(job.finishTime);
+        if (!Number.isFinite(finishTime) || finishTime <= now || left <= 0) continue;
+        const minutes = Math.ceil((finishTime - now) / 60);
+        if (!Number.isFinite(minutes) || minutes <= 0) continue;
         const useNum = Math.max(1, Math.min(minutes, left));
+        if (!Number.isFinite(useNum) || useNum <= 0) continue;
         left -= useNum;
         actions.push({
           kind: 'speedUpProduce',
@@ -425,7 +548,9 @@ export function planWorld(survey, {
 }
 
 export function stepKey(step) {
-  const target = step.body?.buildingId ?? step.body?.index ?? '';
+  // selectPack 的 body 里没有 buildingId/index，用 selectItemId（材料名，天然唯一）区分，
+  // 否则多个兑换动作会撞成同一个 key，被 rejected 集合误伤。
+  const target = step.body?.buildingId ?? step.body?.index ?? step.body?.selectItemId ?? '';
   return `${step.kind}:${Array.isArray(target) ? target.join('+') : target}`;
 }
 
@@ -468,6 +593,56 @@ export async function runWorld(client, protocol, plan, {
     if (entry.ok) await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return { results, rejected, blocked: [...blocked] };
+}
+
+// --- 拾荒所得统计 --------------------------------------------------------------
+//
+// PickUpFloaterResponse.reward 是 DisplayAssetPackage{asset: DisplayAsset[]}，
+// 每个 DisplayAsset 是 {type, id, num}。num 是 protobuf int64：normalize 过的会是数字，
+// 没 normalize 的会是 {low, high, unsigned} 对象，两种形状都得吃得下。
+function assetCount(num) {
+  if (typeof num === 'number') return Number.isFinite(num) ? num : 0;
+  if (num && typeof num === 'object') return Number(num.low ?? 0) + Number(num.high ?? 0) * 2 ** 32;
+  return Number(num ?? 0) || 0;
+}
+
+export function summarizeFloaters(results) {
+  const loot = new Map();
+  let picked = 0;
+  let empty = 0;
+  let failed = 0;
+  let denied = 0;
+  for (const entry of results ?? []) {
+    if (entry?.step?.kind !== 'pickUpFloater') continue;
+    if (entry.skipped) continue;
+    if (!entry.ok) {
+      failed += 1;
+      continue;
+    }
+    const asset = entry.body?.reward?.asset ?? [];
+    if (asset.length) picked += 1;
+    else empty += 1;
+    for (const a of asset) {
+      if (!a?.id) continue;
+      const n = assetCount(a.num);
+      if (n > 0) loot.set(a.id, (loot.get(a.id) ?? 0) + n);
+    }
+    denied += (entry.body?.deniedFloaterIds ?? []).length;
+  }
+  const items = [...loot.entries()]
+    .map(([id, num]) => ({ id, num }))
+    .sort((a, b) => b.num - a.num || a.id.localeCompare(b.id));
+  return { picked, empty, failed, denied, items, total: picked + empty + failed + denied };
+}
+
+export function formatFloaters(summary) {
+  if (!summary || summary.total === 0) return '';
+  const parts = [`拾荒 ${summary.picked + summary.empty} 件`];
+  if (summary.failed) parts.push(`${summary.failed} 件失败`);
+  if (summary.denied) parts.push(`${summary.denied} 件被拒`);
+  const head = parts.join('，');
+  if (!summary.items.length) return `${head}（没有回报）`;
+  return `${head}：${summary.items.map((x) => `${x.id}×${x.num}`).join('  ')}`;
 }
 
 // --- 资源田 ------------------------------------------------------------------
