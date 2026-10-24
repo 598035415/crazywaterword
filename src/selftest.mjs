@@ -803,6 +803,132 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 联盟情报：按舰队战力筛事件，先领奖再把每艘空闲船各派一个事件。
+// 战力比是安全线 —— 战败掉舰船耐久，宁可少打一个也别拿船去赌。
+{
+  const { viewRadar, planRadar, uidKey } = await import('./radar.mjs');
+  const config = { tables: {
+    WorldPirateCfg: { data: [
+      { type: 1, level: 1, power: 100000, showName: '海盗先锋' },
+      { type: 2, level: 1, power: 900000, showName: '海盗精锐' },
+    ] },
+    RadarRandEventCfg: { data: [
+      { eventId: 10001, type: '击退海盗', eventName: '击退{0}', eventNameParams: ['海盗'] },
+      { eventId: 20001, type: '城战试探', eventName: '探查敌城', eventNameParams: [] },
+      { eventId: 50001, type: '打捞宝箱', eventName: '打捞宝箱', eventNameParams: [] },
+    ] },
+    RadarFixedEventCfg: { data: [
+      { eventId: 2, eventName: '路易斯的行踪·{0}', eventNameParams: ['2'], power: 500000 },
+    ] },
+  } };
+
+  const event = (over) => ({
+    uid: 1, key: 'uid-1', eventId: 10001, color: 2, gridIdx: 1, state: 1,
+    pirate: { type: 1, level: 1 }, refugee: null, fixed: false,
+    reward: [{ id: 'GOLD', num: 100 }],
+    ...over,
+  });
+  const surveyFor = ({ events = [], fleets = [], stock = new Map() } = {}) => ({
+    now: 1000, level: 3, exp: 10, storedNum: 1, nextRefreshTime: 0,
+    petrol: 1000, stock, events, fleets,
+  });
+  const fleet = (over) => ({ buildingId: '1远征船', state: 1, power: 500000, durability: 2000, maxDurability: 2000, ...over });
+
+  // 战力不够：100000 × 1.2 = 120000 > 90000，不派。
+  const weak = viewRadar(surveyFor({
+    events: [event({ key: 'a', uid: 11 })],
+    fleets: [fleet({ power: 90000 })],
+  }), { config });
+  assert.equal(weak.events[0].fits, false, 'a 1.2x power margin is required before dispatching');
+  assert.equal(planRadar(weak).actions.length, 0, 'no dispatch when the fleet is too weak');
+  assert.ok(planRadar(weak).notes.some((note) => note.includes('打不了') || note.includes('打不过')), 'it explains why nothing was dispatched');
+
+  // 战力够：130000 ≥ 120000，派。
+  const strong = viewRadar(surveyFor({
+    events: [event({ key: 'a', uid: 11 })],
+    fleets: [fleet({ power: 130000 })],
+  }), { config });
+  const strongPlan = planRadar(strong);
+  assert.equal(strongPlan.actions.length, 1, 'a strong enough fleet dispatches');
+  assert.equal(strongPlan.actions[0].request, 'RadarSendFleetsRequest');
+  assert.deepEqual(strongPlan.actions[0].body, { uid: 11, fleetBuildingIds: ['1远征船'] }, 'the event uid is sent back verbatim');
+
+  // 只有 IDLE(1) 能派；修理中的船不派，但奖励照领。
+  const repairing = viewRadar(surveyFor({
+    events: [event({ key: 'a', uid: 11 }), event({ key: 'b', uid: 12, state: 4 })],
+    fleets: [fleet({ state: 4 })],
+  }), { config });
+  const repairingPlan = planRadar(repairing);
+  assert.equal(repairingPlan.actions.filter((a) => a.kind === 'radarDispatch').length, 0, 'a repairing fleet cannot be dispatched');
+  assert.equal(repairingPlan.actions.filter((a) => a.kind === 'radarReward').length, 1, 'finished events are collected anyway');
+  assert.equal(repairingPlan.actions[0].request, 'RadarGetAllRewardsRequest', 'one request collects every finished event');
+  assert.equal(repairingPlan.actions[0].body && Object.keys(repairingPlan.actions[0].body).length, 0, 'the collect-all request has an empty body');
+
+  // 排序：颜色高的优先（紫 4 > 蓝 3 > 绿 2）；同色才看战力需求。
+  const mixed = viewRadar(surveyFor({
+    events: [
+      event({ key: 'green', uid: 21, color: 2 }),
+      event({ key: 'purple', uid: 22, color: 4 }),
+    ],
+    fleets: [fleet({ power: 500000 })],
+  }), { config });
+  assert.equal(planRadar(mixed).actions[0].body.uid, 22, 'the purple event outranks the green one');
+
+  // 固定事件（eventId < 10000）派兵时不带 uid，战力查 RadarFixedEventCfg。
+  const fixedView = viewRadar(surveyFor({
+    events: [event({ key: 'fixed', uid: 31, eventId: 2, fixed: true, pirate: null })],
+    fleets: [fleet({ power: 700000 })],
+  }), { config });
+  assert.equal(fixedView.events[0].enemyPower, 500000, 'a fixed event reads its power from RadarFixedEventCfg');
+  assert.deepEqual(planRadar(fixedView).actions[0].body, { fleetBuildingIds: ['1远征船'] }, 'fixed events are dispatched without a uid');
+
+  // 难民事件要材料：材料不齐就不派（派了也只会被判失败）。
+  const refugee = viewRadar(surveyFor({
+    events: [event({
+      key: 'refugee', uid: 41, eventId: 60001, pirate: null,
+      refugee: { requirements: [{ id: '生鱼片', num: 2 }] },
+    })],
+    fleets: [fleet({ power: 500000 })],
+    stock: new Map([['生鱼片', 1]]),
+  }), { config });
+  assert.equal(refugee.events[0].dispatchable, false, 'a refugee event waits until the goods are in stock');
+
+  // 多艘空闲船：每艘各派一个事件，不重复派同一个，强船先挑（难的留给它）。
+  const twoFleets = viewRadar(surveyFor({
+    events: [
+      event({ key: 'easy', uid: 51, color: 2 }), // 敌方 100000 → 需 120000
+      event({ key: 'hard', uid: 52, color: 4, pirate: { type: 2, level: 1 } }), // 敌方 900000 → 需 1080000
+      event({ key: 'mid', uid: 53, color: 3 }),
+    ],
+    fleets: [
+      fleet({ buildingId: '1远征船', power: 2000000 }),
+      fleet({ buildingId: '2远征船', power: 300000 }),
+    ],
+  }), { config });
+  const dispatches = planRadar(twoFleets).actions.filter((a) => a.kind === 'radarDispatch');
+  assert.equal(dispatches.length, 2, 'two idle fleets => two dispatches');
+  assert.deepEqual(dispatches.map((a) => a.body.fleetBuildingIds[0]), ['1远征船', '2远征船'],
+    'the strongest fleet picks first');
+  assert.deepEqual(dispatches.map((a) => a.body.uid), [52, 53],
+    'the strong fleet takes the hardest event, the weak one the next it can win');
+  assert.equal(new Set(dispatches.map((a) => a.group)).size, 2, 'each fleet gets its own failure group');
+  assert.equal(planRadar(twoFleets, { maxDispatch: 1 }).actions.filter((a) => a.kind === 'radarDispatch').length, 1,
+    'maxDispatch still caps how many fleets go out');
+
+  // 船比事件多：只派事件数那么多，并说明剩下的船为什么没派。
+  const moreFleets = viewRadar(surveyFor({
+    events: [event({ key: 'only', uid: 61 })],
+    fleets: [fleet({ buildingId: '1远征船', power: 500000 }), fleet({ buildingId: '2远征船', power: 400000 })],
+  }), { config });
+  assert.equal(planRadar(moreFleets).actions.filter((a) => a.kind === 'radarDispatch').length, 1,
+    'one event can only take one fleet');
+  assert.ok(planRadar(moreFleets).notes.length > 0, 'leftover fleets are explained in notes');
+
+  // uid 的 int64 形状：{low, high} 与数字必须归一到同一个 key，否则去重会失效。
+  assert.equal(uidKey({ low: -709528980, high: 33048 }), uidKey(141943664636524), 'int64 uid keys must match the numeric form');
+  checked += 1;
+}
+
 // 材料不齐时用自选包兜底：SelectPackRequest 的 num 是「要换到的数量」，
 // 兑换动作必须排在用到它的动作之前，且不能把包一次性烧光。
 {
@@ -1552,6 +1678,14 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   };
   const text = formatLoopRound(summary);
   assert.ok(text.includes('拾荒 间隔未到，还差 3 分 20 秒（每 5 分一次）'), `应显示拾荒节流提示，实际：\n${text}`);
+
+  // 情报同样受间隔约束（默认 60 秒）：被挡住的那轮要说清楚还差多久。
+  const radarGated = formatLoopRound({
+    ...summary,
+    radar: { planned: 0, results: [], notes: [] },
+    gates: { radar: { enabled: true, everyMs: 60_000, lastAt: 1_700_000_000, waitSeconds: 42, throttled: true } },
+  });
+  assert.ok(radarGated.includes('情报 间隔未到，还差 42 秒（每 1 分一次）'), `应显示情报节流提示，实际：\n${radarGated}`);
 
   // 老 history（没有 gates 字段）不能炸。
   const legacy = formatLoopRound({ ...summary, gates: undefined });

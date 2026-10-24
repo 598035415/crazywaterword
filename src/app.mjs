@@ -13,6 +13,7 @@ import { surveyDailies, runDailies, formatSurvey, planChests, planDailyGift } fr
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
+import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 
 const READ_ONLY_PROBES = [
   'AllResourceRequest',
@@ -553,6 +554,55 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
   }
 }
 
+// 联盟情报（RADAR_VIEW）：先领已完成的奖励，再把每艘空闲船各派去打一个能打过的事件。
+// --dry 只列判定；--yes 才真的派兵（战败会掉舰船耐久，所以默认要求 1.2 倍战力余量）。
+// --power-ratio 0.8 可以放宽到「八折战力也上」，自己承担战损。
+// --max N 限制最多派几艘（默认不限制 = 有多少空闲船就派多少）。
+async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinity }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  try {
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const survey = await surveyRadar(client, protocol, { config });
+    const view = viewRadar(survey, { config, minPowerRatio });
+    const plan = planRadar(view, { minPowerRatio, maxDispatch });
+    console.log(`\n${formatRadarPlan(view, plan)}\n`);
+    const capText = Number.isFinite(Number(maxDispatch)) ? `一次最多派 ${maxDispatch} 艘` : '空闲船全派';
+    console.log(`共 ${plan.actions.length} 个动作（战力余量 ${minPowerRatio}×，${capText}）`);
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 900,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：舰队状态、事件状态都是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyRadar(client, protocol, { config });
+    const afterView = viewRadar(after, { config, minPowerRatio });
+    console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
+    console.log(`  待领奖 ${view.rewards.length} -> ${afterView.rewards.length}，可派 ${view.events.filter((e) => e.dispatchable).length} -> ${afterView.events.filter((e) => e.dispatchable).length}`);
+    console.log(`  汽油 ${after.petrol}`);
+  } finally {
+    client.stop();
+  }
+}
+
 // 临时验证命令：SetAutoFarmingRequest 到底管什么？
 // 协议里它只有一个 isOn，配置里却同时有「自动潜水」和「自动拾荒」两个 param，
 // 而海面响应里也有一堆并列的自动开关。所以不猜，发一次，前后各拍一张快照对比：
@@ -688,6 +738,7 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 // 自动循环：任务 → 日常 → 海面，每轮之间睡 --every 秒。必须显式开，Ctrl-C 收尾后退出。
 // 拾荒另外有自己的间隔（--pick-every，秒；0 = 不限制）。
 // 农田默认开（收成熟作物 + 补种），--no-farm 关；间隔 --farm-every（秒，默认 120）。
+// 联盟情报默认开（领奖 + 派兵），--no-radar 关；间隔 --radar-every（秒，默认 60）。
 async function loopCli({
   allowMutate,
   rounds,
@@ -701,6 +752,9 @@ async function loopCli({
   pickEverySeconds = 0,
   farmEnabled = true,
   farmEverySeconds = 120,
+  radarEnabled = true,
+  radarEverySeconds = 60,
+  minPowerRatio = 1.2,
 }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
@@ -722,6 +776,7 @@ async function loopCli({
     console.log(`开关: 加速=${allowSpeedUp ? '开(只花' + SPEED_UP_ITEM + ')' : '关'} 拒绝重刷=${allowReroll ? '开' : '关'}`);
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
+    console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -737,13 +792,16 @@ async function loopCli({
       pickEveryMs: Math.max(0, Number(pickEverySeconds) || 0) * 1000,
       farmEnabled,
       farmEveryMs: Math.max(0, Number(farmEverySeconds) || 0) * 1000,
+      radarEnabled,
+      radarEveryMs: Math.max(0, Number(radarEverySeconds) || 0) * 1000,
+      minPowerRatio,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -931,6 +989,9 @@ async function main() {
       pickEverySeconds: at('--pick-every', 0),
       farmEnabled: !process.argv.includes('--no-farm'),
       farmEverySeconds: at('--farm-every', 120),
+      radarEnabled: !process.argv.includes('--no-radar'),
+      radarEverySeconds: at('--radar-every', 60),
+      minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -967,6 +1028,17 @@ async function main() {
       maxPackPerRound: numericArg('--max-pack'),
       pickUpFloaters: process.argv.includes('--pick'),
       farm: !process.argv.includes('--no-farm'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'radar') {
+    await radar({
+      dryRun: process.argv.includes('--dry'),
+      // 战力余量：默认 1.2（舰队战力要比敌方高 20% 才派），--power-ratio 可改。
+      minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
+      maxDispatch: numericArg('--max') ?? Infinity,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;

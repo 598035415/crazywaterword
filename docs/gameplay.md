@@ -651,6 +651,68 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
 材料不齐时客户端会先弹「用钻石补」，本工具不这么做，记一笔
 「建造材料不足（X a/b），不买材料，等下一轮」；等级不够也记明「建造要等级 N，当前 M，先推主线」。
 
+### 12.8 联盟情报（雷达）：按舰队战力派兵
+
+游戏里的「联盟情报」就是客户端的 `RADAR_VIEW`，数据来自 `RadarInfoRequest`：
+
+```
+radarInfo = { events[], level, exp, storedNum, nextRefreshTime }
+events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,level},
+              refugee?:{requirements[]}, createTime, state }
+```
+
+- **`state`** 是 `RadarEventState`：`1 INIT`（可派兵）/ `2 LOCKED`（被占）/ `3 START`（我方在打）/ `4 FINISHED`（可领奖）。
+  实测抓包时 10 个事件全是 `1`。
+- **`pirate{type, level}`** 决定敌方战力，查 `WorldPirateCfg`（3 种海盗 × 550 级）：
+  type 1/2/3 = 海盗先锋/精锐/头目，lv1 分别是 84200 / 123000 / 118000。
+  `eventId >= 10000` 的才是随机事件表 `RadarRandEventCfg` 里的类型；`eventId < 10000` 是固定事件
+  （`RadarFixedEventCfg`，150 档，自带 `power`，最小 155000、最大 4 亿）。
+- **`refugee.requirements`** 是「解救难民」要交的材料，材料不齐别派（派了也是白跑）。
+- 其余事件（打捞宝箱 / 救助海兽 / 收集资源）没有 `pirate` 字段，属于「无需战斗」，但**仍要派舰队**
+  —— 客户端所有情报事件都走同一个 `RadarSendFleetsRequest`。
+
+请求（`tools/describe.mjs` 读出的字段）：
+
+| 请求 | 字段 | 说明 |
+|---|---|---|
+| `RadarSendFleetsRequest` | `uid: int64`, `fleetBuildingIds: repeated string` | 固定事件（`isFixed()`）**不带 uid**，只带舰队 |
+| `RadarGetRewardRequest` | `uid: int64` | 按事件领 |
+| `RadarGetAllRewardsRequest` | 空体 | 一键全领，本工具用它 |
+
+舰队：`MyFleetsResponse.fleets[] = { buildingId, state, durability, power, maxDura, autoFight, cityId }`。
+`FleetState`：`1 IDLE` / `2 MOVING` / `3 BATTLING` / `4 REPAIRING` / `5 QUEUING` —— **只有 IDLE 能派**。
+实测本账号 1~2 艘远征船，`power` 48 万～68 万，所以能稳定打过 lv1~lv5 的海盗（≤29 万）。
+
+本工具的做法（`src/radar.mjs`）：
+1. **先领奖**：`state === 4` 的事件合成一条 `RadarGetAllRewardsRequest`。
+2. **再派兵**：只在有 IDLE 舰队时派，且 `舰队战力 ≥ 敌方战力 × minPowerRatio`（默认 **1.2**）。
+   战败会掉舰船耐久、修船要资源，所以宁可少打一个也不拿船去赌。
+3. **排序**：`color` 降序（4 紫 > 3 蓝 > 2 绿）→ 敌方战力降序 → 奖励件数。
+   **不能只按奖励件数排** —— 打捞宝箱带 `GOLD 3700`，按件数算会把分数拉得虚高，结果船天天去捞箱子。
+4. **每艘空闲船各派一个**：一艘船同一时刻只能打一个点，所以空闲船数就是并发上限；
+   同一事件不会被派两次（`taken` 集合按事件 key 去重，固定事件用 `eventId+gridIdx` 兜底 key）。
+   配对是贪心：空闲船按战力降序排，最强的先挑优先级最高的事件，弱船顺延挑剩下能打赢的 ——
+   战力不够的事件不硬派（打输掉耐久，修船要资源）。派出去后 `state` 变 MOVING，
+   下一轮探测自然看不到那几艘船。
+   失败隔离按船分组（`group: radarDispatch:<buildingId>`）：一条被拒只停这艘船，别的船照派。
+5. **按自己的间隔跑**（`runLoop` 的 `radarEveryMs`，默认 60 秒）：这也是后来补的 ——
+   事件会随时刷出来，但每轮都探测等于每轮多发 `RadarInfo + MyFleets + AllItem` 三个请求。
+   现在跟拾荒/农田共用 `gateDue`：没到点整段跳过（一个请求都不发），到点才跑一整套
+   「读取情报 → 领已完成奖励 → 每艘空闲船各派一个事件」。
+   计时语义跟拾荒/农田**不同**：那两个是「真的排了动作才计时」，情报是**探测成功就计时**
+   —— 因为「读取情报」本身就是这套动作的一部分；探测失败不记时，下一轮立刻重试。
+
+页面上的分工：手动那套（读取情报 / 领奖 + 派兵 + 舰队表 + 事件表）在**日常页**，
+自动那套（开关 + 间隔 + 战力余量 + 上次/还差）在**挂机页**的「自动联盟情报」。两处共用同一个
+`minPowerRatio`（战力余量仍留在挂机页那个输入框）。
+
+客户端也有内置的「自动雷达」（`AutoRadar.running()`，读 `情报事件消耗汽油` 参数、遍历 `isInit()` 事件、
+取第一个 `idleTroopIds()` 派出去），但它**不看战力**，而且非月卡用户派一次就 `stop()`。
+本模块的价值就是「按战力挑、能连续派」。
+
+汽油：派兵要消耗（`情报事件消耗汽油` × 舰队数）。实测账号 16.7 万汽油，够用很久；
+`surveyRadar` 会把汽油余额读出来给页面看，但**不做余额拦截**（参数名跨表查不到时按 0 处理，拦了反而误伤）。
+
 ## 13. 账号、素材与网页控制台
 
 ### 13.1 多账号：一条记录 = 一份凭证

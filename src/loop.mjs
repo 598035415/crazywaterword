@@ -7,6 +7,7 @@
 import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
+import { surveyRadar, viewRadar, planRadar, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -61,26 +62,35 @@ export async function runLoop(client, protocol, {
   // 所以默认 2 分钟看一次（0 = 不限制，每轮都看）。开关默认开。
   farmEnabled = true,
   farmEveryMs = 120_000,
+  // 联盟情报：领已完成的奖励 + 派舰队打能打过的事件。舰队派出后 state 变 MOVING，
+  // 下一轮自然没有空闲船，但事件会随时刷出来，所以给它自己的节奏：默认 60 秒扫一次，
+  // 时间没到就整段跳过（省掉 RadarInfo + MyFleets + AllItem 三个请求）。
+  radarEnabled = true,
+  radarEveryMs = 60_000,
+  minPowerRatio = DEFAULT_MIN_POWER_RATIO,
   sleep = defaultSleep,
   stop = { aborted: false },
   onRound,
   onStep,
 } = {}) {
   if (!allowMutate) throw new Error('循环会持续改变账号状态，需要 --yes');
-  const rejected = { tasks: new Set(), world: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
   let lastPickAt = 0;
   // 农田同理：只有真的排了收/种动作才计时，没熟也没空地时不占用间隔。
   let lastFarmAt = 0;
+  // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
+  // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
+  let lastRadarAt = 0;
   // rounds <= 0 表示一直跑，靠 stop.aborted（Ctrl-C 或网页停止按钮）退出。
   const total = rounds > 0 ? rounds : Infinity;
 
   for (let round = 1; round <= total; round += 1) {
     if (stop.aborted) break;
     const tickAt = Date.now();
-    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null };
+    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, radar: null };
 
     // 1. 任务奖励
     const tasksSurvey = await surveyTasks(client, protocol, { config });
@@ -138,6 +148,44 @@ export async function runLoop(client, protocol, {
       summary.world.floaterLoot = summarizeFloaters(results);
     }
 
+    // 4. 联盟情报：先把已完成的奖励领掉，再把每艘空闲船各派去打一个「战力够」的事件。
+    //    舰队只有 IDLE 能派，派出去后 state 变 MOVING，下一轮自然跳过；
+    //    另外整段受自己的间隔约束（默认 60 秒），没到点就一次请求都不发。
+    const radarDue = radarEnabled && gateDue(lastRadarAt, radarEveryMs, tickAt);
+    summary.radar = { planned: 0, notes: [], results: [] };
+    if (radarDue) {
+      try {
+        const radarSurvey = await surveyRadar(client, protocol, { config, stock: worldSurvey.stock });
+        const radarView = viewRadar(radarSurvey, { config, minPowerRatio });
+        const radarPlan = planRadar(radarView, { minPowerRatio });
+        summary.radar.planned = radarPlan.actions.length;
+        summary.radar.notes = radarPlan.notes;
+        // 事件为 0 时把「下次刷新」一起说出来 —— 否则日志里连续几十轮「事件 0 个」，
+        // 看不出是没刷出来还是刷不出来。
+        const refreshLeft = Number(radarView.nextRefreshTime) > 0
+          ? Number(radarView.nextRefreshTime) - Math.floor(tickAt / 1000) : 0;
+        summary.radar.summary = `Lv${radarView.level} · 事件 ${radarView.events.length} 个`
+          + (radarView.events.length === 0
+            ? (refreshLeft > 0 ? `（下次刷新 ${humanDuration(refreshLeft)}后）` : '（等刷新）')
+            : '')
+          + ` · 空闲舰队 ${radarView.idleFleets.length}`;
+        if (radarPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, radarPlan, {
+            allowMutate,
+            rejected: rejected.radar,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'radar', ...entry }),
+          });
+          rejected.radar = stillRejected;
+          summary.radar.results = results;
+        }
+        // 探测成功就算这次「读取情报」用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastRadarAt = tickAt;
+      } catch (error) {
+        summary.radar.notes = [`情报探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -145,6 +193,7 @@ export async function runLoop(client, protocol, {
     summary.gates = {
       pick: { ...gateSummary(pickUpFloaters, pickEveryMs, lastPickAt, tickAt), throttled: pickUpFloaters && !pickDue },
       farm: { ...gateSummary(farmEnabled, farmEveryMs, lastFarmAt, tickAt), throttled: farmEnabled && !farmDue },
+      radar: { ...gateSummary(radarEnabled, radarEveryMs, lastRadarAt, tickAt), throttled: radarEnabled && !radarDue },
     };
 
     history.push(summary);
@@ -166,6 +215,8 @@ const KIND_TEXT = {
   startProduce: '排产',
   farmHarvest: '收农田',
   farmPlant: '播种',
+  radarReward: '领情报奖励',
+  radarDispatch: '派舰队',
   upgrade: '升级',
   speedUpUpgrade: '加速建造',
   speedUpProduce: '加速生产',
@@ -220,7 +271,16 @@ export function formatLoopRound(summary) {
     ...detailLines(summary.dailies),
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
     ...detailLines(summary.world),
+    // 情报这一轮真的探测过就印一行概览（哪怕「事件 0 个」）——
+    // 否则日志里连续几十轮看不到情报，很容易以为它根本没在跑。
+    // 被间隔挡住的那轮没有 summary 字段，只在下面的 gateLine 里体现。
+    ...(summary.radar && (summary.radar.summary || (summary.radar.notes ?? []).length > 0)
+      ? [`${line('情报', summary.radar)}${summary.radar.summary ? `  ${summary.radar.summary}` : ''}`,
+        ...detailLines(summary.radar),
+        ...(summary.radar.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...(floater ? [`  ${floater}`] : []),
+    ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),
   ].join('\n');

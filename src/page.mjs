@@ -146,38 +146,28 @@ export const PAGE = `<!doctype html>
       <span class="k">自动循环</span>
       <label class="dim">轮数 <input id="loop-rounds" value="0" style="width:56px"></label>
       <label class="dim" title="瞬成配方（生产时间被英雄委任压到 0）会一次把 6 个制造位排满，所以间隔可以放宽到 180~300 秒">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
-      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（价值高的种子优先）。作物最快 30 分钟成熟，所以默认 2 分钟才看一次">
-        <input type="checkbox" id="world-farm" checked> 农田
-      </label>
-      <label class="dim">农田间隔 <input id="farm-every" value="120" style="width:56px"> 秒</label>
-      <span id="farm-state" class="dim">还没跑过</span>
       <label class="dim"><input type="checkbox" id="world-speedup"> 允许花加速器</label>
       <label class="dim"><input type="checkbox" id="world-reroll"> 拒绝重刷订单</label>
       <button id="loop-start" class="primary">开始挂机</button>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
     </div>
-    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。</pre>
+    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 情报」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
+这里只放自动化：要手动点一次的「任务奖励」「海面」「联盟情报」都在「日常」页。</pre>
 
-    <h2>任务奖励</h2>
+    <h2>自动联盟情报</h2>
     <div class="bar">
-      <button id="tasks-plan">检查可领</button>
-      <button id="tasks-run" class="primary">领取任务奖励</button>
-      <span id="tasks-hint" class="warn"></span>
+      <label class="dim" title="联盟情报：领已完成的奖励 + 派舰队打情报事件。默认开，默认 60 秒扫一次">
+        <input type="checkbox" id="loop-radar" checked> 自动情报
+      </label>
+      <label class="dim">时间间隔 <input id="radar-every" value="60" style="width:64px"> 秒</label>
+      <label class="dim" title="战力余量 1.2 = 舰队战力要比敌方高 20% 才派，战败会掉舰船耐久">战力余量 <input id="radar-ratio" value="1.2" style="width:48px"></label>
+      <span id="radar-state" class="dim">还没跑过</span>
     </div>
-    <pre id="tasks-view">主线、支线、成就、每日订单档位。算不出目标值的会跳过。</pre>
-
-    <h2>海面</h2>
-    <div class="bar">
-      <button id="world-plan">探测计划</button>
-      <button id="world-run" class="primary">执行一轮</button>
-      <span id="world-hint" class="warn"></span>
-    </div>
-    <pre id="world-view">收成品 → 竣工 → 交单 → 按订单缺口排产（瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。</pre>
-    <div id="world-factories"></div>
-    <div id="world-orders"></div>
-    <h2>仓库</h2><div class="icons" id="world-stock"></div>
-    <h2>资源田</h2><pre id="world-fields"></pre>
+    <pre id="radar-gate-view">跟拾荒、农田同一套节奏：自动循环每轮都会看一眼，只有「距上次执行」超过间隔才真的跑一次
+「读取情报 → 领已完成奖励 → 每艘空闲船各打一个战力够的事件」，其余轮次整段跳过（连探测请求都不发）。
+战力余量越大越保守：1.2 表示舰队战力至少是敌方的 1.2 倍才派；战败会掉舰船耐久，修船要资源。
+状态「上次 3 分钟前 · 还差 20 秒」里的时间只在这轮真的探测成功后才更新 —— 探测失败不占用间隔，下一轮立刻重试。</pre>
 
     <h2>拾荒</h2>
     <div class="bar">
@@ -186,8 +176,22 @@ export const PAGE = `<!doctype html>
       <span id="pick-state" class="dim">还没跑过</span>
     </div>
     <pre id="gate-view">拾荒的节奏跟循环间隔无关，所以单独给一个时间间隔：自动循环每轮都会看一眼，只有「距上次执行」超过间隔才真的发请求，其余轮次直接跳过。
-拾荒：扫海面漂浮物，一次全捡（不消耗任何资源）。间隔填 0 表示不限制（每轮都试）；手动「执行一轮」不受间隔限制。
-潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
+拾荒：扫海面漂浮物，一次全捡（不消耗任何资源）。间隔填 0 表示不限制（每轮都试）；手动「执行一轮」不受间隔限制。</pre>
+
+    <h2>农田</h2>
+    <div class="bar">
+      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（价值高的种子优先）">
+        <input type="checkbox" id="world-farm" checked> 自动农田
+      </label>
+      <label class="dim">时间间隔 <input id="farm-every" value="120" style="width:64px"> 秒</label>
+      <span id="farm-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="farm-view">农田跟拾荒一样按自己的节奏跑，但方向相反：默认就开着，只有命令行加 --no-farm 才关。
+作物最快 30 分钟成熟，所以默认 120 秒看一眼就够；只有**真的排出了收/种动作**才记时间，地里没熟、也没空地时不占用间隔。
+收：熟一片全收（一条 FarmHarvestRequest）；种：空地和刚收的地同一轮补种（一条 FarmPlantRequest），种子按库存从**价值高的先用**（成熟时间长的更值钱），不够的地块会逐块列出原因。
+游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。</pre>
+
+    <pre class="dim" style="color:#7c8695">潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
   </section>
 
   <section id="tab-heroes" class="hidden">
@@ -201,6 +205,9 @@ export const PAGE = `<!doctype html>
   </section>
 
   <section id="tab-dailies" class="hidden">
+    <pre class="dim" style="color:#7c8695">手动操作都在这页：想立刻做一次就点按钮，不用开挂机。自动循环照样每轮会顺带做这些（开关在「挂机」页）。</pre>
+
+    <h2>日常任务</h2>
     <div class="bar">
       <button id="dailies-plan">探测</button>
       <button id="dailies-run" class="primary">一键完成</button>
@@ -209,6 +216,37 @@ export const PAGE = `<!doctype html>
     </div>
     <pre id="dailies-view">先「探测」看看现在能做哪些、为什么不能做。点金与折扣店默认跳过，勾上才会花钻石。</pre>
     <div id="dailies-table"></div>
+
+    <h2>任务奖励</h2>
+    <div class="bar">
+      <button id="tasks-plan">检查可领</button>
+      <button id="tasks-run" class="primary">领取任务奖励</button>
+      <span id="tasks-hint" class="warn"></span>
+    </div>
+    <pre id="tasks-view">主线、支线、成就、每日订单档位。算不出目标值的会跳过。</pre>
+
+    <h2>海面</h2>
+    <div class="dim">收成品、竣工、交单、排产、收农田/播种、余料升级。按「挂机」页的「农田」「拾荒」勾选执行（加速、重刷订单开关也在那边）。</div>
+    <div class="bar">
+      <button id="world-plan">探测计划</button>
+      <button id="world-run" class="primary">执行一轮</button>
+      <span id="world-hint" class="warn"></span>
+    </div>
+    <pre id="world-view">收成品 → 竣工 → 交单 → 按订单缺口排产（瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。</pre>
+    <div id="world-factories"></div>
+    <div id="world-orders"></div>
+    <h2>仓库</h2><div class="icons" id="world-stock"></div>
+    <h2>资源田</h2><pre id="world-fields"></pre>
+
+    <h2>联盟情报</h2>
+    <div class="bar">
+      <button id="radar-refresh">读取情报</button>
+      <button id="radar-run" class="primary">领奖 + 派兵</button>
+      <span id="radar-hint" class="warn"></span>
+    </div>
+    <pre id="radar-view">按舰队战力筛情报事件：每艘空闲船各派去打一个能打过的，打完的领奖励。战力余量取「挂机」页那个（默认 1.2），越大越保守 —— 战败会掉舰船耐久。
+自动挂机里也有这套（「挂机」页的「自动联盟情报」，默认每 60 秒跑一次），这里点按钮是不等间隔、立刻跑一次。</pre>
+    <div id="radar-events"></div>
   </section>
 
   <section id="tab-account" class="hidden">
@@ -618,19 +656,39 @@ function clock(seconds) {
   return new Date(seconds * 1000).toLocaleTimeString('zh-CN', { hour12: false });
 }
 
-// 拾荒的状态：上次什么时候做的、离下次还差多久。
-function renderGate(nodeId, lastAt, everyMs, enabled) {
+// 相对时间（「上次 3 分钟前」）：看的是体感，具体钟点塞进 title 不占版面。
+function ago(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 10) return '刚刚';
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m > 0 ? h + ' 小时 ' + m + ' 分钟前' : h + ' 小时前';
+}
+
+// 拾荒 / 农田 / 情报共用的门控状态：上次什么时候做的、离下次还差多久。
+// running=false 时不能说「已到间隔」——那看起来像「到点了却不执行」，
+// 实际是循环根本没在跑，所以直接点明「未在挂机」。
+function renderGate(nodeId, lastAt, everyMs, enabled, running = true) {
   const node = $(nodeId);
+  node.title = '';
   if (!enabled) {
     node.textContent = '未勾选，不会执行';
     return;
   }
   if (!lastAt) {
-    node.textContent = '上次：还没执行（首次跑就做一次）';
+    node.textContent = running ? '上次：还没执行（首次跑就做一次）' : '还没执行过（未在挂机）';
+    return;
+  }
+  node.title = '上次执行 ' + clock(lastAt);
+  const waited = Math.max(0, Date.now() / 1000 - lastAt);
+  const base = '上次 ' + ago(waited);
+  if (!running) {
+    node.textContent = base + ' · 未在挂机，不会执行';
     return;
   }
   const left = Math.max(0, Math.ceil((lastAt * 1000 + (everyMs || 0) - Date.now()) / 1000));
-  const base = '上次 ' + clock(lastAt);
   node.textContent = !(everyMs > 0) ? base + '（不限间隔，每轮都试）'
     : base + ' · ' + (left > 0 ? '还差 ' + dur(left) : '已到间隔');
 }
@@ -640,16 +698,16 @@ function renderLoop(data) {
   $('loop-stop').disabled = !data.running;
   $('loop-hint').textContent = (data.running ? '挂机中，已完成 ' : '未在挂机，累计 ') + data.completed + ' 轮' + (data.error ? '，中止: ' + data.error : '');
   // 运行中把服务端实际生效的间隔回填到输入框（用户正在改的那个不动）。
-  const pickInput = $('pick-every');
-  if (data.running && document.activeElement !== pickInput) {
-    pickInput.value = String(Math.round((data.pickEveryMs || 0) / 1000));
-  }
-  const farmInput = $('farm-every');
-  if (data.running && document.activeElement !== farmInput) {
-    farmInput.value = String(Math.round((data.farmEveryMs || 0) / 1000));
-  }
-  renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked);
-  renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked);
+  const syncInterval = (id, everyMs) => {
+    const input = $(id);
+    if (data.running && document.activeElement !== input) input.value = String(Math.round((everyMs || 0) / 1000));
+  };
+  syncInterval('pick-every', data.pickEveryMs);
+  syncInterval('farm-every', data.farmEveryMs);
+  syncInterval('radar-every', data.radarEveryMs);
+  renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked, data.running);
+  renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked, data.running);
+  renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, $('loop-radar').checked, data.running);
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
     return;
@@ -681,6 +739,10 @@ $('loop-start').onclick = async () => {
         // 农田默认开，跟拾荒一样有独立间隔（作物最快 30 分钟熟，默认 2 分钟看一次）。
         farm: $('world-farm').checked,
         farmEverySeconds: Number($('farm-every').value || 0),
+        // 情报默认开，跟拾荒/农田一样有独立间隔（默认 60 秒）；战力余量越小越激进（战败掉耐久）。
+        radar: $('loop-radar').checked,
+        radarEverySeconds: Number($('radar-every').value || 0),
+        powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
     refreshLoop();
@@ -700,6 +762,7 @@ $('loop-stop').onclick = async () => {
 // 勾选一变就把「上次 / 还差多久」重算一遍，不用等下一次 3 秒轮询。
 $('world-pick').onchange = refreshLoop;
 $('world-farm').onchange = refreshLoop;
+$('loop-radar').onchange = refreshLoop;
 
 $('tasks-plan').onclick = async () => {
   $('tasks-hint').textContent = '检查中 ...';
@@ -763,6 +826,71 @@ function renderWorld(data) {
   if (!sbox.childElementCount) sbox.appendChild(el('span', 'dim', '仓库空'));
   $('world-fields').textContent = data.resFields.text || '';
 }
+
+// ---- 联盟情报 --------------------------------------------------------------
+// 一张表说清「哪些能打、为什么不能打」。判定全在服务端算好（radar.mjs），前端只画。
+function renderRadar(data) {
+  $('radar-view').textContent = data.text;
+  const box = clear($('radar-events'));
+  const fleets = data.fleets || [];
+  if (fleets.length) {
+    box.appendChild(el('h2', null, '舰队'));
+    // cell 分支要的是资产对象 {icon, id}（服务端已经把 icon 一起返回了），
+    // 之前只传了 cell: fleet.icon（只是个图标对象，没有 id），名字就渲染成 undefined。
+    box.appendChild(table(['舰队', '状态', '战力', '耐久'], fleets.map((fleet) => [
+      { cell: { icon: fleet.icon, id: fleet.buildingId } },
+      fleet.stateText,
+      fmt(fleet.power),
+      fleet.maxDurability ? fmt(fleet.durability) + '/' + fmt(fleet.maxDurability) : '—',
+    ])));
+  }
+  box.appendChild(el('h2', null, '情报事件'));
+  if (!data.events.length) {
+    box.appendChild(el('div', 'dim', '情报里现在没有事件'));
+    return;
+  }
+  box.appendChild(table(['事件', '敌方战力', '状态', '奖励'], data.events.map((event) => [
+    event.name,
+    event.enemyPower > 0 ? fmt(event.enemyPower) : '无需战斗',
+    event.state === 4 ? chip('done', '待领奖')
+      : event.state !== 1 ? chip('waiting', event.stateText)
+        : event.dispatchable ? chip('ready', '可派')
+          : chip('blocked', event.fits ? '缺材料' : '战力不够'),
+    (event.reward || []).slice(0, 3).map((asset) => asset.id + '×' + fmt(asset.num)).join('、')
+      + ((event.reward || []).length > 3 ? ' 等 ' + (event.reward || []).length + ' 项' : ''),
+  ])));
+}
+
+async function refreshRadar() {
+  $('radar-hint').textContent = '读取中 ...';
+  try {
+    renderRadar(await call('/api/radar'));
+    $('radar-hint').textContent = '';
+  } catch (error) {
+    $('radar-hint').textContent = error.message;
+  }
+}
+
+$('radar-refresh').onclick = refreshRadar;
+$('radar-run').onclick = () => {
+  const ratio = Number($('radar-ratio').value || 1.2);
+  openConfirm('联盟情报：领奖 + 派兵', [
+    el('div', null, '先把已完成（待领奖）的情报奖励一次领掉，再把**每一艘空闲船**各派去打一个能打的事件（船有几艘就派几个，互不重复）。'),
+    el('div', null, '战力余量 ' + ratio + '×：舰队战力 ≥ 敌方 × ' + ratio + ' 才派。战败会掉舰船耐久，调小就是拿船去赌。'),
+    el('div', null, '派兵会消耗汽油（余量见下方舰队表）；同一时刻只有一艘船能打一个点。'),
+    el('div', null, '不想手动点：回「挂机」页把「自动情报」勾上，它会按设定的间隔自己跑这一套。'),
+  ], async () => {
+    $('radar-hint').textContent = '执行中 ...';
+    try {
+      const data = await call('/api/radar/run', { method: 'POST', body: JSON.stringify({ confirm: true, powerRatio: ratio }) });
+      const failed = data.results.filter((r) => r.ok === false).length;
+      $('radar-hint').textContent = '执行 ' + data.results.length + ' 个动作，失败 ' + failed;
+      renderRadar(data);
+    } catch (error) {
+      $('radar-hint').textContent = error.message;
+    }
+  });
+};
 
 $('world-plan').onclick = async () => {
   $('world-hint').textContent = '探测中 ...';

@@ -15,6 +15,7 @@ import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
+import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -80,6 +81,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         farmEnabled: true,
         farmEveryMs: 120_000,
         lastFarmAt: null,
+        // 联盟情报：默认开，派兵前要求舰队战力 ≥ 敌方 × minPowerRatio（战败掉耐久）。
+        // 探测 + 领奖 + 派兵按自己的间隔跑（默认 60 秒），没到点整段跳过。
+        radarEnabled: true,
+        radarEveryMs: 60_000,
+        lastRadarAt: null,
+        minPowerRatio: DEFAULT_MIN_POWER_RATIO,
         stop: { aborted: false },
         history: [],
         error: null,
@@ -292,6 +299,35 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           costs: recipe.costs.map((cost) => ({ ...cost, icon: itemIcon(cost.id) })),
         })),
       })),
+    };
+  }
+
+  // 联盟情报：只读视图（事件 + 舰队 + 计划）。真正的派兵走 /api/radar/run。
+  // 舰队 id 形如「1远征船」，去掉前缀数字就是建筑类型，拿来取图标。
+  async function radar(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyRadar(instance, protocol, { config });
+    const ratio = Number(session.loop.minPowerRatio) || DEFAULT_MIN_POWER_RATIO;
+    const view = viewRadar(survey, { config, minPowerRatio: ratio });
+    const plan = planRadar(view, { minPowerRatio: ratio });
+    const fleetIcon = (buildingId) => buildingIcon(String(buildingId).replace(/^\d+[A-Z]?/, ''));
+    return {
+      level: view.level,
+      exp: view.exp,
+      storedNum: view.storedNum,
+      nextRefreshTime: view.nextRefreshTime,
+      petrol: view.petrol,
+      bestIdlePower: view.bestIdlePower,
+      minPowerRatio: ratio,
+      fleets: view.fleets.map((fleet) => ({ ...fleet, icon: fleetIcon(fleet.buildingId) })),
+      events: view.events.map((event) => ({
+        ...event,
+        reward: (event.reward ?? []).map((asset) => ({ ...asset, icon: materialIcon(asset.id) })),
+      })),
+      plan: plan.actions,
+      notes: plan.notes,
+      text: formatRadarPlan(view, plan),
     };
   }
 
@@ -567,6 +603,41 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         return;
       }
       // ---- 工厂 ----
+      if (route === 'GET /api/radar') {
+        const { account, session } = scoped_(parsed);
+        json(await radar(session, account));
+        return;
+      }
+      // 派兵/领奖：跟 world 一样先探测再计划再执行；每艘空闲船各派一个事件。
+      if (route === 'POST /api/radar/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const survey = await surveyRadar(instance, protocol, { config });
+        const ratio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : (Number(session.loop.minPowerRatio) || DEFAULT_MIN_POWER_RATIO);
+        const view = viewRadar(survey, { config, minPowerRatio: ratio });
+        const plan = planRadar(view, {
+          minPowerRatio: ratio,
+          // 默认不限：有多少空闲船就派多少（每艘船打一个事件）。传 max 才限制。
+          maxDispatch: Number(payload.max) > 0 ? Number(payload.max) : Infinity,
+        });
+        const { results } = await runWorld(instance, protocol, plan, {
+          allowMutate: true,
+          window: 900,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `情报「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `情报 ${entry.step.label}` : `情报 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await radar(session, account)),
+        });
+        return;
+      }
       if (route === 'GET /api/factory') {
         const { account, session } = scoped_(parsed);
         json(await factory(session, account));
@@ -813,6 +884,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.farmEnabled = payload.farm !== false;
         loop.farmEveryMs = Math.max(0, Number(payload.farmEverySeconds ?? 120)) * 1000;
         loop.lastFarmAt = null;
+        // 情报默认开；powerRatio 前端可调（默认 1.2，越大越保守）；间隔默认 60 秒。
+        loop.radarEnabled = payload.radar !== false;
+        loop.radarEveryMs = Math.max(0, Number(payload.radarEverySeconds ?? 60)) * 1000;
+        loop.lastRadarAt = null;
+        loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
         loop.history = [];
         loop.error = null;
         loop.stop = { aborted: false };
@@ -820,7 +896,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const farmText = loop.farmEnabled
           ? (loop.farmEveryMs > 0 ? `农田每 ${Math.round(loop.farmEveryMs / 1000)} 秒看一眼` : '农田每轮都看')
           : '农田关';
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}；${farmText}`);
+        const radarText = loop.radarEnabled
+          ? `情报${loop.radarEveryMs > 0 ? `每 ${Math.round(loop.radarEveryMs / 1000)} 秒一次` : '每轮都看'}（战力余量 ${loop.minPowerRatio}×）`
+          : '情报关';
+        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}；${farmText}；${radarText}`);
         runLoop(instance, protocol, {
           config,
           player: session.player,
@@ -834,11 +913,15 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           pickEveryMs: loop.pickEveryMs,
           farmEnabled: loop.farmEnabled,
           farmEveryMs: loop.farmEveryMs,
+          radarEnabled: loop.radarEnabled,
+          radarEveryMs: loop.radarEveryMs,
+          minPowerRatio: loop.minPowerRatio,
           stop: loop.stop,
           onRound: (summary) => {
             loop.completed = summary.round;
             loop.lastPickAt = summary.gates?.pick?.lastAt ?? loop.lastPickAt;
             loop.lastFarmAt = summary.gates?.farm?.lastAt ?? loop.lastFarmAt;
+            loop.lastRadarAt = summary.gates?.radar?.lastAt ?? loop.lastRadarAt;
             loop.history.push(summary);
             if (loop.history.length > 50) loop.history.shift();
             emit(session, 'info', formatLoopRound(summary));
@@ -890,6 +973,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       farmEnabled: loop.farmEnabled,
       farmEveryMs: loop.farmEveryMs,
       lastFarmAt: loop.lastFarmAt,
+      radarEnabled: loop.radarEnabled,
+      radarEveryMs: loop.radarEveryMs,
+      lastRadarAt: loop.lastRadarAt,
+      minPowerRatio: loop.minPowerRatio,
       history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
       error: loop.error,
     };
