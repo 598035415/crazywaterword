@@ -386,7 +386,7 @@ export function planWorld(survey, {
   // （没连上游戏、或者想按「如果我换一套委任会怎样」试算时用）。
   produceReduceSec = null,
   // 瞬成配方的排满策略：减免把生产时间压到 0 的配方，一次把空制造位排满；
-  // 关掉就回到老行为（一轮每座工厂只排 1 个）。
+  // 关掉就退回「一轮每座工厂只排 1 个」。
   fillInstantQueue = true,
   // 农田开关：收成熟作物 + 补种空地。跟拾荒一样由调用方按自己的间隔门控
   // （循环默认 2 分钟看一次），关掉就完全不碰农田。
@@ -616,34 +616,46 @@ export function planWorld(survey, {
     }
   }
 
-  // 5. 排产：按订单缺口挑配方，缺得多的先产；已设自动生产的工厂不覆盖。
+  // 5. 排产：**只补「完全空闲」的工厂**。
   //
-  //    关键：生产时间是**减免后**的（produceFinalTime 里先减 reduce 再提速）。
-  //    减免 774 秒时，300 秒的鱼/淡水/布匹实际上 0 秒完成 —— 这种「瞬成」配方
-  //    一次就把空制造位排满，否则一轮只补 1 个，低级物品永远要靠缩短循环间隔续产。
-  //    非瞬成的配方仍然一轮只排 1 个：队列是串行的，多排只会把同一批料提前烧掉。
+  //    判据是 factoryQ 为空 —— 队列里还有东西在造就一个都不排（提前排只会把料先烧掉，
+  //    也容易把用户在游戏里手动排的队顶掉）。空闲时才从「第一个能造的产品」开始排：
+  //    订单缺口优先、其余按生产时间短的先排；已到存量上限 / 料不够 / 等级没到的会被过滤，
+  //    所以「排到哪个」天然就是「第一个还没满的产品」。
+  //    当这座工厂下所有产品都满了（cand 为空）→ 就让它空着，这是正常状态。
+  //
+  //    生产时间是**减免后**的（produceFinalTime 先减 reduce 再提速）：减免 840 秒时
+  //    300 秒的鱼/淡水/布匹就是 0 秒，这类「瞬成」配方一次占满制造位，不然低级物品
+  //    每分钟都得回来补一次。
   const demand = new Map();
   for (const order of survey.orders) {
     for (const m of order.missing) demand.set(m.id, (demand.get(m.id) ?? 0) + m.num);
   }
   const produceRows = rowsOf(config, 'BuildingProduceCfg');
   const instantHints = new Set(survey.produce?.instant ?? []);
+  // 订单缺口的先产，其余按产出时间短的先产（早点回本）。
+  const scoreOf = (row) => (demand.get(row.itemId) ?? 0) * 1e6 - Number(row.produceTime || 0);
   for (const b of survey.factories) {
     if (b.factory.autoProductId) {
       notes.push(`${b.buildingId} 已设自动生产 ${b.factory.autoProductId}，不覆盖`);
       continue;
     }
     const queue = b.factory.factoryQ ?? [];
-    if (queue.length >= survey.factorySlots) continue;
+    // 没在生产东西才补。队列非空 = 有活（可能是我们上一轮排的，也可能是用户手动排的）。
+    if (queue.length > 0) continue;
+    const slots = Math.max(0, Number(survey.factorySlots) || 0);
+    if (slots === 0) continue;
     const cand = produceRows
       .filter((row) => row.buildType === b.type && row.unlockLevel <= b.level)
-      .filter((row) => !queue.some((job) => job.productId === row.itemId))
-      .filter((row) => have(row.itemId) < survey.stockCap)
-      .filter((row) => (row.costItem ?? []).every(([id, n]) => free(id) >= n));
-    if (cand.length === 0) continue;
-    // 订单缺口的先产，其余按产出时间短的先产（早点回本）。
-    const score = (row) => (demand.get(row.itemId) ?? 0) * 1e6 - row.produceTime;
-    const best = cand.sort((a, b2) => score(b2) - score(a))[0];
+      .filter((row) => (survey.stockCap > 0 ? have(row.itemId) < survey.stockCap : true))
+      .filter((row) => (row.costItem ?? []).every(([id, n]) => free(id) >= n))
+      .sort((a, b2) => scoreOf(b2) - scoreOf(a));
+    if (cand.length === 0) {
+      // 空闲是正常状态：要么这个等级的产品都排满了，要么料不够。
+      notes.push(`${b.buildingId} 空闲：没有能排的配方（产品到存量上限 ${survey.stockCap} / 缺材料 / 等级不够）`);
+      continue;
+    }
+    const best = cand[0];
     const need = demand.get(best.itemId) ?? 0;
     // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
     // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
@@ -652,16 +664,14 @@ export function planWorld(survey, {
       finalSeconds,
       hint: instantHints.has(`${b.type}\u0000${best.itemId}`),
     });
-    const slots = Math.max(0, (Number(survey.factorySlots) || 0) - queue.length);
     const wanted = fillInstantQueue && instant ? slots : 1;
-    // 产品持有量 = 仓库 + 工厂待收 + 队列里还排着的，跟服务端 storage full 的口径一致。
+    // 产品持有量 = 仓库 + 工厂待收 + 队列里排着的，跟服务端 storage full 的口径一致。
     const held = have(best.itemId)
       + (b.factory.finishedProducts ?? [])
         .filter((asset) => asset.id === best.itemId)
         .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
       + queue.filter((job) => job.productId === best.itemId).length;
-    // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」，
-    // 光有产品名看不出为什么它一直排这个（或者为什么别的配方排不上）。
+    // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」。
     const costText = (best.costItem ?? []).map(([id, n]) => `${id}×${n}`).join(' ');
     const timeText = instant
       ? `瞬成${produceReduce > 0 ? `，原 ${best.produceTime}s - 减免 ${produceReduce}s` : '（队列观测）'}`

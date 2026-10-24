@@ -226,13 +226,14 @@ export const PAGE = `<!doctype html>
     <pre id="tasks-view">主线、支线、成就、每日订单档位。算不出目标值的会跳过。</pre>
 
     <h2>海面</h2>
-    <div class="dim">收成品、竣工、交单、排产、收农田/播种、余料升级。按「挂机」页的「农田」「拾荒」勾选执行（加速、重刷订单开关也在那边）。</div>
+    <div class="dim">收成品、竣工、交单、给空闲工厂排产、收农田/播种、余料升级。按「挂机」页的「农田」「拾荒」勾选执行（加速、重刷订单开关也在那边）。</div>
     <div class="bar">
       <button id="world-plan">探测计划</button>
       <button id="world-run" class="primary">执行一轮</button>
       <span id="world-hint" class="warn"></span>
     </div>
-    <pre id="world-view">收成品 → 竣工 → 交单 → 按订单缺口排产（瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。</pre>
+    <pre id="world-view">收成品 → 竣工 → 交单 → 给空闲工厂排产（按订单缺口，瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。
+「空闲」= 这座工厂的制造队列为空；队列里还有东西在造就完全不碰，所有产品都到存量上限时它就该空着。</pre>
     <div id="world-factories"></div>
     <div id="world-orders"></div>
     <h2>仓库</h2><div class="icons" id="world-stock"></div>
@@ -905,7 +906,7 @@ $('world-plan').onclick = async () => {
 };
 $('world-run').onclick = () => {
   openConfirm('执行一轮海面自动化', [
-    el('div', null, '会收成品、竣工、交居民订单、按缺口排产、收农田并重新播种、把余料拿去升级建筑。'),
+    el('div', null, '会收成品、竣工、交居民订单、给空闲工厂按缺口排产、收农田并重新播种、把余料拿去升级建筑。'),
     el('div', null, '加速只花加速器（' + ($('world-speedup').checked ? '当前允许' : '当前不允许') + '），钻石与付费礼包永不购买。'),
     el('div', null, $('world-pick').checked ? '会顺带扫海面漂浮物（拾荒），捡完打印所得。' : '未勾「自动拾荒」，不会动海面漂浮物。'),
     el('div', null, $('world-farm').checked ? '会收成熟作物并补种空地（种子按价值高的先用）。' : '未勾「农田」，不碰农田。'),

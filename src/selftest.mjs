@@ -685,9 +685,13 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const slow = planWorld(surveyFor({ seaweed: 9, reduce: 0 }), { config });
   assert.equal(producesOf(slow).length, 1, 'a non-instant recipe is still queued one at a time');
   assert.equal(producesOf(slow)[0].body.productId, '鱼', 'the shorter recipe is still preferred');
-  // 队列已占 2 格时，瞬成只补剩下的 4 格。
-  const partial = planWorld(surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }] }), { config });
-  assert.equal(producesOf(partial).length, 4, 'an occupied queue only fills the free slots');
+  // 队列里还有东西在造：这座工厂完全不碰 —— 只有「没在生产东西」才补，
+  // 这样也不会把用户手动排的队插花。
+  const busy = planWorld(surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }] }), { config });
+  assert.equal(producesOf(busy).length, 0, 'a factory that is still producing is left alone');
+  // 所有产品都到上限 → 空闲是正常状态，notes 里要说明原因（候选被过滤 / 循环里被 held 卡住都算）。
+  assert.ok(noRoom.notes.some((note) => note.includes('空闲') || note.includes('上限')),
+    'an idle factory says why');
 
   // 批量排产中途被拒：只停这座工厂剩下的几条，别的工厂照排，
   // 而且不能写进 rejected —— 队列满/库存满都是瞬时状态，记一辈子就再也不排了。
