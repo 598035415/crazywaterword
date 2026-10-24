@@ -495,7 +495,7 @@ async function tasks({ allowMutate, dryRun }) {
 // 材料不齐时默认会拿「原料自选包 / 工事材料自选包」兑出来补（--no-pack 关掉，--max-pack 改上限）。
 // --pick 才扫海面漂浮物（拾荒），结束后打印所得。
 // 没有 --dive：潜水/打捞的请求体里要填「你实际捡到了什么」，纯协议只能伪造，故不做（见 docs/gameplay.md）。
-async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, pickUpFloaters = false }) {
+async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, pickUpFloaters = false, farm = true }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -507,7 +507,7 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyWorld(client, protocol, { config, player: response.playerInfo });
-    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters });
+    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters, farm });
     console.log(`\n${formatWorldPlan(survey, plan)}\n`);
     console.log(`共 ${plan.actions.length} 个动作${allowSpeedUp ? '' : '（未开 --speed-up，不会花' + SPEED_UP_ITEM + '）'}`
       + `${pickUpFloaters ? `，含拾荒 ${(survey.floaters ?? []).length} 件漂浮物` : '（未开 --pick，不拾荒）'}`);
@@ -687,6 +687,7 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 
 // 自动循环：任务 → 日常 → 海面，每轮之间睡 --every 秒。必须显式开，Ctrl-C 收尾后退出。
 // 拾荒另外有自己的间隔（--pick-every，秒；0 = 不限制）。
+// 农田默认开（收成熟作物 + 补种），--no-farm 关；间隔 --farm-every（秒，默认 120）。
 async function loopCli({
   allowMutate,
   rounds,
@@ -698,6 +699,8 @@ async function loopCli({
   maxPackPerRound,
   pickUpFloaters = false,
   pickEverySeconds = 0,
+  farmEnabled = true,
+  farmEverySeconds = 120,
 }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
@@ -718,6 +721,7 @@ async function loopCli({
     console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}，${rounds > 0 ? `共 ${rounds} 轮` : '一直跑（Ctrl-C 停）'}，间隔 ${everySeconds}s`);
     console.log(`开关: 加速=${allowSpeedUp ? '开(只花' + SPEED_UP_ITEM + ')' : '关'} 拒绝重刷=${allowReroll ? '开' : '关'}`);
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
+    console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -731,6 +735,8 @@ async function loopCli({
       maxPackPerRound,
       pickUpFloaters,
       pickEveryMs: Math.max(0, Number(pickEverySeconds) || 0) * 1000,
+      farmEnabled,
+      farmEveryMs: Math.max(0, Number(farmEverySeconds) || 0) * 1000,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
@@ -923,6 +929,8 @@ async function main() {
       maxPackPerRound: numericArg('--max-pack'),
       pickUpFloaters: process.argv.includes('--pick'),
       pickEverySeconds: at('--pick-every', 0),
+      farmEnabled: !process.argv.includes('--no-farm'),
+      farmEverySeconds: at('--farm-every', 120),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -958,6 +966,7 @@ async function main() {
       useSelectPack: !process.argv.includes('--no-pack'),
       maxPackPerRound: numericArg('--max-pack'),
       pickUpFloaters: process.argv.includes('--pick'),
+      farm: !process.argv.includes('--no-farm'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;

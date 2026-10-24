@@ -722,6 +722,87 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 农田：成熟的批量收、空出来的批量播。
+// 两个请求都是 repeated（FarmHarvestRequest.buildingId / FarmPlantRequest.args），一轮各一条就够；
+// 种子在 FarmlandPlantCfg.material = [种子名, 份数]（**一对**，不是列表），要按库存扣。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '农田' }] },
+    BuildingProduceCfg: { data: [] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    FarmlandPlantCfg: { data: [
+      { id: '小麦', time: 1800, produceNum: 5, material: ['小麦种子', 1] },
+      { id: '玉米', time: 1800, produceNum: 5, material: ['玉米种子', 1] },
+      { id: '南瓜', time: 4800, produceNum: 5, material: ['南瓜种子', 1] },
+    ] },
+  } };
+  const surveyFor = ({ plots, seeds = {}, orders = [], autoFarming = false } = {}) => {
+    const stock = new Map(Object.entries(seeds));
+    const buildings = plots.map((plot, i) => ({
+      buildingId: `${i + 1}农田`,
+      type: '农田',
+      level: 1,
+      product: [],
+      buildFinishTime: 0,
+      factory: null,
+      farm: plot,
+    }));
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6,
+      autoFarming, buildings, factories: [], orders,
+      produce: { reduce: 0, instant: [] },
+    };
+  };
+  const of = (plan, kind) => plan.actions.filter((a) => a.kind === kind);
+  const ripe = { productId: '玉米', ripeAt: 900, plantAt: 100 };
+  const idle = { productId: '', ripeAt: 0, plantAt: 0 };
+  const growing = { productId: '玉米', ripeAt: 5000, plantAt: 990 };
+
+  // 熟的一次收完（多块装一条请求），空的一块紧接着种。
+  const basic = planWorld(surveyFor({ plots: [ripe, idle, growing], seeds: { 小麦种子: 10 } }), { config });
+  assert.equal(of(basic, 'farmHarvest').length, 1, 'all ripe plots go in one harvest request');
+  assert.deepEqual(of(basic, 'farmHarvest')[0].body.buildingId, ['1农田'], 'only the ripe plot is harvested');
+  assert.equal(of(basic, 'farmPlant').length, 1, 'planting is one batched request');
+  // 刚收的那块地收完就是空的，同一轮直接种上；生长中的那块不动。
+  assert.deepEqual(of(basic, 'farmPlant')[0].body.args,
+    [{ buildingId: '1农田', productId: '小麦' }, { buildingId: '2农田', productId: '小麦' }],
+    'the harvested plot is replanted in the same round, the growing one is left alone');
+  assert.deepEqual(basic.reserved, [['小麦种子', 2]], 'both seeds are reserved, not silently spent');
+  assert.equal(of(basic, 'farmHarvest')[0].response, null, 'FarmHarvestRequest has no paired response');
+  assert.equal(of(basic, 'farmPlant')[0].response, null, 'FarmPlantRequest has no paired response');
+
+  // 播种顺序：价值高的先种（配置里没有价格字段，用成熟时间当代价），同一时长内订单缺的优先。
+  const valuable = planWorld(surveyFor({ plots: [idle, idle, idle], seeds: { 小麦种子: 10, 南瓜种子: 10 } }), { config });
+  assert.equal(of(valuable, 'farmPlant')[0].body.args.every((arg) => arg.productId === '南瓜'), true,
+    'the most valuable seed (longest grow time) is planted first');
+  const wanted = planWorld(surveyFor({
+    plots: [idle, idle, idle],
+    seeds: { 小麦种子: 10, 玉米种子: 10 },
+    orders: [{ index: 1, requirements: [{ id: '玉米', num: 5 }], missing: [{ id: '玉米', num: 5 }], rewardExp: 10 }],
+  }), { config });
+  assert.equal(of(wanted, 'farmPlant')[0].body.args.every((arg) => arg.productId === '玉米'), true,
+    'between equally long crops the one an order is short of wins');
+
+  // 种子只够一块：种一块，剩下的写成 notes 说清楚。
+  const short = planWorld(surveyFor({ plots: [idle, idle, idle], seeds: { 小麦种子: 1 } }), { config });
+  assert.equal(of(short, 'farmPlant')[0].body.args.length, 1, 'only as many plots as the seeds can cover');
+  assert.ok(short.notes.some((note) => note.includes('没种子可种')), 'the unplanted plots are explained');
+
+  // 游戏内「自动种植」开着：服务端自己播，计划里只许收、不许播。
+  const auto = planWorld(surveyFor({ plots: [ripe, idle], seeds: { 小麦种子: 10 }, autoFarming: true }), { config });
+  assert.equal(of(auto, 'farmHarvest').length, 1, 'auto farming still needs the harvest');
+  assert.equal(of(auto, 'farmPlant').length, 0, 'auto farming means the server plants, we must not');
+  assert.ok(auto.notes.some((note) => note.includes('自动种植')), 'it says why it did not plant');
+
+  // 开关关掉就完全不碰农田（连收都不收）—— 循环按自己的间隔传 farm:false。
+  const off = planWorld(surveyFor({ plots: [ripe, idle], seeds: { 小麦种子: 10 } }), { config, farm: false });
+  assert.equal(of(off, 'farmHarvest').length + of(off, 'farmPlant').length, 0, 'farm:false touches nothing');
+  checked += 1;
+}
+
 // 材料不齐时用自选包兜底：SelectPackRequest 的 num 是「要换到的数量」，
 // 兑换动作必须排在用到它的动作之前，且不能把包一次性烧光。
 {

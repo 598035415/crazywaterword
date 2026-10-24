@@ -57,6 +57,10 @@ export async function runLoop(client, protocol, {
   maxPackPerRound,
   pickUpFloaters = false,
   pickEveryMs = 0,
+  // 农田跟拾荒一样有自己的节奏：作物最快也要 30 分钟成熟，每轮都探测纯属浪费请求，
+  // 所以默认 2 分钟看一次（0 = 不限制，每轮都看）。开关默认开。
+  farmEnabled = true,
+  farmEveryMs = 120_000,
   sleep = defaultSleep,
   stop = { aborted: false },
   onRound,
@@ -68,6 +72,8 @@ export async function runLoop(client, protocol, {
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
   let lastPickAt = 0;
+  // 农田同理：只有真的排了收/种动作才计时，没熟也没空地时不占用间隔。
+  let lastFarmAt = 0;
   // rounds <= 0 表示一直跑，靠 stop.aborted（Ctrl-C 或网页停止按钮）退出。
   const total = rounds > 0 ? rounds : Infinity;
 
@@ -103,6 +109,7 @@ export async function runLoop(client, protocol, {
     // 3. 海面世界。拾荒按自己的间隔节流：间隔没到就这轮不发，到点才发。
     //    （潜水已移除：DivingRequest 要上报「捡到了什么」，纯协议发空体只能拿回空奖励。见 docs。）
     const pickDue = pickUpFloaters && gateDue(lastPickAt, pickEveryMs, tickAt);
+    const farmDue = farmEnabled && gateDue(lastFarmAt, farmEveryMs, tickAt);
     const worldSurvey = await surveyWorld(client, protocol, { config, player });
     const worldPlan = planWorld(worldSurvey, {
       config,
@@ -111,6 +118,7 @@ export async function runLoop(client, protocol, {
       useSelectPack,
       maxPackPerRound,
       pickUpFloaters: pickDue,
+      farm: farmDue,
     });
     summary.world = {
       planned: worldPlan.actions.length,
@@ -133,8 +141,10 @@ export async function runLoop(client, protocol, {
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
+    if (farmDue && worldPlan.actions.some((action) => action.kind === 'farmHarvest' || action.kind === 'farmPlant')) lastFarmAt = tickAt;
     summary.gates = {
       pick: { ...gateSummary(pickUpFloaters, pickEveryMs, lastPickAt, tickAt), throttled: pickUpFloaters && !pickDue },
+      farm: { ...gateSummary(farmEnabled, farmEveryMs, lastFarmAt, tickAt), throttled: farmEnabled && !farmDue },
     };
 
     history.push(summary);
@@ -154,6 +164,8 @@ const KIND_TEXT = {
   finishOrder: '交订单',
   denyOrder: '拒单',
   startProduce: '排产',
+  farmHarvest: '收农田',
+  farmPlant: '播种',
   upgrade: '升级',
   speedUpUpgrade: '加速建造',
   speedUpProduce: '加速生产',
@@ -210,5 +222,6 @@ export function formatLoopRound(summary) {
     ...detailLines(summary.world),
     ...(floater ? [`  ${floater}`] : []),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
+    ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),
   ].join('\n');
 }

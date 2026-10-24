@@ -76,6 +76,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 拾荒的间隔（0 = 不限制，每轮都试）。潜水已移除，这里只剩拾荒。
         pickEveryMs: 0,
         lastPickAt: null,
+        // 农田开关与间隔：作物最快 30 分钟成熟，没必要每轮都探测，默认 2 分钟看一次。
+        farmEnabled: true,
+        farmEveryMs: 120_000,
+        lastFarmAt: null,
         stop: { aborted: false },
         history: [],
         error: null,
@@ -223,11 +227,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     return { ...survey, text: formatTaskPlan(survey) };
   }
 
-  async function world(session, account, { pickUpFloaters = false } = {}) {
+  async function world(session, account, { pickUpFloaters = false, farm = true } = {}) {
     const instance = await ensureConnected(session, account);
     const config = loadConfigSafe();
     const survey = await surveyWorld(instance, protocol, { config, player: session.player });
-    const plan = planWorld(survey, { config, pickUpFloaters });
+    const plan = planWorld(survey, { config, pickUpFloaters, farm });
     let map = null;
     try {
       map = loadMapAsset(Number(session.player?.scenarioId ?? 0));
@@ -249,6 +253,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         building: b.buildFinishTime > 0 && b.buildFinishTime > Date.now() / 1000,
         icon: buildingIcon(b.type),
       })),
+      // 农田单独一栏：成熟与否决定「收」还是「等」，空着则要播种。
+      farms: survey.buildings.filter((b) => b.farm).map((b) => ({
+        buildingId: b.buildingId,
+        icon: buildingIcon(b.type),
+        productId: b.farm.productId || null,
+        ripeAt: b.farm.ripeAt || 0,
+        remainSeconds: Math.max(0, (b.farm.ripeAt || 0) - (survey.now || 0)),
+        ripe: Boolean(b.farm.productId) && b.farm.ripeAt > 0 && b.farm.ripeAt <= (survey.now || 0),
+        idle: !b.farm.productId,
+        cropIcon: b.farm.productId ? materialIcon(b.farm.productId) : null,
+      })),
+      autoFarming: survey.autoFarming === true,
       stock: [...survey.stock].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([id, num_]) => ({ id, num: num_, icon: materialIcon(id) })),
       resFields: fields,
       plan: plan.actions,
@@ -545,6 +561,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const { account, session } = scoped_(parsed);
         json(await world(session, account, {
           pickUpFloaters: parsed.searchParams.get('pick') === '1',
+          // 农田默认开；显式传 farm=0 才关。
+          farm: parsed.searchParams.get('farm') !== '0',
         }));
         return;
       }
@@ -743,6 +761,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           maxPackPerRound: Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined,
           // 拾荒默认不做，前端勾了「自动拾荒」才扫海面漂浮物。
           pickUpFloaters: payload.pickFloaters === true,
+          // 农田默认做（收成熟作物 + 补种），前端取消勾选才关。
+          farm: payload.farm !== false,
           // 潜水**没有这个参数**：DivingRequest 要上报「这一局捡到了什么」，
           // 纯协议发空体只会拿回空奖励，详见 docs/gameplay.md 与 world.mjs 顶部注释。
         });
@@ -757,7 +777,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const floaterText = formatFloaters(floaterLoot);
         if (floaterText) emit(session, 'info', floaterText);
         await new Promise((resolve) => setTimeout(resolve, 1200));
-        const after = await world(session, account, { pickUpFloaters: payload.pickFloaters === true });
+        const after = await world(session, account, {
+          pickUpFloaters: payload.pickFloaters === true,
+          farm: payload.farm !== false,
+        });
         json({
           results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
           plan: after.plan, text: after.text, population: after.population,
@@ -786,11 +809,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 0 或负数 = 不节流（旧行为）。负数按 0 处理，免得写成 -1 时被当成「永远不做」。
         loop.pickEveryMs = Math.max(0, Number(payload.pickEverySeconds ?? 0)) * 1000;
         loop.lastPickAt = null;
+        // 农田默认开，前端取消勾选才关；间隔同样 0 = 不限制。
+        loop.farmEnabled = payload.farm !== false;
+        loop.farmEveryMs = Math.max(0, Number(payload.farmEverySeconds ?? 120)) * 1000;
+        loop.lastFarmAt = null;
         loop.history = [];
         loop.error = null;
         loop.stop = { aborted: false };
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}`);
+        const farmText = loop.farmEnabled
+          ? (loop.farmEveryMs > 0 ? `农田每 ${Math.round(loop.farmEveryMs / 1000)} 秒看一眼` : '农田每轮都看')
+          : '农田关';
+        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}；${farmText}`);
         runLoop(instance, protocol, {
           config,
           player: session.player,
@@ -802,10 +832,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           allowReroll: payload.reroll === true,
           pickUpFloaters: payload.pickFloaters === true,
           pickEveryMs: loop.pickEveryMs,
+          farmEnabled: loop.farmEnabled,
+          farmEveryMs: loop.farmEveryMs,
           stop: loop.stop,
           onRound: (summary) => {
             loop.completed = summary.round;
             loop.lastPickAt = summary.gates?.pick?.lastAt ?? loop.lastPickAt;
+            loop.lastFarmAt = summary.gates?.farm?.lastAt ?? loop.lastFarmAt;
             loop.history.push(summary);
             if (loop.history.length > 50) loop.history.shift();
             emit(session, 'info', formatLoopRound(summary));
@@ -854,6 +887,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       everyMs: loop.everyMs,
       pickEveryMs: loop.pickEveryMs,
       lastPickAt: loop.lastPickAt,
+      farmEnabled: loop.farmEnabled,
+      farmEveryMs: loop.farmEveryMs,
+      lastFarmAt: loop.lastFarmAt,
       history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
       error: loop.error,
     };

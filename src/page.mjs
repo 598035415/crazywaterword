@@ -146,6 +146,11 @@ export const PAGE = `<!doctype html>
       <span class="k">自动循环</span>
       <label class="dim">轮数 <input id="loop-rounds" value="0" style="width:56px"></label>
       <label class="dim" title="瞬成配方（生产时间被英雄委任压到 0）会一次把 6 个制造位排满，所以间隔可以放宽到 180~300 秒">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
+      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（价值高的种子优先）。作物最快 30 分钟成熟，所以默认 2 分钟才看一次">
+        <input type="checkbox" id="world-farm" checked> 农田
+      </label>
+      <label class="dim">农田间隔 <input id="farm-every" value="120" style="width:56px"> 秒</label>
+      <span id="farm-state" class="dim">还没跑过</span>
       <label class="dim"><input type="checkbox" id="world-speedup"> 允许花加速器</label>
       <label class="dim"><input type="checkbox" id="world-reroll"> 拒绝重刷订单</label>
       <button id="loop-start" class="primary">开始挂机</button>
@@ -168,7 +173,7 @@ export const PAGE = `<!doctype html>
       <button id="world-run" class="primary">执行一轮</button>
       <span id="world-hint" class="warn"></span>
     </div>
-    <pre id="world-view">收成品 → 竣工 → 交单 → 按订单缺口排产 → 余料升级建筑。</pre>
+    <pre id="world-view">收成品 → 竣工 → 交单 → 按订单缺口排产（瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。</pre>
     <div id="world-factories"></div>
     <div id="world-orders"></div>
     <h2>仓库</h2><div class="icons" id="world-stock"></div>
@@ -639,7 +644,12 @@ function renderLoop(data) {
   if (data.running && document.activeElement !== pickInput) {
     pickInput.value = String(Math.round((data.pickEveryMs || 0) / 1000));
   }
+  const farmInput = $('farm-every');
+  if (data.running && document.activeElement !== farmInput) {
+    farmInput.value = String(Math.round((data.farmEveryMs || 0) / 1000));
+  }
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked);
+  renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked);
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
     return;
@@ -668,6 +678,9 @@ $('loop-start').onclick = async () => {
         reroll: $('world-reroll').checked,
         pickFloaters: $('world-pick').checked,
         pickEverySeconds: Number($('pick-every').value || 0),
+        // 农田默认开，跟拾荒一样有独立间隔（作物最快 30 分钟熟，默认 2 分钟看一次）。
+        farm: $('world-farm').checked,
+        farmEverySeconds: Number($('farm-every').value || 0),
       }),
     });
     refreshLoop();
@@ -686,6 +699,7 @@ $('loop-stop').onclick = async () => {
 
 // 勾选一变就把「上次 / 还差多久」重算一遍，不用等下一次 3 秒轮询。
 $('world-pick').onchange = refreshLoop;
+$('world-farm').onchange = refreshLoop;
 
 $('tasks-plan').onclick = async () => {
   $('tasks-hint').textContent = '检查中 ...';
@@ -725,6 +739,15 @@ function renderWorld(data) {
       b.auto ? '自动: ' + b.auto : '',
     ])));
   }
+  // 农田：熟 / 生长中 / 空闲（要播种）。游戏内「自动种植」开着时只收不种，这里也标出来。
+  if ((data.farms || []).length) {
+    fbox.appendChild(el('h2', null, '农田' + (data.autoFarming ? '（游戏内自动种植已开，只收不种）' : '')));
+    fbox.appendChild(table(['农田', '作物', '状态'], data.farms.map((f) => [
+      { cell: f.icon, text: f.buildingId },
+      f.productId ? { cell: f.cropIcon, text: f.productId } : '空',
+      f.ripe ? chip('ready', '可收') : f.idle ? chip('waiting', '空闲，待播种') : chip('waiting', '生长中 ' + f.remainSeconds + 's'),
+    ])));
+  }
   const obox = clear($('world-orders'));
   if (data.orders.length) {
     obox.appendChild(el('h2', null, '居民订单'));
@@ -745,7 +768,8 @@ $('world-plan').onclick = async () => {
   $('world-hint').textContent = '探测中 ...';
   try {
     // 计划要跟着勾选状态走，否则「探测计划」比「执行一轮」少几行，看着像 bug。
-    renderWorld(await call('/api/world?pick=' + ($('world-pick').checked ? '1' : '0')));
+    renderWorld(await call('/api/world?pick=' + ($('world-pick').checked ? '1' : '0')
+      + '&farm=' + ($('world-farm').checked ? '1' : '0')));
     $('world-hint').textContent = '';
   } catch (error) {
     $('world-hint').textContent = error.message;
@@ -753,10 +777,11 @@ $('world-plan').onclick = async () => {
 };
 $('world-run').onclick = () => {
   openConfirm('执行一轮海面自动化', [
-    el('div', null, '会收成品、竣工、交居民订单、按缺口排产、把余料拿去升级建筑。'),
+    el('div', null, '会收成品、竣工、交居民订单、按缺口排产、收农田并重新播种、把余料拿去升级建筑。'),
     el('div', null, '加速只花加速器（' + ($('world-speedup').checked ? '当前允许' : '当前不允许') + '），钻石与付费礼包永不购买。'),
     el('div', null, $('world-pick').checked ? '会顺带扫海面漂浮物（拾荒），捡完打印所得。' : '未勾「自动拾荒」，不会动海面漂浮物。'),
-    el('div', null, '拾荒的「时间间隔」只约束自动循环，手动执行不看间隔。'),
+    el('div', null, $('world-farm').checked ? '会收成熟作物并补种空地（种子按价值高的先用）。' : '未勾「农田」，不碰农田。'),
+    el('div', null, '拾荒与农田的「时间间隔」只约束自动循环，手动执行不看间隔。'),
   ], async () => {
     $('world-hint').textContent = '执行中 ...';
     try {
@@ -765,6 +790,7 @@ $('world-run').onclick = () => {
         speedUp: $('world-speedup').checked,
         reroll: $('world-reroll').checked,
         pickFloaters: $('world-pick').checked,
+        farm: $('world-farm').checked,
       };
       const data = await call('/api/world/run', { method: 'POST', body: JSON.stringify(body) });
       const failed = data.results.filter((r) => r.ok === false).length;

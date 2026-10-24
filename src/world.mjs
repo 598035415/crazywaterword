@@ -270,6 +270,16 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
       type,
       level,
       factory: raw.factory ?? null,
+      // 农田挂在 building.farm 上：{productId, plantTime, ripeTime}。
+      // 空地和「已种下」靠 productId 有无区分，成熟靠 ripeTime <= now。
+      // 注意 product.asset 对农田恒为空 —— 作物收获后直接进仓库，不走建筑产物。
+      farm: raw.farm
+        ? {
+            productId: raw.farm.productId || '',
+            plantAt: Number(raw.farm.plantTime ?? 0) || 0,
+            ripeAt: Number(raw.farm.ripeTime ?? 0) || 0,
+          }
+        : null,
       product: (raw.product?.asset ?? []).map((a) => ({ id: a.id, num: Number(a.num ?? 0) })),
       buildStartTime: raw.buildStartTime ?? 0,
       buildFinishTime: raw.buildFinishTime ?? 0,
@@ -344,6 +354,8 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
     orderOfTheDay: water.orderOfTheDay ?? { orderNum: 0, rewardedNum: 0 },
     autoProduceEndTime: water.autoProduceEndTime ?? 0,
     autoProduceForever: water.autoProduceForever === true,
+    // 游戏内「自动种植」开关：开着时服务端自己播种，计划器就只收不种。
+    autoFarming: water.autoFarming === true,
     // 海面漂浮物 = 拾荒的目标。以前只留了个 count 把列表丢了，现在整条留下来给计划器用。
     floaters: normalize(water.floater ?? []),
     floaterCount: (water.floater ?? []).length,
@@ -376,6 +388,9 @@ export function planWorld(survey, {
   // 瞬成配方的排满策略：减免把生产时间压到 0 的配方，一次把空制造位排满；
   // 关掉就回到老行为（一轮每座工厂只排 1 个）。
   fillInstantQueue = true,
+  // 农田开关：收成熟作物 + 补种空地。跟拾荒一样由调用方按自己的间隔门控
+  // （循环默认 2 分钟看一次），关掉就完全不碰农田。
+  farm = true,
 } = {}) {
   const { now, have } = survey;
   const produceReduce = produceReduceSec === null || produceReduceSec === undefined
@@ -682,6 +697,73 @@ export function planWorld(survey, {
       });
     }
     if (planned > 1) notes.push(`${b.buildingId} 瞬成配方 ${best.itemId} 一次排了 ${planned} 个，队列已排满`);
+  }
+
+  // 5.5 农田：熟的一次批量收，空出来的地一次批量播。
+  //   FarmHarvestRequest.buildingId 与 FarmPlantRequest.args 都是 repeated，
+  //   所以一轮各发一条就能覆盖所有农田（客户端框选批量操作发的也是这两个）。
+  //   作物表 FarmlandPlantCfg：{id, time, produceNum, material: [种子, 份数]}。
+  //   游戏内「自动种植」（SetAutoFarmingRequest / water.autoFarming）开着时服务端自己播，这边只收不种。
+  const farms = survey.buildings.filter((b) => b.farm);
+  if (farm && farms.length > 0) {
+    const ripe = farms.filter((b) => b.farm.productId && b.farm.ripeAt > 0 && b.farm.ripeAt <= now);
+    if (ripe.length > 0) {
+      actions.push({
+        kind: 'farmHarvest',
+        request: 'FarmHarvestRequest',
+        response: null,
+        body: { buildingId: ripe.map((b) => b.buildingId) },
+        label: `收农田 ${ripe.map((b) => `${b.buildingId}(${b.farm.productId})`).join(' ')}`,
+      });
+    }
+    // 本轮刚收的地收完就是空的，可以紧接着种（服务端按顺序处理）。
+    const empties = farms.filter((b) => !b.farm.productId || ripe.includes(b));
+    if (empties.length > 0 && survey.autoFarming === true) {
+      notes.push(`农田 ${empties.length} 块空着，游戏内「自动种植」开着，交给服务端`);
+    } else if (empties.length > 0) {
+      const options = rowsOf(config, 'FarmlandPlantCfg')
+        .map((row) => ({
+          id: row?.id,
+          time: Number(row?.time) || 0,
+          // 注意：FarmlandPlantCfg.material 是**一对** `[种子名, 份数]`，不是 [[id,num], …] 的列表
+          // （实测 `{"id":"玉米","material":["玉米种子",1]}`）。当成列表取 [0] 会拿到字符串，
+          // 解构出来是「玉」「米」两个字，free('玉') 永远是 0 → 一块都种不上。
+          seed: Array.isArray(row?.material) && row.material.length >= 2 ? row.material : null,
+        }))
+        .filter((row) => row.id && row.seed)
+        // 播种顺序：**价值高的先种**。作物配置里没有价格字段，`produceNum` 又全是 5，
+        // 唯一的成本差异就是成熟时间 —— 时间越长越贵（橡胶 15600s ＞ 花菜 7200 ＞ 小麦 1800），
+        // 所以用 time 降序当作「高价值 → 低价值」。同一时长内订单缺的优先。
+        .sort((a, b) => b.time - a.time || (demand.get(b.id) ?? 0) - (demand.get(a.id) ?? 0));
+      const args = [];
+      const left = [...empties];
+      for (const option of options) {
+        if (left.length === 0) break;
+        const [seedId, perRaw] = option.seed;
+        const per = Math.max(1, Number(perRaw) || 1);
+        const can = Math.min(left.length, Math.floor(free(seedId) / per));
+        for (let i = 0; i < can; i += 1) {
+          const plot = left.shift();
+          reserve(seedId, per);
+          args.push({ buildingId: plot.buildingId, productId: option.id });
+        }
+      }
+      if (args.length > 0) {
+        const mix = [...new Set(args.map((a) => a.productId))]
+          .map((id) => `${id}×${args.filter((a) => a.productId === id).length}`)
+          .join(' ');
+        actions.push({
+          kind: 'farmPlant',
+          request: 'FarmPlantRequest',
+          response: null,
+          body: { args },
+          label: `播种 ${args.length} 块（${mix}）`,
+        });
+      }
+      if (left.length > 0) {
+        notes.push(`农田还有 ${left.length} 块没种子可种（${left.map((b) => b.buildingId).join(' ')}）`);
+      }
+    }
   }
 
   // 6. 余料升级建筑：把订单与排产占用的材料扣掉之后再比升级消耗，按人口需求升序（便宜的先生效）。
@@ -1017,6 +1099,17 @@ export function formatWorldPlan(survey, plan) {
     lines.push(`生产时间减免没算出来（缺委任/英雄数据），但队列里观测到 ${hints} 条瞬成配方，这些会排满`);
   } else {
     lines.push('生产时间减免 0s：没取到委任数据，排产按原时长算，一轮每座工厂排 1 个');
+  }
+  const farms = (survey.buildings ?? []).filter((b) => b.farm);
+  if (farms.length > 0) {
+    const nowSec = survey.now ?? Math.floor(Date.now() / 1000);
+    const ripe = farms.filter((b) => b.farm.productId && b.farm.ripeAt > 0 && b.farm.ripeAt <= nowSec).length;
+    const idle = farms.filter((b) => !b.farm.productId).length;
+    const growing = farms.filter((b) => b.farm.productId && b.farm.ripeAt > nowSec);
+    const soonest = growing.length > 0 ? Math.min(...growing.map((b) => b.farm.ripeAt - nowSec)) : 0;
+    lines.push(`农田 ${farms.length} 块：成熟 ${ripe} · 空闲 ${idle}`
+      + (growing.length > 0 ? ` · 生长中 ${growing.length}（最近 ${soonest}s 后）` : '')
+      + (survey.autoFarming === true ? ' · 游戏内自动种植开着（只收不种）' : ''));
   }
   if (survey.resFields) {
     const fields = survey.resFields.fields ?? [];

@@ -539,6 +539,34 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
 - **同一配方可以重复排队**（6 个刺身拼盘就是证据），工厂页只标注「队列×N」，不阻止用户继续排；
 - 制造位上限（6）是队列长度上限，不是并行数。
 
+#### 12.3.2 农田：播种与收获
+
+农田不是工厂，产物也不走 `product.asset`（农田这一项**恒为空**），状态全在 `building.farm` 里：
+
+```json
+"farm": { "productId": "玉米", "plantTime": 1792735168, "ripeTime": 1792736870 }
+```
+
+- `productId` 为空 = 空地（要播种）；`ripeTime <= now` = 成熟（要收）；否则生长中。
+- 收获：`FarmHarvestRequest { buildingId: repeated string }` —— **一次能装多块地**（客户端框选批量走的就是它）。
+- 播种：`FarmPlantRequest { args: repeated PlantArg }`，`PlantArg = { buildingId, productId }`，
+  同样一次能种多块；也能混种（args 里每项各带自己的 productId）。
+- 作物表 `FarmlandPlantCfg`：`{ id, time, produceNum, res, material }`，13 种作物。
+  **`material` 是一对 `[种子名, 份数]`，不是 `[[id,num], …]` 的列表** ——
+  当成列表取 `[0]` 会拿到字符串「玉米种子」，解构出「玉」「米」两个字，种子永远扣不到（实测踩过）。
+- 收获给 `produceNum`（5）+ 成熟时间：小麦/玉米 1800 秒、土豆/番茄 2400、胡萝卜/卷心菜 3600、大豆/南瓜 4800。
+- 加速：`FarmSpeedUpRequest { buildingId, param: SpeedUpCostParam }`（`type=2` 加速器），本工具不用。
+- 游戏内「自动种植」：`SetAutoFarmingRequest { isOn }` + `water.autoFarming`，需要 VIP 功能「农田自动种植」。
+  开着时服务端自己播种，计划器**只收不种**（`survey.autoFarming` 为 true 就跳过播种并写 notes）。
+
+计划器的取舍：
+- **播种顺序按「价值从高到低」**。作物表没有价格字段、`produceNum` 全是 5，唯一能当价值的量就是
+  `time`（时间越长越贵：橡胶 15600s > 花菜 7200 > 大豆/南瓜 4800 > 胡萝卜/卷心菜 3600 >
+  土豆/番茄 2400 > 小麦/玉米 1800），所以用 `time` 降序。同一时长内订单缺的优先。
+- 种子按库存扣，扣不到的地块逐块写进 notes（「还有 N 块没种子可种」），不会种到一半才发现没种子。
+- 开关 + 节流：计划器只认 `planWorld({ farm })`，循环按 `farmEveryMs`（默认 120 秒）调 `gateDue` 决定这轮做不做。
+  只有真的排出收/种动作才更新 `lastFarmAt`，跟拾荒同一套语义。
+
 ### 12.4 资源田：静态数据在客户端地图 bundle 里
 
 `MyResFieldsResponse.info = {fields:[{gridIdx, cityId, type}], maxNum}` 只描述**已经占下的**田。
