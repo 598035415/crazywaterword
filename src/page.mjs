@@ -145,7 +145,7 @@ export const PAGE = `<!doctype html>
     <div class="bar">
       <span class="k">自动循环</span>
       <label class="dim">轮数 <input id="loop-rounds" value="0" style="width:56px"></label>
-      <label class="dim">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
+      <label class="dim" title="瞬成配方（生产时间被英雄委任压到 0）会一次把 6 个制造位排满，所以间隔可以放宽到 180~300 秒">间隔秒 <input id="loop-every" value="60" style="width:64px"></label>
       <label class="dim"><input type="checkbox" id="world-speedup"> 允许花加速器</label>
       <label class="dim"><input type="checkbox" id="world-reroll"> 拒绝重刷订单</label>
       <button id="loop-start" class="primary">开始挂机</button>
@@ -926,7 +926,10 @@ function tickFactories() {
 setInterval(tickFactories, 1000);
 
 function recipeTitle(recipe) {
-  const parts = ['生产 ' + dur(recipe.produceTime)];
+  // 瞬成的配方写清楚「原时长 → 0 秒」：这是自动挂机一次性排满队列的前提。
+  const parts = [recipe.instant
+    ? '生产瞬成（原 ' + dur(recipe.produceTime) + '，减免后 0 秒，排下去就完成）'
+    : '生产 ' + dur(recipe.produceTime)];
   if (recipe.costs.length) {
     parts.push('消耗 ' + recipe.costs.map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num + (c.enough ? '' : '（不够）')).join('，'));
   }
@@ -1016,7 +1019,8 @@ function factoryCard(factory, data) {
     txt.appendChild(el('span', 'nm', recipe.itemId));
     // 状态直接写在副标题上：满 / 缺料 / 已排几个。光把格子变暗，看不出是为什么。
     const sub = el('span', 'sub');
-    sub.appendChild(document.createTextNode(dur(recipe.produceTime)));
+    // 瞬成配方显示「瞬成」而不是原时长：写 5 分 0 秒会让人以为还得等 5 分钟。
+    sub.appendChild(document.createTextNode(recipe.instant ? '瞬成' : dur(recipe.produceTime)));
     if (!recipe.unlocked) sub.appendChild(document.createTextNode(' · lv' + recipe.unlockLevel));
     if (recipe.atCap) sub.appendChild(el('span', 'miss', ' · 满'));
     else if (!recipe.enough) sub.appendChild(el('span', 'miss', ' · 缺料'));
@@ -1094,6 +1098,9 @@ function renderFactories(data) {
   $('factory-gain').textContent = waiting ? '一键收成（' + waiting + '）' : '一键收成';
   $('factory-summary').textContent = list.length
     ? list.length + ' 座工厂 · 在造 ' + making + ' 个 · 待收 ' + waiting + ' 个 · 制造位上限 ' + data.slots
+      + (data.produceReduce > 0
+        ? ' · 生产减免 ' + dur(data.produceReduce) + '（≤此时长的配方瞬成，自动挂机会一次排满）'
+        : '')
     : '';
   if (!list.length) {
     box.appendChild(el('div', 'dim', '这个账号还没有工厂建筑。'));

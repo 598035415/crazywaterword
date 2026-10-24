@@ -33,6 +33,16 @@ export const STOCK_PARAM = '产品存量初始上限';
 export const SLOTS_PARAM = '制造位上限';
 const POPULATION_PARAM = '初始人口上限';
 
+// 生产时间的公式是**减免后**的，不是 BuildingProduceCfg.produceTime 原值：
+//   BuildingProduceUtil.produceFinalTime = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
+//   reduce  = GameEffectId.PRODUCE_TIME_REDUCTION（「生产时间减少」，单位秒）
+//   speedUp = GameEffectId.PRODUCE_SPEED_UP（按百分比提速，只由服务端 effect 推送，配置表里没有）
+// reduce 的大头是英雄委任：AppointPosCfg 里 posId 1/2/3 三条效果都是「生产时间」，
+// 单个英雄的贡献 = AppointEffectCfg.heroAdd[品质档-1] + starAdd[品质档-1] × 星级
+// （客户端 getAppointEffect 同款公式，品质档取 HeroCfg.qualityIndex）。
+// 实测本账号三个橙色 9 星 = 258×3 = 774 秒，所以 300 秒的低级配方是 0 秒完成 —— 瞬成。
+export const PRODUCE_TIME_EFFECT = '生产时间';
+
 // 仓库材料清单：建造 / 升级 / 交订单 / 排产真正会消耗掉的那些东西，总览页单独列一栏。
 // 分类不硬编码，全部从配置读：
 //   原料、农产品、加工品 —— ItemCfg.type 就是这个分类（7 / 13 / 158 种）；
@@ -117,6 +127,89 @@ export function topLevel(config, buildingType) {
     .reduce((max, r) => Math.max(max, r.level), 0);
 }
 
+// --- 生产时间减免 ----------------------------------------------------------------
+//
+// 一条委任英雄对某个效果的贡献：客户端 AppointUtil.getAppointEffect 就是这两个数组相加，
+// 档位是英雄品质（HeroCfg.qualityIndex，1=蓝 2=紫 3=橙 4=红）。
+// 「生产时间」「贸易时间」「种田时间」「锻造时间」是秒数（viewType=数值），
+// 「建造速度」「训练产量」「宠物培育速度」是比率（viewType=百分比），别混用。
+export function appointEffectValue(effect, heroCfg, star) {
+  if (!effect || !heroCfg) return 0;
+  const slot = Number(heroCfg.qualityIndex) - 1;
+  if (!(slot >= 0)) return 0;
+  const base = Number(effect.heroAdd?.[slot] ?? 0);
+  const perStar = Number(effect.starAdd?.[slot] ?? 0);
+  const value = base + perStar * (Number(star) || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+// 委任带来的「生产时间减少」总和（秒）。只看 posId 归属「生产时间」的那几个位置。
+// 缺任何一张表都返回 0 —— 算不出来时排产退回「一轮排 1 个」的老行为，不会乱排。
+export function appointProduceReduce(config, { appointed = [], heroes = [] } = {}) {
+  const effect = rowsOf(config, 'AppointEffectCfg').find((row) => row?.effectId === PRODUCE_TIME_EFFECT);
+  if (!effect) return 0;
+  const posEffect = new Map(rowsOf(config, 'AppointPosCfg').map((row) => [Number(row?.posId), row?.effectId]));
+  const heroCfg = new Map(rowsOf(config, 'HeroCfg').map((row) => [row?.id, row]));
+  const starOf = new Map(heroes.map((hero) => [hero?.heroId, hero?.star]));
+  let total = 0;
+  for (const slot of appointed) {
+    if (posEffect.get(Number(slot?.posId)) !== PRODUCE_TIME_EFFECT) continue;
+    const cfg = heroCfg.get(slot?.heroId);
+    if (!cfg) continue;
+    total += appointEffectValue(effect, cfg, starOf.get(slot.heroId));
+  }
+  return total;
+}
+
+// 生产时间的实际秒数（客户端 produceFinalTime 同款）。减免够大就是 0 = 瞬成。
+export function produceFinalTime(produceTime, reduce = 0, speedUp = 0) {
+  const left = Math.max(0, Number(produceTime || 0) - (Number(reduce) || 0));
+  const rate = Number(speedUp) > 0 ? Number(speedUp) : 0;
+  return Math.ceil(left / (1 + rate));
+}
+
+// 观测兜底：瞬成的项排下去就完成，正常情况下根本看不到它在队列里；
+// 偶尔能抓到队首「还剩 0~2 秒」的那种，就是服务端 tick 还没把它收走的瞬成项。
+// 它只能给**单条配方**打「瞬成」标记，绝不能拿「原时长 - 剩余」反推减免秒数 ——
+// 那个差值里混着已经过去的时间（实测 13500 秒的配方做到一半，反推出来是 12500，
+// 直接把 780 秒的配方也判成瞬成）。所以这里只出标记，不出数字。
+export const INSTANT_HINT_SECONDS = 2;
+
+export function observedInstantRecipes(now, factories, produceRows = []) {
+  const raw = new Map(produceRows.map((row) => [`${row?.buildType}\u0000${row?.itemId}`, Number(row?.produceTime) || 0]));
+  const hints = new Set();
+  for (const building of factories ?? []) {
+    // 两种形状都吃：world.mjs 的 factories 挂原始 factory.factoryQ（finishTime），
+    // factories.mjs 的工厂页视图已经拍平成 queue（finishAt）。
+    const queue = building?.factory?.factoryQ ?? building?.queue ?? [];
+    for (const job of queue) {
+      const finishAt = Number(job?.finishTime ?? job?.finishAt ?? 0);
+      if (!(finishAt > 0)) continue; // 排队中的项 finishTime 为 0，没得看
+      const seconds = raw.get(`${building.type}\u0000${job.productId}`) ?? 0;
+      // 本身就短于 2 秒的配方天然瞬成，不算「观测到的减免」。
+      if (seconds <= INSTANT_HINT_SECONDS) continue;
+      // 只认「刚好快到了」的那一小段：已经过期很久的项是完成了没被收走，
+      // 拿它当瞬成证据会冤枉长配方（实测归档数据里 2700 秒的吊床就这么被误判成瞬成）。
+      const left = finishAt - now;
+      if (!(left >= 0 && left <= INSTANT_HINT_SECONDS)) continue;
+      hints.add(`${building.type}\u0000${job.productId}`);
+    }
+  }
+  return hints;
+}
+
+// 这个 survey 实际该用多少秒减免：只有配置算出来的那一份。
+// planWorld 的 produceReduceSec 参数可以强行覆盖（比如没连上游戏、想先看计划）。
+export function produceReduceOf(survey) {
+  const reduce = Number(survey?.produce?.reduce ?? survey?.produceReduce ?? 0);
+  return Number.isFinite(reduce) && reduce > 0 ? reduce : 0;
+}
+
+// 某个配方是不是瞬成：减免压到 0，或者观测到它本来就秒出。
+export function isInstantRecipe({ finalSeconds, hint }) {
+  return (Number(finalSeconds) || 0) <= 0 || hint === true;
+}
+
 // 只读探测：一次拉齐海面状态、库存、资源田、舰队。
 export async function surveyWorld(client, protocol, { config = null, player = null, timeout = 8000 } = {}) {
   const get = async (name) => {
@@ -131,11 +224,15 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
 
   const water = await get('OnWaterRequest');
   if (!water) throw new Error('拿不到 OnWaterResponse，无法探测海面');
-  const [itemList, resourceList, resFields, fleets] = await Promise.all([
+  // AppointInfo + AllHero 只为算「生产时间减少」：委任列表给 posId/heroId，英雄表给星级。
+  // 两条都是只读轻请求，缺任意一条就按 0 处理，排产退回「一轮排 1 个」。
+  const [itemList, resourceList, resFields, fleets, appointInfo, allHero] = await Promise.all([
     get('AllItemRequest'),
     get('AllResourceRequest'),
     get('MyResFieldsRequest'),
     get('MyFleetsRequest'),
+    get('AppointInfoRequest'),
+    get('AllHeroRequest'),
   ]);
 
   // 道具和资源合到一张库存表里，消耗项的 id 有的是道具名（木材）、有的是资源名（GOLD）。
@@ -220,15 +317,30 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
 
   const factories = buildings.filter((b) => b.factory);
   const resFieldInfo = resFields?.info ?? null;
+  const now = Math.floor(Date.now() / 1000);
+
+  // 生产时间减免：委任列表 + 英雄星级按 AppointEffectCfg 算，算不出就是 0。
+  // instant 是观测到的瞬成配方（只在委任算不出来时才用），两个都拿不到就按原时长。
+  const reduce = config
+    ? appointProduceReduce(config, { appointed: appointInfo?.heroes ?? [], heroes: allHero?.heroes ?? [] })
+    : 0;
+  const instant = reduce > 0 ? [] : [...observedInstantRecipes(now, factories, rowsOf(config, 'BuildingProduceCfg'))];
 
   return {
-    now: Math.floor(Date.now() / 1000),
+    now,
     player,
     stock,
     have,
     buildings,
     factories,
     orders,
+    // 生产侧的两个加速口径，planWorld 与工厂页共用：
+    // reduce = 英雄委任的「生产时间减少」秒数（实测 774），instant = 观测到的瞬成配方 key。
+    produce: {
+      reduce,
+      instant,
+      source: reduce > 0 ? 'appoint' : instant.length > 0 ? 'observed' : 'none',
+    },
     orderOfTheDay: water.orderOfTheDay ?? { orderNum: 0, rewardedNum: 0 },
     autoProduceEndTime: water.autoProduceEndTime ?? 0,
     autoProduceForever: water.autoProduceForever === true,
@@ -258,8 +370,17 @@ export function planWorld(survey, {
   minOrderExp = 0,
   maxUpgrades = 2,
   maxBuilds = 5,
+  // 生产时间减免（秒）。默认用 survey.produce 算出来的值，这里只是强行覆盖的出口
+  // （没连上游戏、或者想按「如果我换一套委任会怎样」试算时用）。
+  produceReduceSec = null,
+  // 瞬成配方的排满策略：减免把生产时间压到 0 的配方，一次把空制造位排满；
+  // 关掉就回到老行为（一轮每座工厂只排 1 个）。
+  fillInstantQueue = true,
 } = {}) {
   const { now, have } = survey;
+  const produceReduce = produceReduceSec === null || produceReduceSec === undefined
+    ? produceReduceOf(survey)
+    : Math.max(0, Number(produceReduceSec) || 0);
   const actions = [];
   const notes = [];
   const reserved = new Map();
@@ -481,11 +602,17 @@ export function planWorld(survey, {
   }
 
   // 5. 排产：按订单缺口挑配方，缺得多的先产；已设自动生产的工厂不覆盖。
+  //
+  //    关键：生产时间是**减免后**的（produceFinalTime 里先减 reduce 再提速）。
+  //    减免 774 秒时，300 秒的鱼/淡水/布匹实际上 0 秒完成 —— 这种「瞬成」配方
+  //    一次就把空制造位排满，否则一轮只补 1 个，低级物品永远要靠缩短循环间隔续产。
+  //    非瞬成的配方仍然一轮只排 1 个：队列是串行的，多排只会把同一批料提前烧掉。
   const demand = new Map();
   for (const order of survey.orders) {
     for (const m of order.missing) demand.set(m.id, (demand.get(m.id) ?? 0) + m.num);
   }
   const produceRows = rowsOf(config, 'BuildingProduceCfg');
+  const instantHints = new Set(survey.produce?.instant ?? []);
   for (const b of survey.factories) {
     if (b.factory.autoProductId) {
       notes.push(`${b.buildingId} 已设自动生产 ${b.factory.autoProductId}，不覆盖`);
@@ -502,18 +629,59 @@ export function planWorld(survey, {
     // 订单缺口的先产，其余按产出时间短的先产（早点回本）。
     const score = (row) => (demand.get(row.itemId) ?? 0) * 1e6 - row.produceTime;
     const best = cand.sort((a, b2) => score(b2) - score(a))[0];
-    for (const [id, n] of best.costItem ?? []) reserve(id, n);
     const need = demand.get(best.itemId) ?? 0;
+    // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
+    // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
+    const finalSeconds = produceFinalTime(best.produceTime, produceReduce);
+    const instant = isInstantRecipe({
+      finalSeconds,
+      hint: instantHints.has(`${b.type}\u0000${best.itemId}`),
+    });
+    const slots = Math.max(0, (Number(survey.factorySlots) || 0) - queue.length);
+    const wanted = fillInstantQueue && instant ? slots : 1;
+    // 产品持有量 = 仓库 + 工厂待收 + 队列里还排着的，跟服务端 storage full 的口径一致。
+    const held = have(best.itemId)
+      + (b.factory.finishedProducts ?? [])
+        .filter((asset) => asset.id === best.itemId)
+        .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
+      + queue.filter((job) => job.productId === best.itemId).length;
     // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」，
     // 光有产品名看不出为什么它一直排这个（或者为什么别的配方排不上）。
     const costText = (best.costItem ?? []).map(([id, n]) => `${id}×${n}`).join(' ');
-    actions.push({
-      kind: 'startProduce',
-      request: 'StartFactoryProduceRequest',
-      response: null,
-      body: { buildingId: b.buildingId, productId: best.itemId },
-      label: `排产 ${b.buildingId} -> ${best.itemId}（${best.produceTime}s${costText ? `，耗 ${costText}` : ''}${need ? `，订单缺 ${need}` : ''}）`,
-    });
+    const timeText = instant
+      ? `瞬成${produceReduce > 0 ? `，原 ${best.produceTime}s - 减免 ${produceReduce}s` : '（队列观测）'}`
+      : `${finalSeconds}s${finalSeconds !== best.produceTime ? `（原 ${best.produceTime}s）` : ''}`;
+    let planned = 0;
+    for (let k = 0; k < wanted; k += 1) {
+      // 每排一个都要再扣一次料：瞬成排满 = 同一配方连着烧 N 份材料。
+      if (!(best.costItem ?? []).every(([id, n]) => free(id) >= n)) {
+        const short = (best.costItem ?? []).filter(([id, n]) => free(id) < n).map(([id, n]) => `${id} ${free(id)}/${n}`).join(' ');
+        notes.push(`${b.buildingId} ${best.itemId} 排到第 ${k + 1} 个材料不够（${short}），本座工厂本轮排 ${k} 个`);
+        break;
+      }
+      // 存量上限：瞬成排满会把成品堆在工厂里，超上限服务端会回 storage full。
+      if (survey.stockCap > 0 && held + k >= survey.stockCap) {
+        notes.push(`${b.buildingId} ${best.itemId} 已持有 ${held + k} 个（含待收与队列），到存量上限 ${survey.stockCap}，不再排`);
+        break;
+      }
+      for (const [id, n] of best.costItem ?? []) reserve(id, n);
+      planned += 1;
+      actions.push({
+        kind: 'startProduce',
+        request: 'StartFactoryProduceRequest',
+        response: null,
+        body: { buildingId: b.buildingId, productId: best.itemId },
+        // 瞬成排满是同一座工厂连发 N 条：key 必须带上序号，否则 stepKey 会把它们算成同一个动作。
+        // transient：排产失败几乎都是瞬时原因（队列满/库存满/料不够），不该被 rejected 永久记住。
+        key: `startProduce:${b.buildingId}#${k}`,
+        group: `startProduce:${b.buildingId}`,
+        transient: true,
+        label: `排产 ${b.buildingId} -> ${best.itemId}（${timeText}`
+          + `${wanted > 1 ? `，第 ${k + 1}/${wanted} 个` : ''}`
+          + `${costText ? `，耗 ${costText}` : ''}${need ? `，订单缺 ${need}` : ''}）`,
+      });
+    }
+    if (planned > 1) notes.push(`${b.buildingId} 瞬成配方 ${best.itemId} 一次排了 ${planned} 个，队列已排满`);
   }
 
   // 6. 余料升级建筑：把订单与排产占用的材料扣掉之后再比升级消耗，按人口需求升序（便宜的先生效）。
@@ -618,11 +786,16 @@ export async function runWorld(client, protocol, plan, {
   if (!allowMutate) throw new Error('海面自动化会改变账号状态，需要 --yes');
   const results = [];
   const blocked = new Set();
+  // 失败隔离的粒度：默认按 kind（同类动作一起停），带 group 的按 group 停。
+  // 排产就是这样用的 —— 瞬成配方一次连发 6 条，第 3 条失败（队列满/库存满）
+  // 只该停掉这座工厂剩下的几条，不能把其它工厂的排产一起废掉。
+  const isolationKey = (step) => step.group ?? step.kind;
   for (const step of plan.actions) {
     const key = stepKey(step);
+    const guard = isolationKey(step);
     let entry;
     if (rejected.has(key)) entry = { step, ok: false, skipped: true, error: '刚被服务端拒过，跳过' };
-    else if (blocked.has(step.kind)) entry = { step, ok: false, skipped: true, error: `同类动作已失败，本轮不再尝试` };
+    else if (blocked.has(guard)) entry = { step, ok: false, skipped: true, error: `同类动作已失败，本轮不再尝试` };
     else if (!protocol[step.request]) entry = { step, ok: false, error: `协议表里没有 ${step.request}` };
     else {
       try {
@@ -635,8 +808,10 @@ export async function runWorld(client, protocol, plan, {
           entry = { step, ok: true, sent };
         }
       } catch (error) {
-        rejected.add(key);
-        blocked.add(step.kind);
+        // transient 的失败原因多是瞬时状态（队列满、库存满、这一份料刚好不够），
+        // 记进 rejected 会让后续轮次永远跳过同一格，反而不排了。
+        if (!step.transient) rejected.add(key);
+        blocked.add(guard);
         entry = { step, ok: false, error: error.message };
       }
     }
@@ -833,6 +1008,16 @@ export function planFieldGiveUp(survey, gridIdx) {
 export function formatWorldPlan(survey, plan) {
   const lines = [];
   lines.push(`人口 ${survey.population}/${survey.maxPopulation}  库存 ${survey.stock.size} 种  工厂 ${survey.factories.length} 栋  订单 ${survey.orders.length} 条`);
+  // 生产减免直接摆出来：它是「为什么这座工厂能一次排 6 个」的唯一解释依据。
+  const reduce = produceReduceOf(survey);
+  const hints = (survey.produce?.instant ?? []).length;
+  if (reduce > 0) {
+    lines.push(`生产时间减免 ${reduce}s（英雄委任）：≤${reduce}s 的配方瞬成，会一次排满制造位`);
+  } else if (hints > 0) {
+    lines.push(`生产时间减免没算出来（缺委任/英雄数据），但队列里观测到 ${hints} 条瞬成配方，这些会排满`);
+  } else {
+    lines.push('生产时间减免 0s：没取到委任数据，排产按原时长算，一轮每座工厂排 1 个');
+  }
   if (survey.resFields) {
     const fields = survey.resFields.fields ?? [];
     lines.push(`资源田 ${fields.length}/${survey.resFields.maxNum ?? '?'}${fields.length ? `  已占 ${fields.map((f) => f.gridIdx).join(',')}` : ''}`);

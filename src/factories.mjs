@@ -12,9 +12,13 @@
 //   所以走 sendWatch：守到 PromptResponse 才算被拒。
 
 import { normalize } from './worlds.mjs';
-import { rowsOf, paramOf, assetCount, makeTypeResolver, RESOURCE_NAMES, SLOTS_PARAM, STOCK_PARAM } from './world.mjs';
+import {
+  rowsOf, paramOf, assetCount, makeTypeResolver, RESOURCE_NAMES, SLOTS_PARAM, STOCK_PARAM,
+  appointProduceReduce, observedInstantRecipes, produceFinalTime, produceReduceOf,
+} from './world.mjs';
 
 // 只读探测：海面（工厂挂在 building 上）+ 库存（算材料够不够），不多拉资源田与舰队。
+// AppointInfo / AllHero 只为算「生产时间减少」—— 页面上要标出哪些配方已经瞬成。
 export async function surveyFactories(client, protocol, { config = null, timeout = 8000 } = {}) {
   const get = async (name) => {
     const responseName = `${name.slice(0, -7)}Response`;
@@ -28,7 +32,12 @@ export async function surveyFactories(client, protocol, { config = null, timeout
 
   const water = await get('OnWaterRequest');
   if (!water) throw new Error('拿不到 OnWaterResponse，读不了工厂');
-  const [itemList, resourceList] = await Promise.all([get('AllItemRequest'), get('AllResourceRequest')]);
+  const [itemList, resourceList, appointInfo, allHero] = await Promise.all([
+    get('AllItemRequest'),
+    get('AllResourceRequest'),
+    get('AppointInfoRequest'),
+    get('AllHeroRequest'),
+  ]);
 
   // 道具与资源合成一张库存表：配方消耗项里既有道具名（木材），也有资源名（GOLD）。
   const stock = new Map();
@@ -71,6 +80,19 @@ export async function surveyFactories(client, protocol, { config = null, timeout
     factories,
     factorySlots: paramOf(config, SLOTS_PARAM),
     stockCap: paramOf(config, STOCK_PARAM),
+    // 生产时间减免（秒）：来自英雄委任折算的「生产时间减少」，见 world.mjs 的公式。
+    // 774 秒的意思就是「300 秒的配方排下去就完成」，页面用 instant 把它标出来。
+    // 委任算得出来就不看队列观测了 —— 观测只是拿不到委任数据时的兜底，两者别混。
+    produce: (() => {
+      const reduce = config
+        ? appointProduceReduce(config, { appointed: appointInfo?.heroes ?? [], heroes: allHero?.heroes ?? [] })
+        : 0;
+      return {
+        reduce,
+        instant: reduce > 0 ? [] : [...observedInstantRecipes(now, factories, rowsOf(config, 'BuildingProduceCfg'))],
+        source: reduce > 0 ? 'appoint' : 'none',
+      };
+    })(),
   };
 }
 
@@ -93,6 +115,8 @@ export function factoryRecipes(config, type) {
 export function viewFactories(survey, { config = null } = {}) {
   const { stock, factorySlots, stockCap, now } = survey;
   const have = (id) => stock.get(id) ?? 0;
+  // 生产时间减免：774s 减免下 300s 的配方就是 0 秒，排下去立刻能收。
+  const reduce = produceReduceOf(survey);
 
   // 整张配方表只扫一遍，按 buildType 分组；「已排队的配方要显示多久」也从这里取 produceTime。
   const byType = new Map();
@@ -112,6 +136,9 @@ export function viewFactories(survey, { config = null } = {}) {
     now,
     slots: factorySlots,
     stockCap,
+    // 生产时间减免（秒）与来源，页面拿它解释「为什么这个配方标着瞬成」。
+    produceReduce: reduce,
+    produceSource: survey.produce?.source ?? 'none',
     factories: survey.factories.map((factory) => {
       const recipes = byType.get(factory.type) ?? [];
       const produceTimeOf = new Map(recipes.map((recipe) => [recipe.itemId, recipe.produceTime]));
@@ -150,9 +177,14 @@ export function viewFactories(survey, { config = null } = {}) {
             .reduce((sum, asset) => sum + asset.num, 0)
             + factory.queue.filter((job) => job.productId === recipe.itemId).length;
           const held = inStock + inFactory;
+          const finalSeconds = produceFinalTime(recipe.produceTime, reduce);
+          const hint = (survey.produce?.instant ?? []).includes(`${factory.type}\u0000${recipe.itemId}`);
           return {
             itemId: recipe.itemId,
             produceTime: recipe.produceTime,
+            // 减免后的实际秒数。瞬成 = 排下去就完成，可以一次把制造位排满。
+            finalSeconds,
+            instant: finalSeconds <= 0 || hint,
             unlockLevel: recipe.unlockLevel,
             limitType: recipe.limitType,
             costs,

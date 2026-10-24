@@ -597,6 +597,131 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 生产时间减免与「瞬成排满」：客户端 produceFinalTime = ceil(max(0, 原时长 - 减免) / (1 + 提速))。
+// 减免的大头是英雄委任（AppointEffectCfg「生产时间」按品质档 + 每星加成），
+// 实测 3 个橙色 9 星 = 258×3 = 774 秒，于是 300 秒的鱼/淡水/布匹排下去就是 0 秒完成 ——
+// 这种配方一轮要把制造位排满，否则低级物品永远得靠缩短循环间隔来续产。
+{
+  const { appointProduceReduce, produceFinalTime, planWorld, runWorld } = await import('./world.mjs');
+  const config = { tables: {
+    AppointPosCfg: { data: [
+      { posId: 1, effectId: '生产时间', playerLevel: 4 },
+      { posId: 2, effectId: '生产时间', playerLevel: 8 },
+      { posId: 3, effectId: '生产时间', playerLevel: 15 },
+      { posId: 4, effectId: '建造速度', playerLevel: 6 },
+    ] },
+    // 建造速度是百分比（viewType=百分比），绝不能当成秒数和生产时间混在一起加。
+    AppointEffectCfg: { data: [
+      { effectId: '生产时间', viewType: '数值', heroAdd: [8, 20, 60, 80], starAdd: [2, 8, 22, 28] },
+      { effectId: '建造速度', viewType: '百分比', heroAdd: [0.0017, 0.0042, 0.0125, 0.0167], starAdd: [0.0006, 0.0015, 0.0045, 0.006] },
+    ] },
+    HeroCfg: { data: [
+      { id: '杰森', qualityIndex: 3 },
+      { id: '霍金', qualityIndex: 3 },
+      { id: '巨石强森', qualityIndex: 3 },
+      { id: '小布', qualityIndex: 1 },
+    ] },
+    BuildingCfg: { data: [{ buildingType: '切鱼厂' }] },
+    BuildingProduceCfg: { data: [
+      { buildType: '切鱼厂', itemId: '鱼', produceTime: 300, unlockLevel: 1, costItem: [['海藻', 1]] },
+      { buildType: '切鱼厂', itemId: '烤鱼', produceTime: 1800, unlockLevel: 1, costItem: [['鱼', 2]] },
+    ] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+  } };
+  const appointed = [
+    { heroId: '杰森', posId: 1 },
+    { heroId: '霍金', posId: 2 },
+    { heroId: '巨石强森', posId: 3 },
+    { heroId: '小布', posId: 4 },
+  ];
+  const heroes = appointed.map((slot) => ({ heroId: slot.heroId, star: 9 }));
+  const reduce = appointProduceReduce(config, { appointed, heroes });
+  assert.equal(reduce, 774, '3 个橙色 9 星委任生产 = (80 + 28×9) × 3 = 774 秒');
+  assert.equal(produceFinalTime(300, reduce), 0, '300 秒的配方在 774 秒减免下瞬成');
+  assert.equal(produceFinalTime(1800, reduce), 1026, '1800 - 774 = 1026 秒，非瞬成');
+  assert.equal(produceFinalTime(1800, 0), 1800, '没有减免时就是原时长');
+  // 缺表时必须是 0，不能算出一个假的减免把队列排满。
+  assert.equal(appointProduceReduce({ tables: {} }, { appointed, heroes }), 0, 'no effect table means no reduction');
+
+  const surveyFor = ({ seaweed = 9, queue = [], finished = 0, slots = 6, cap = 50, reduce: forceReduce = reduce } = {}) => {
+    const stock = new Map([['海藻', seaweed], ['鱼', 0], ['烤鱼', 0]]);
+    const factory = {
+      buildingId: '1切鱼厂', type: '切鱼厂', level: 1, product: [],
+      factory: {
+        factoryQ: queue,
+        finishedProducts: finished > 0 ? [{ type: 'product', id: '鱼', num: finished }] : [],
+        autoProductId: '',
+      },
+    };
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: cap, factorySlots: slots,
+      buildings: [factory], factories: [factory], orders: [],
+      produce: { reduce: forceReduce, observed: 0, source: 'appoint' },
+    };
+  };
+  const producesOf = (plan) => plan.actions.filter((action) => action.kind === 'startProduce');
+
+  // 瞬成 → 空制造位一次排满；但排 6 个就是 6 份料，预留也要是 6 份。
+  const full = planWorld(surveyFor({ seaweed: 9 }), { config });
+  assert.equal(producesOf(full).length, 6, 'an instant recipe fills all six slots in one round');
+  assert.ok(producesOf(full).every((action) => action.body.productId === '鱼'), 'only the instant recipe is batched');
+  assert.deepEqual(full.reserved, [['海藻', 6]], 'six batches burn six units of material, all reserved');
+  assert.equal(new Set(producesOf(full).map((action) => action.key)).size, 6, 'batched actions need distinct keys');
+
+  // 料不够就排到够为止，别排出花不掉的假动作。
+  const short = planWorld(surveyFor({ seaweed: 3 }), { config });
+  assert.equal(producesOf(short).length, 3, 'material shortage caps the batch');
+  assert.ok(short.notes.some((note) => note.includes('材料不够')), 'the shortfall is explained');
+
+  // 存量上限：仓库 + 待收 + 队列一起算，已到上限就一个都别排。
+  const capped = planWorld(surveyFor({ seaweed: 9, finished: 48, cap: 50 }), { config });
+  assert.equal(producesOf(capped).length, 2, 'the stock cap (48/50) leaves room for exactly two');
+  const noRoom = planWorld(surveyFor({ seaweed: 9, finished: 50, cap: 50 }), { config });
+  assert.equal(producesOf(noRoom).length, 0, 'a full stock means no production at all');
+
+  // 非瞬成配方仍然一轮只排 1 个：队列是串行的，多排只是提前烧料。
+  const slow = planWorld(surveyFor({ seaweed: 9, reduce: 0 }), { config });
+  assert.equal(producesOf(slow).length, 1, 'a non-instant recipe is still queued one at a time');
+  assert.equal(producesOf(slow)[0].body.productId, '鱼', 'the shorter recipe is still preferred');
+  // 队列已占 2 格时，瞬成只补剩下的 4 格。
+  const partial = planWorld(surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }] }), { config });
+  assert.equal(producesOf(partial).length, 4, 'an occupied queue only fills the free slots');
+
+  // 批量排产中途被拒：只停这座工厂剩下的几条，别的工厂照排，
+  // 而且不能写进 rejected —— 队列满/库存满都是瞬时状态，记一辈子就再也不排了。
+  {
+    let tried = 0;
+    const client = {
+      sendWatch: async (name, body) => {
+        if (body.buildingId === '1切鱼厂') {
+          tried += 1;
+          // 第 2 条才失败：模拟「前一条排进去后队列/库存刚好满了」。
+          if (tried === 2) throw new Error('storage full');
+        }
+        return null;
+      },
+    };
+    const survey = surveyFor({ seaweed: 12, slots: 6 });
+    const second = { ...survey.factories[0], buildingId: '2切鱼厂' };
+    survey.factories = [survey.factories[0], second];
+    survey.buildings = survey.factories;
+    const plan = planWorld(survey, { config });
+    assert.equal(producesOf(plan).length, 12, 'two factories, six slots each');
+    const { results, rejected } = await runWorld(client, { StartFactoryProduceRequest: {} }, plan, {
+      allowMutate: true, window: 0, rejected: new Set(),
+    });
+    assert.equal(rejected.size, 0, 'a transient produce failure is not remembered forever');
+    const firstFactory = results.filter((entry) => entry.step.body.buildingId === '1切鱼厂');
+    const secondFactory = results.filter((entry) => entry.step.body.buildingId === '2切鱼厂');
+    assert.equal(firstFactory.filter((entry) => entry.ok).length, 1, 'the first slot goes through');
+    assert.equal(firstFactory.filter((entry) => entry.skipped).length, 4, 'the rest of that factory stops');
+    assert.equal(secondFactory.filter((entry) => entry.ok).length, 6, 'the other factory is untouched');
+  }
+  checked += 1;
+}
+
 // 材料不齐时用自选包兜底：SelectPackRequest 的 num 是「要换到的数量」，
 // 兑换动作必须排在用到它的动作之前，且不能把包一次性烧光。
 {

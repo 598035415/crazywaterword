@@ -498,10 +498,36 @@ node tools/selftest-describe.mjs    # 字段布局还原自检
 响应体是 `{"products":{"asset":[{"type":0,"id":"生鱼片","num":1}]}}`。
 
 实测（排产）：`StartFactoryProduceRequest` 入队时 `finishTime` 就是当前时刻，
-5 秒内该队列项消失并出现在 `finishedProducts` —— 即这条请求一次只产 1 件且**即时完成**，
-`BuildingProduceCfg.produceTime`（90/300 秒）在界面上是倒计时展示，不是这条请求的等待时间。
+5 秒内该队列项消失并出现在 `finishedProducts`。当时（2026-10 早期）把这条读成
+「所有排产都即时完成」，**2026-10-23 修正**：真正的解释是英雄委任的
+「生产时间减少」把这条短配方压到了 0 秒（见 12.3.1），长配方照样要排队等。
 所以循环里每轮「收成品 + 排产」是正常的一进一出，不是重复发同一个请求：
 只有当队列里已经有同一个 `productId` 时计划器才会跳过（此时它会去挑别的配方）。
+
+#### 12.3.1 生产时间减免与「瞬成排满」
+
+客户端 `BuildingProduceUtil.produceFinalTime` 的公式（不是原样用 `produceTime`）：
+
+```
+finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
+```
+
+- `reduce` = `GameEffectId.PRODUCE_TIME_REDUCTION`（「生产时间减少」，单位**秒**）。
+  大头是英雄委任：`AppointPosCfg` 里 `posId` 1/2/3 三条效果都是「生产时间」，
+  单个英雄的贡献 = `AppointEffectCfg.heroAdd[qualityIndex-1] + starAdd[qualityIndex-1] × 星级`
+  （客户端 `AppointUtil.getAppointEffect` 同款；`qualityIndex` 取自 `HeroCfg`，1蓝 2紫 3橙 4红）。
+  实测本账号 3 个橙色 9 星：`(80 + 28×9) × 3 = 774` 秒。
+- `speedUp` = `GameEffectId.PRODUCE_SPEED_UP`（百分比提速），只由服务端 effect 推送，
+  591 张配置表里没有，本工具按 0 处理（偏保守：算出来的时间只会比实际长）。
+
+774 秒减免下，90 秒的鱼/淡水、300 秒的布匹/救生衣/烤鱼全是 **0 秒 = 瞬成**；
+780 秒的木板剩 6 秒、2100 秒的刺身拼盘剩 1326 秒。所以：
+
+- **瞬成配方**：一次把空制造位排满（6 个）。每个都独立扣一次材料、占一个存量上限名额。
+- **非瞬成配方**：仍然一轮只排 1 个（队列是串行的，多排只是提前烧料）。
+- **不要用「原时长 - 剩余时间」反推减免**：那个差值里混着已经流逝的时间。
+  实测拿一个做到一半的 13500 秒配方反推，得到 12500 秒，直接把 780 秒的木板也误判成瞬成。
+  观测只能用来抓「队首还剩 0~2 秒」的瞬成证据（`observedInstantRecipes`），不能出数值。
 
 实测（制造位是**串行**的，2026-10-23 做工厂页时确认）：`factoryQ` 里**只有队首带 `finishTime`**，
 后面的排队项 `finishTime` 是 `0` —— 实测 `1食品厂` 排了 6 个「刺身拼盘」，只有第 1 项有完成时间，
