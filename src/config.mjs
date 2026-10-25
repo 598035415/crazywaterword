@@ -60,7 +60,36 @@ export function loadTables(file = findConfigPack()) {
   return extractTables(JSON.parse(fs.readFileSync(file, 'utf8')));
 }
 
-const rows = (tables, name) => (Array.isArray(tables[name]?.data) ? tables[name].data : []);
+const rows = (tables, name) => (Array.isArray(tables?.[name]?.data) ? tables[name].data : []);
+
+// 挂机等级上限：OfflineCfg 里 stage <= 主线关卡-1 的最高 level（客户端 AfkModel.maxLevel() 同款）。
+//
+// 独立导出而不是只做方法，是因为 idle.mjs（挂机等级升级）也要这一份判断 ——
+// 两处各写一份迟早会漂。第一个参数收「像 config 的东西」（只要有 tables），
+// 所以单测可以直接喂一张合成表。
+export function afkMaxLevelOf(config, mainlineStage) {
+  // 拿不到主线关卡时返回 null，不能退化成「第 0 关」（升级全禁却不说明原因），
+  // 更不能退化成「无上限」（盲发一批必被服务端拒的请求）。
+  if (mainlineStage == null || mainlineStage === '') return null;
+  const stage = Number(mainlineStage);
+  if (!Number.isFinite(stage)) return null;
+  const limit = stage - 1;
+  let best = 0;
+  for (const row of rows(config?.tables, 'OfflineCfg')) {
+    const level = Number(row.level) || 0;
+    if ((Number(row.stage) || 0) <= limit && level > best) best = level;
+  }
+  return best;
+}
+
+// 下一个有奖励的挂机等级：reward 为空的等级不产出，客户端 nextLvRewardCfg 会跳过。
+export function nextAfkRewardLevelOf(config, rewardedLevel) {
+  for (const row of rows(config?.tables, 'OfflineLvRewardCfg')) {
+    const level = Number(row.level) || 0;
+    if (level > Number(rewardedLevel) && (row.reward ?? []).length > 0) return level;
+  }
+  return null;
+}
 
 export function loadConfig({ file } = {}) {
   const tables = loadTables(file);
@@ -78,19 +107,13 @@ export function loadConfig({ file } = {}) {
       return typeof res === 'number' ? RESOURCE[res] ?? String(res) : res;
     },
     // 挂机等级上限由主线进度决定：取 stage <= mainlineStage-1 的最高等级。
+    // 拿不到主线关卡时按 0 处理（老调用方的契约：返回数字）。
     afkMaxLevel(mainlineStage) {
-      let best = 0;
-      for (const row of rows(tables, 'OfflineCfg')) {
-        if (row.stage <= mainlineStage - 1 && row.level > best) best = row.level;
-      }
-      return best;
+      return afkMaxLevelOf(this, mainlineStage) ?? 0;
     },
     // 下一个有奖励的挂机等级；reward 为空的等级不产出，客户端会跳过。
     nextAfkRewardLevel(rewardedLevel) {
-      for (const row of rows(tables, 'OfflineLvRewardCfg')) {
-        if (row.level > rewardedLevel && row.reward.length > 0) return row.level;
-      }
-      return null;
+      return nextAfkRewardLevelOf(this, rewardedLevel);
     },
   };
 }

@@ -159,10 +159,24 @@ export function record({ dir, name, seq, body, tag = null, t = Date.now(), parti
   return appendLine(archivePath(name, t), line);
 }
 
+// 日志时间戳用**本地时间 + 时区偏移**，跟 dayOf() 按本地日期切目录保持一致。
+// 之前用 toISOString()（UTC），东八区下日志时间比目录日期早 8 小时 ——
+// 事后按「今天这一轮」对日志和归档目录时两边对不上。
+export function stamp(ms = Date.now()) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  const offset = -d.getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const abs = Math.abs(offset);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
+    + `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
 // 时序流水。tag 是账号前缀，CW_DEBUG=1 时同时打到终端。
 export function traceLine(tag, line, { t = Date.now() } = {}) {
   if (!archiveEnabled()) return;
-  const text = `${new Date(t).toISOString()}${tag ? ` [${tag}]` : ''} ${line}\n`;
+  const text = `${stamp(t)}${tag ? ` [${tag}]` : ''} ${line}\n`;
   if (process.env.CW_DEBUG === '1') process.stdout.write(text);
   appendLine(PROTOCOL_LOG, text);
 }

@@ -1,4 +1,13 @@
-// 自动循环：每轮依次跑 任务领取 → 日常（含任务奖励与活跃度宝箱） → 海面（收成品/竣工/建造/交单/排产/升级）。
+// 自动循环：每轮依次跑 任务领取 → 日常（含任务奖励与活跃度宝箱） → 海面（收成品/竣工/建造/交单/排产/升级）
+// → 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级） → 搁浅的货轮（抢无人占领的货轮）
+// → 联盟情报（领奖 + 派舰队） → 装备厂（收装备 + 锻造）。
+//
+// 拾荒 / 农田 / 货轮 / 情报 / 锻造 / 挂机领取 各自有独立间隔（gateDue）：自动循环每轮都会看一眼，
+// 只有「距上次执行」超过自己的间隔才真的跑一次，其余轮次整段跳过（连探测请求都不发）。
+//
+// 货轮排在情报**前面**是刻意的：两边抢的是同一份资源 —— 空闲舰队。
+// 货轮每小时整点才刷一次、万吨全服 1 艘，错过就没了；情报事件 6 小时才刷一批、
+// 而且一直挂在那儿不会跑。所以先让货轮挑船，剩下的才给情报。
 //
 // 循环是显式开的：必须同时给 --loop 与 --yes，且每轮都是「先只读探测，再算计划，再执行」，
 // 所以第二轮起没有可做的事时计划自然为空，不会重复发同样的请求。
@@ -8,6 +17,16 @@ import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
 import { surveyRadar, viewRadar, planRadar, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
+import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
+import {
+  surveyTreasure,
+  viewTreasure,
+  planTreasure,
+  formatTreasureSummary,
+  DEFAULT_MAX_FLEETS,
+  DEFAULT_MIN_COLOR,
+} from './treasure.mjs';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -19,6 +38,21 @@ export function gateDue(lastAt, everyMs, nowMs) {
   if (!(Number(everyMs) > 0)) return true;
   if (!Number(lastAt)) return true;
   return Number(nowMs) - Number(lastAt) >= Number(everyMs);
+}
+
+// 轮数与间隔的兜底判定单独导出，纯函数好测：
+//   rounds 非法（"abc" → NaN）回退 1 轮 —— NaN 不满足 > 0，会静默变成「永久挂机」；
+//   everyMs 非法或负数回退 60 秒 —— NaN 传给 setTimeout 会被钳成 1ms，等于毫秒级轰炸网关。
+// rounds <= 0（一直跑）与 everyMs === 0（不节流）的既有语义保持不变。
+export function loopTotal(rounds) {
+  const n = Number(rounds);
+  if (!Number.isFinite(n)) return 1;
+  return n > 0 ? n : Infinity;
+}
+
+export function loopGap(everyMs) {
+  const n = Number(everyMs);
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
 }
 
 // 间隔的展示文案：40 秒 / 5 分 20 秒 / 1 小时 3 分。
@@ -67,6 +101,24 @@ export async function runLoop(client, protocol, {
   // 时间没到就整段跳过（省掉 RadarInfo + MyFleets + AllItem 三个请求）。
   radarEnabled = true,
   radarEveryMs = 60_000,
+  // 装备厂（锻造）：造好了收取 + 按部位均衡排下一件。一件蓝装原时长 1800 秒、
+  // 减完「锻造时间」委任也要 25 分钟左右，所以默认 3 分钟看一眼就够。
+  // 它比农田更值得勤看：同一时间只能造一件，造好不收等于整座工厂停产。
+  forgeEnabled = true,
+  forgeEveryMs = 180_000,
+  // 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励/升级。三件都免费、不发就白放着，
+  // 但节奏是「小时级」的（收益 8 小时封顶、等级奖励是按级一次），所以 5 分钟看一次足够，
+  // 不必每轮都多打 3 个请求（AfkInfo + EmailBox + 库存复用）。
+  idleEnabled = true,
+  idleEveryMs = 300_000,
+  // 搁浅的货轮（世界宝藏）：整点刷新、一天只有 3 次奖励，抢的是刷新后那几十秒的窗口，
+  // 所以给它最短的间隔 —— 默认 60 秒（与情报同节奏）。它排在情报前面先挑船。
+  treasureEnabled = true,
+  treasureEveryMs = 60_000,
+  // 一次最多派几支舰队抢同一个货轮；同联盟最多 10 支能占同一个，3 支已经够把小型推完。
+  treasureMaxFleets = DEFAULT_MAX_FLEETS,
+  // 最低品质：3 蓝(小型) / 4 紫(中型) / 5 橙(万吨)。默认 3 = 能抢就抢，先把 3 次名额拿满。
+  treasureMinColor = DEFAULT_MIN_COLOR,
   minPowerRatio = DEFAULT_MIN_POWER_RATIO,
   sleep = defaultSleep,
   stop = { aborted: false },
@@ -74,7 +126,7 @@ export async function runLoop(client, protocol, {
   onStep,
 } = {}) {
   if (!allowMutate) throw new Error('循环会持续改变账号状态，需要 --yes');
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), forge: new Set(), idle: new Set(), treasure: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -84,13 +136,21 @@ export async function runLoop(client, protocol, {
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
-  // rounds <= 0 表示一直跑，靠 stop.aborted（Ctrl-C 或网页停止按钮）退出。
-  const total = rounds > 0 ? rounds : Infinity;
+  // 锻造同理：探测是一整套「读装备厂 → 收取 → 排产」，探测成功就计时。
+  let lastForgeAt = 0;
+  // 挂机领取同理：探测成功就计时（哪怕这一轮没有可领的）。
+  let lastIdleAt = 0;
+  // 货轮同理：探测成功就计时（哪怕这一轮没有可抢的）。
+  let lastTreasureAt = 0;
+  // rounds <= 0 表示一直跑，靠 stop.aborted（Ctrl-C 或网页停止按钮）退出；
+  // 非法输入的回退规则见 loopTotal()，别在这里再写一份。
+  const total = loopTotal(rounds);
+  const gapMs = loopGap(everyMs);
 
   for (let round = 1; round <= total; round += 1) {
     if (stop.aborted) break;
     const tickAt = Date.now();
-    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, radar: null };
+    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, idle: null, treasure: null, radar: null, forge: null };
 
     // 1. 任务奖励
     const tasksSurvey = await surveyTasks(client, protocol, { config });
@@ -148,9 +208,78 @@ export async function runLoop(client, protocol, {
       summary.world.floaterLoot = summarizeFloaters(results);
     }
 
-    // 4. 联盟情报：先把已完成的奖励领掉，再把每艘空闲船各派去打一个「战力够」的事件。
+    // 4. 挂机领取：邮件附件 + 挂机本段收益 + 等级奖励 + 等级升级。
+    //    放在海面之后是因为它直接复用 worldSurvey.stock（省一次 AllItemRequest）。
+    //    日常那一段如果正好有「领取挂机收益(1004)」这条任务，会先把本段领掉 ——
+    //    那时这里看到的是刚开的新一段，自然什么都不做，不会重复领。
+    const idleDue = idleEnabled && gateDue(lastIdleAt, idleEveryMs, tickAt);
+    summary.idle = { planned: 0, notes: [], results: [] };
+    if (idleDue) {
+      try {
+        const idleSurvey = await surveyIdle(client, protocol, { config, player, stock: worldSurvey.stock });
+        const idlePlan = planIdle(idleSurvey, { now: Math.floor(tickAt / 1000), config });
+        summary.idle.planned = idlePlan.actions.length;
+        summary.idle.notes = idlePlan.notes;
+        summary.idle.summary = formatIdleSummary(idleSurvey);
+        if (idlePlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runIdle(client, protocol, idlePlan, {
+            allowMutate,
+            rejected: rejected.idle,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'idle', ...entry }),
+          });
+          rejected.idle = stillRejected;
+          summary.idle.results = results;
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastIdleAt = tickAt;
+      } catch (error) {
+        summary.idle.notes = [`挂机领取探测失败：${error.message}`];
+      }
+    }
+
+    // 5. 搁浅的货轮（世界宝藏）：只抢「无人占领」的货轮，一条请求把选中的空闲舰队全压上去。
+    //    必须在情报之前 —— 情报是「有多少空闲船就派多少」，放在前面会把船抢光，
+    //    货轮就永远排不上（整点刷新错过就没了，情报事件挂 6 小时还在）。
+    //    复用 world 那一段的库存（汽油），所以这一轮只多 Stats + List + MyFleets 三个只读请求。
+    const treasureDue = treasureEnabled && gateDue(lastTreasureAt, treasureEveryMs, tickAt);
+    summary.treasure = { planned: 0, notes: [], results: [] };
+    if (treasureDue) {
+      try {
+        const treasureSurvey = await surveyTreasure(client, protocol, { config, player, stock: worldSurvey.stock });
+        const treasureView = viewTreasure(treasureSurvey, {
+          config,
+          minColor: treasureMinColor,
+          maxFleets: treasureMaxFleets,
+        });
+        const treasurePlan = planTreasure(treasureView, {
+          minColor: treasureMinColor,
+          maxFleets: treasureMaxFleets,
+        });
+        summary.treasure.planned = treasurePlan.actions.length;
+        summary.treasure.notes = treasurePlan.notes;
+        summary.treasure.summary = formatTreasureSummary(treasureView);
+        if (treasurePlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, treasurePlan, {
+            allowMutate,
+            rejected: rejected.treasure,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'treasure', ...entry }),
+          });
+          rejected.treasure = stillRejected;
+          summary.treasure.results = results;
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastTreasureAt = tickAt;
+      } catch (error) {
+        summary.treasure.notes = [`货轮探测失败：${error.message}`];
+      }
+    }
+
+    // 6. 联盟情报：先把已完成的奖励领掉，再把每艘空闲船各派去打一个「战力够」的事件。
     //    舰队只有 IDLE 能派，派出去后 state 变 MOVING，下一轮自然跳过；
     //    另外整段受自己的间隔约束（默认 60 秒），没到点就一次请求都不发。
+    //    货轮那一段已经挑走了它要的船，这里只能拿剩下的。
     const radarDue = radarEnabled && gateDue(lastRadarAt, radarEveryMs, tickAt);
     summary.radar = { planned: 0, notes: [], results: [] };
     if (radarDue) {
@@ -186,6 +315,38 @@ export async function runLoop(client, protocol, {
       }
     }
 
+    // 7. 装备厂（锻造）：造好了就收，收完接着排下一件；按部位件数最少的先补。
+    //    复用 world 那一轮已经拉到的建筑与库存（含 GOLD），所以这轮只多一个 EquipsRequest。
+    const forgeDue = forgeEnabled && gateDue(lastForgeAt, forgeEveryMs, tickAt);
+    summary.forge = { planned: 0, notes: [], results: [] };
+    if (forgeDue) {
+      try {
+        const equipSurvey = await surveyEquip(client, protocol, {
+          config,
+          stock: worldSurvey.stock,
+          buildings: worldSurvey.buildings,
+        });
+        const equipPlan = planEquip(equipSurvey, { config });
+        summary.forge.planned = equipPlan.actions.length;
+        summary.forge.notes = equipPlan.notes;
+        summary.forge.summary = formatEquipSummary(equipSurvey);
+        if (equipPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, equipPlan, {
+            allowMutate,
+            rejected: rejected.forge,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'forge', ...entry }),
+          });
+          rejected.forge = stillRejected;
+          summary.forge.results = results;
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastForgeAt = tickAt;
+      } catch (error) {
+        summary.forge.notes = [`锻造探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -193,12 +354,15 @@ export async function runLoop(client, protocol, {
     summary.gates = {
       pick: { ...gateSummary(pickUpFloaters, pickEveryMs, lastPickAt, tickAt), throttled: pickUpFloaters && !pickDue },
       farm: { ...gateSummary(farmEnabled, farmEveryMs, lastFarmAt, tickAt), throttled: farmEnabled && !farmDue },
+      idle: { ...gateSummary(idleEnabled, idleEveryMs, lastIdleAt, tickAt), throttled: idleEnabled && !idleDue },
+      treasure: { ...gateSummary(treasureEnabled, treasureEveryMs, lastTreasureAt, tickAt), throttled: treasureEnabled && !treasureDue },
       radar: { ...gateSummary(radarEnabled, radarEveryMs, lastRadarAt, tickAt), throttled: radarEnabled && !radarDue },
+      forge: { ...gateSummary(forgeEnabled, forgeEveryMs, lastForgeAt, tickAt), throttled: forgeEnabled && !forgeDue },
     };
 
     history.push(summary);
     onRound?.(summary);
-    if (round < total && !stop.aborted) await sleep(everyMs);
+    if (round < total && !stop.aborted) await sleep(gapMs);
   }
 
   return { history, rejected };
@@ -217,6 +381,13 @@ const KIND_TEXT = {
   farmPlant: '播种',
   radarReward: '领情报奖励',
   radarDispatch: '派舰队',
+  treasureDispatch: '抢货轮',
+  equipPick: '收装备',
+  equipMake: '锻造',
+  mailQuickGet: '领邮件',
+  afkDraw: '挂机收益',
+  afkLevelDraw: '挂机等级奖励',
+  afkUpgrade: '挂机升级',
   upgrade: '升级',
   speedUpUpgrade: '加速建造',
   speedUpProduce: '加速生产',
@@ -225,15 +396,38 @@ const KIND_TEXT = {
 };
 
 // 每一部分的明细：成功的按 kind 聚合、失败逐条列（最多 limit 条）、跳过的按原因聚合。
+// 成功那一行必须带上**具体物品**（收成品 淡水×2、木板×1 / 排产 木板×3）：
+// 只写「收成品×3」看不出收到什么，等于没记。物品来自 step.items（由 planWorld / planEquip 填）。
+const OK_ITEM_LIMIT = 8;
 function detailLines(part, limit = 4) {
   const lines = [];
   const okBy = new Map();
   for (const entry of part.results) {
     if (entry.skipped || !entry.ok) continue;
-    const name = KIND_TEXT[entry.step?.kind] ?? entry.step?.kind ?? '其他';
-    okBy.set(name, (okBy.get(name) ?? 0) + 1);
+    const step = entry.step ?? {};
+    const name = KIND_TEXT[step.kind] ?? step.kind ?? '其他';
+    const slot = okBy.get(name) ?? { count: 0, items: new Map(), unit: step.unit ?? '' };
+    slot.count += 1;
+    for (const pair of step.items ?? []) {
+      const [id, num] = pair ?? [];
+      const n = Math.abs(Number(num) || 0);
+      if (id && n > 0) slot.items.set(id, (slot.items.get(id) ?? 0) + n);
+    }
+    okBy.set(name, slot);
   }
-  if (okBy.size) lines.push(`    成功 ${[...okBy].map(([name, n]) => `${name}×${n}`).join('  ')}`);
+  if (okBy.size) {
+    // 一类动作一行：一条 26 个动作的轮次如果全挤在一行，物品一多就折成好几行还看不到对应关系。
+    // 第一行带「成功」，后续行缩进对齐（"    成功 " 占 9 列）。
+    const parts = [...okBy].map(([name, slot]) => {
+      if (slot.items.size === 0) return `${name}×${slot.count}`;
+      const list = [...slot.items].slice(0, OK_ITEM_LIMIT)
+        .map(([id, n]) => `${id}×${n}${slot.unit}`).join('、');
+      const rest = slot.items.size > OK_ITEM_LIMIT ? `、另有 ${slot.items.size - OK_ITEM_LIMIT} 种` : '';
+      return `${name} ${list}${rest}`;
+    });
+    lines.push(`    成功 ${parts[0]}`);
+    for (const line of parts.slice(1)) lines.push(`         ${line}`);
+  }
 
   const fails = part.results.filter((entry) => !entry.skipped && entry.ok === false);
   for (const entry of fails.slice(0, limit)) {
@@ -271,6 +465,20 @@ export function formatLoopRound(summary) {
     ...detailLines(summary.dailies),
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
     ...detailLines(summary.world),
+    // 挂机领取同理：这一轮真的探测过就印一行（哪怕「本段还剩 7 小时」「邮件都已领」）——
+    // 否则日志里看不到它，很容易以为开关没生效。
+    ...(summary.idle && (summary.idle.summary || (summary.idle.notes ?? []).length > 0)
+      ? [`${line('挂机领取', summary.idle)}${summary.idle.summary ? `  ${summary.idle.summary}` : ''}`,
+        ...detailLines(summary.idle),
+        ...(summary.idle.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
+    // 货轮这一轮真的探测过就印一行概览（哪怕「今日奖励已满」「没有可抢的」）——
+    // 否则日志里看不到它，很容易以为开关没生效。被间隔挡住的那轮只在 gateLine 里体现。
+    ...(summary.treasure && (summary.treasure.summary || (summary.treasure.notes ?? []).length > 0)
+      ? [`${line('货轮', summary.treasure)}${summary.treasure.summary ? `  ${summary.treasure.summary}` : ''}`,
+        ...detailLines(summary.treasure),
+        ...(summary.treasure.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     // 情报这一轮真的探测过就印一行概览（哪怕「事件 0 个」）——
     // 否则日志里连续几十轮看不到情报，很容易以为它根本没在跑。
     // 被间隔挡住的那轮没有 summary 字段，只在下面的 gateLine 里体现。
@@ -279,8 +487,18 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.radar),
         ...(summary.radar.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 锻造同理：这轮真的探测过就印一行（哪怕是「还在锻造、还剩 20 分钟」），
+    // 否则日志里看不到它，很容易以为开关没生效。
+    ...(summary.forge && (summary.forge.summary || (summary.forge.notes ?? []).length > 0)
+      ? [`${line('锻造', summary.forge)}${summary.forge.summary ? `  ${summary.forge.summary}` : ''}`,
+        ...detailLines(summary.forge),
+        ...(summary.forge.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...(floater ? [`  ${floater}`] : []),
+    ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
+    ...[gateLine('锻造', summary.gates?.forge)].filter(Boolean),
+    ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),
   ].join('\n');

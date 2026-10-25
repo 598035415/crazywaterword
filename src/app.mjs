@@ -14,6 +14,17 @@ import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyEquip, planEquip, formatEquipPlan, formatEquipSummary } from './equip.mjs';
+import { surveyIdle, planIdle, runIdle, formatIdleSummary, mailClaimable, planAfkClaims } from './idle.mjs';
+import {
+  surveyTreasure,
+  viewTreasure,
+  planTreasure,
+  formatTreasurePlan,
+  formatTreasureSummary,
+  DEFAULT_MAX_FLEETS,
+  DEFAULT_MIN_COLOR,
+} from './treasure.mjs';
 
 const READ_ONLY_PROBES = [
   'AllResourceRequest',
@@ -62,6 +73,19 @@ function numericArg(flag) {
   if (index < 0) return undefined;
   const value = Number(process.argv[index + 1]);
   return Number.isFinite(value) ? value : undefined;
+}
+
+// 读 `--flag value` / `--flag=value` 这种带字符串值的参数。
+// 只判 includes 会把值丢掉（`--out x.json` 会静默写死到默认路径，还不报错），所以两种写法都认。
+function valueArg(flag) {
+  const index = process.argv.indexOf(flag);
+  if (index >= 0) {
+    const next = process.argv[index + 1];
+    if (next !== undefined && next !== '' && !next.startsWith('--')) return next;
+  }
+  const prefix = `${flag}=`;
+  const hit = process.argv.find((arg) => arg.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) || null : null;
 }
 
 async function headless({ seconds = 60, probes = true }) {
@@ -200,7 +224,11 @@ function planLoot(ok, now, config = null, level = 1) {
   const plan = [];
   const claimable = (list) => asArray(list).filter((task) => task.progress >= task.targetProgress && !task.rewardClaimed);
 
-  plan.push({ id: 'emailQuickGet', params: {}, why: '邮件一键领取' });
+  // 邮件：判据跟循环里那份是同一个函数（idle.mjs 的 mailClaimable），
+  // 别再写「无条件发一次」—— 没有可领的邮件时那条请求会被服务端打回。
+  if (mailClaimable(ok.EmailBoxRequest?.email ?? [])) {
+    plan.push({ id: 'emailQuickGet', params: {}, why: '邮件一键领取' });
+  }
 
   const daily = ok.DailyTaskInfoRequest;
   for (const task of claimable(daily?.dailyTask)) plan.push({ id: 'dailyTaskDraw', params: { id: task.id }, why: `每日任务 ${task.id}` });
@@ -222,16 +250,10 @@ function planLoot(ok, now, config = null, level = 1) {
   const achievement = ok.AchievementInfoRequest;
   for (const task of claimable(achievement?.task)) plan.push({ id: 'achievementDraw', params: { id: task.id }, why: `成就 ${task.id}` });
 
-  const afk = ok.AfkInfoRequest?.afkInfo;
-  if (afk && afk.afkFinishTime > 0 && now >= afk.afkFinishTime) {
-    plan.push({ id: 'afkDraw', params: {}, why: '挂机本段收益' });
-  }
-  // 等级奖励的可领等级由 OfflineLvRewardCfg 决定，不是 rewardedLevel+1，也不能超过当前挂机等级。
-  if (afk && config) {
-    const level = config.nextAfkRewardLevel(afk.rewardedLevel ?? 0);
-    if (level !== null && level <= (afk.level ?? 0)) {
-      plan.push({ id: 'afkLevelDraw', params: { level }, why: `挂机等级 ${level} 奖励` });
-    }
+  // 挂机两个领取（本段收益 / 等级奖励）用的是 idle.mjs 的 planAfkClaims —— 跟循环同一份判据：
+  // 等级奖励看 OfflineLvRewardCfg 里第一个有奖的等级，且不能超过当前挂机等级。
+  for (const step of planAfkClaims(ok.AfkInfoRequest?.afkInfo, config, now)) {
+    plan.push({ id: step.kind, params: step.body, why: step.label });
   }
 
   for (const building of asArray(ok.OnWaterRequest?.building)) {
@@ -554,6 +576,91 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
   }
 }
 
+// 装备厂（锻造）：造好了就收取，收完按部位件数最少的排下一件。
+// --dry 只列计划；--yes 才真的收/造（会消耗材料与金币，但绝不动钻石、不加速）。
+async function forge({ allowMutate, dryRun }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  try {
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const survey = await surveyEquip(client, protocol, { config });
+    const plan = planEquip(survey, { config });
+    console.log(`\n${formatEquipPlan(survey, plan)}\n`);
+    console.log(`共 ${plan.actions.length} 个动作`);
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 800,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：打造状态是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyEquip(client, protocol, { config });
+    console.log(`\n对照: ${formatEquipSummary(after)}`);
+  } finally {
+    client.stop();
+  }
+}
+
+// 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励 + 挂机等级升级。
+// 四样都免费（升级只花「挂机徽章」道具），所以默认就在循环里开跑；--dry 只列计划。
+async function idleCli({ allowMutate, dryRun }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  try {
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const survey = await surveyIdle(client, protocol, { config, player: response.playerInfo });
+    const plan = planIdle(survey, { config });
+    console.log(`\n${formatIdleSummary(survey)}\n`);
+    for (const step of plan.actions) console.log(`  ${step.kind.padEnd(12)}${step.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+    console.log(`\n共 ${plan.actions.length} 个动作`);
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runIdle(client, protocol, plan, {
+      allowMutate,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：挂机等级的计时是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyIdle(client, protocol, { config, player: response.playerInfo });
+    console.log(`\n对照: ${formatIdleSummary(after)}`);
+  } finally {
+    client.stop();
+  }
+}
+
 // 联盟情报（RADAR_VIEW）：先领已完成的奖励，再把每艘空闲船各派去打一个能打过的事件。
 // --dry 只列判定；--yes 才真的派兵（战败会掉舰船耐久，所以默认要求 1.2 倍战力余量）。
 // --power-ratio 0.8 可以放宽到「八折战力也上」，自己承担战损。
@@ -598,6 +705,51 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
     console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
     console.log(`  待领奖 ${view.rewards.length} -> ${afterView.rewards.length}，可派 ${view.events.filter((e) => e.dispatchable).length} -> ${afterView.events.filter((e) => e.dispatchable).length}`);
     console.log(`  汽油 ${after.petrol}`);
+  } finally {
+    client.stop();
+  }
+}
+
+// 搁浅的货轮（世界宝藏）：列货轮 → 只挑无人占领的 → 一条请求把空闲舰队全派上去。
+async function treasureCli({ allowMutate, dryRun, maxFleets, minColor }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  try {
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const survey = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
+    const view = viewTreasure(survey, { config, minColor, maxFleets });
+    const plan = planTreasure(view, { minColor, maxFleets });
+    console.log(`\n${formatTreasureSummary(view)}`);
+    console.log(`\n${formatTreasurePlan(view, plan)}\n`);
+    console.log(`共 ${plan.actions.length} 个动作（品质下限 ${minColor}，一次最多 ${maxFleets} 支舰队）`);
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 900,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：货轮归属和舰队状态都是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
+    const afterView = viewTreasure(after, { config, minColor, maxFleets });
+    console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
+    console.log(`  可抢 ${view.targets.length} -> ${afterView.targets.length}，今日奖励 ${after.todayRewardTimes}/${after.dailyLimit}，汽油 ${after.petrol}`);
   } finally {
     client.stop();
   }
@@ -739,6 +891,8 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 // 拾荒另外有自己的间隔（--pick-every，秒；0 = 不限制）。
 // 农田默认开（收成熟作物 + 补种），--no-farm 关；间隔 --farm-every（秒，默认 120）。
 // 联盟情报默认开（领奖 + 派兵），--no-radar 关；间隔 --radar-every（秒，默认 60）。
+// 装备厂默认开（收装备 + 锻造），--no-forge 关；间隔 --forge-every（秒，默认 180）。
+// 挂机领取默认开（邮件/本段收益/等级奖励/升级），--no-idle 关；间隔 --idle-every（秒，默认 300）。
 async function loopCli({
   allowMutate,
   rounds,
@@ -754,6 +908,12 @@ async function loopCli({
   farmEverySeconds = 120,
   radarEnabled = true,
   radarEverySeconds = 60,
+  forgeEnabled = true,
+  forgeEverySeconds = 180,
+  idleEnabled = true,
+  idleEverySeconds = 300,
+  treasureEnabled = true,
+  treasureEverySeconds = 60,
   minPowerRatio = 1.2,
 }) {
   const { url, login } = loadCredentials();
@@ -777,6 +937,9 @@ async function loopCli({
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
+    console.log(`锻造=${forgeEnabled ? (forgeEverySeconds > 0 ? `开(每 ${forgeEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
+    console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
+    console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：只抢无人占领的，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -794,6 +957,12 @@ async function loopCli({
       farmEveryMs: Math.max(0, Number(farmEverySeconds) || 0) * 1000,
       radarEnabled,
       radarEveryMs: Math.max(0, Number(radarEverySeconds) || 0) * 1000,
+      forgeEnabled,
+      forgeEveryMs: Math.max(0, Number(forgeEverySeconds) || 0) * 1000,
+      idleEnabled,
+      idleEveryMs: Math.max(0, Number(idleEverySeconds) || 0) * 1000,
+      treasureEnabled,
+      treasureEveryMs: Math.max(0, Number(treasureEverySeconds) || 0) * 1000,
       minPowerRatio,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
@@ -801,7 +970,7 @@ async function loopCli({
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world' || entry.phase === 'radar') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'forge' || entry.phase === 'idle' || entry.phase === 'treasure') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -973,9 +1142,14 @@ async function main() {
   }
 
   if (mode === 'loop') {
+    // 非数字必须回退默认值：`--rounds abc` 会让 rounds 变 NaN 而被当成「一直跑」，
+    // `--every abc` 则让 setTimeout(NaN) 退化成 1ms 间隔的高频轰炸。
     const at = (name, fallback) => {
       const i = process.argv.indexOf(name);
-      return i >= 0 && process.argv[i + 1] ? Number(process.argv[i + 1]) : fallback;
+      const raw = i >= 0 ? process.argv[i + 1] : undefined;
+      if (raw === undefined || raw === '') return fallback;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : fallback;
     };
     await loopCli({
       rounds: at('--rounds', 1),
@@ -991,6 +1165,12 @@ async function main() {
       farmEverySeconds: at('--farm-every', 120),
       radarEnabled: !process.argv.includes('--no-radar'),
       radarEverySeconds: at('--radar-every', 60),
+      forgeEnabled: !process.argv.includes('--no-forge'),
+      forgeEverySeconds: at('--forge-every', 180),
+      idleEnabled: !process.argv.includes('--no-idle'),
+      idleEverySeconds: at('--idle-every', 300),
+      treasureEnabled: !process.argv.includes('--no-treasure'),
+      treasureEverySeconds: at('--treasure-every', 60),
       minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
@@ -1044,6 +1224,33 @@ async function main() {
     return;
   }
 
+  if (mode === 'treasure') {
+    await treasureCli({
+      dryRun: process.argv.includes('--dry'),
+      // 一次最多派几支舰队；--min-color 3/4/5 = 只抢蓝/紫/橙及以上。
+      maxFleets: numericArg('--max') ?? DEFAULT_MAX_FLEETS,
+      minColor: numericArg('--min-color') ?? DEFAULT_MIN_COLOR,
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'forge') {
+    await forge({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'idle') {
+    await idleCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
   if (mode === 'tasks') {
     await tasks({
       dryRun: process.argv.includes('--dry'),
@@ -1053,17 +1260,23 @@ async function main() {
   }
 
   if (mode === 'state') {
+    // --out 是**带值**参数，不能只判 includes：那样 `state --out mydump.json` 会静默写到
+    // data/state.json，用户给的路径被丢掉也不报错。
+    const outArg = valueArg('--out');
     await state({
       raw: process.argv.includes('--raw'),
-      out: process.env.CW_STATE_OUT ?? (process.argv.includes('--out') ? 'data/state.json' : null),
+      out: process.env.CW_STATE_OUT ?? outArg ?? (process.argv.includes('--out') ? 'data/state.json' : null),
     });
     return;
   }
 
   if (mode === 'worlds') {
     const arg = process.argv[3];
+    // 开关（--group / --dry）也会落在 argv[3]，不能直接 Number()：`worlds --group`
+    // 会得到 NaN 并被当成 worldId 再登录一次，可能顶号、甚至在没角色的服上建号。
+    const wanted = arg && !arg.startsWith('--') && arg !== 'all' ? Number(arg) : null;
     await worlds({
-      worldId: arg && arg !== 'all' ? Number(arg) : null,
+      worldId: Number.isFinite(wanted) ? wanted : null,
       group: process.argv.includes('--group'),
       seconds: Number(process.env.CW_WORLD_HOLD ?? 0),
     });

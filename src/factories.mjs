@@ -149,14 +149,20 @@ export function viewFactories(survey, { config = null } = {}) {
         buildingId: factory.buildingId,
         type: factory.type,
         level: factory.level,
-        // 队列项带上 produceTime，前端拿它算进度条（查不到就是 0，只显示倒计时）。
+        // 队列项带上配方时长，前端拿它算进度条（查不到就是 0，只显示倒计时）。
         // pending = 还没轮到的排队项（finishTime 为 0）；remain 是队首的剩余秒数。
-        queue: factory.queue.map((job) => ({
-          ...job,
-          pending: (job.finishAt ?? 0) <= 0,
-          remain: Math.max(0, (job.finishAt ?? 0) - now),
-          produceTime: produceTimeOf.get(job.productId) ?? 0,
-        })),
+        // finalSeconds 是**减免后**的秒数 —— 进度条的分母必须用它，写原时长会让
+        // 「1200 秒配方在 840 秒减免下 360 秒做完」的进度条只走到三成然后跳满。
+        queue: factory.queue.map((job) => {
+          const produceTime = produceTimeOf.get(job.productId) ?? 0;
+          return {
+            ...job,
+            pending: (job.finishAt ?? 0) <= 0,
+            remain: Math.max(0, (job.finishAt ?? 0) - now),
+            produceTime,
+            finalSeconds: produceFinalTime(produceTime, reduce),
+          };
+        }),
         finished: factory.finished,
         finishedTotal: factory.finished.reduce((sum, entry) => sum + entry.num, 0),
         autoProductId: factory.autoProductId,

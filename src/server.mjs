@@ -16,6 +16,9 @@ import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyEquip, planEquip, formatEquipPlan } from './equip.mjs';
+import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
+import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, DEFAULT_MAX_FLEETS, DEFAULT_MIN_COLOR } from './treasure.mjs';
 import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -86,6 +89,23 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         radarEnabled: true,
         radarEveryMs: 60_000,
         lastRadarAt: null,
+        // 装备厂（锻造）：造好了收取 + 按部位均衡排下一件。一件蓝装 25 分钟上下，
+        // 所以默认 3 分钟看一眼；造好不收 = 整座工厂停产，比农田更值得勤看。
+        forgeEnabled: true,
+        forgeEveryMs: 180_000,
+        lastForgeAt: null,
+        // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：收益 8 小时封顶、等级奖励是按级一次，
+        // 都是小时级节奏，所以默认 5 分钟看一眼，不必每轮多打 3 个请求。
+        idleEnabled: true,
+        idleEveryMs: 300_000,
+        lastIdleAt: null,
+        // 搁浅的货轮（世界宝藏）：整点刷新、一天 3 次奖励，抢的是刷新后那几十秒，
+        // 所以给最短的间隔（默认 60 秒）。它排在情报前面先挑空闲舰队。
+        treasureEnabled: true,
+        treasureEveryMs: 60_000,
+        lastTreasureAt: null,
+        treasureMaxFleets: DEFAULT_MAX_FLEETS,
+        treasureMinColor: DEFAULT_MIN_COLOR,
         minPowerRatio: DEFAULT_MIN_POWER_RATIO,
         stop: { aborted: false },
         history: [],
@@ -331,6 +351,80 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     };
   }
 
+  // 装备厂（锻造）：读装备厂 + 背包，算「收哪件、造哪件」。只读视图，真正的写走 /api/forge/run。
+  async function forge(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyEquip(instance, protocol, { config });
+    const plan = planEquip(survey, { config });
+    return {
+      building: survey.building,
+      making: survey.making,
+      counts: survey.counts,
+      bagCount: survey.bag.length,
+      actions: plan.actions,
+      notes: plan.notes,
+      text: formatEquipPlan(survey, plan),
+    };
+  }
+
+  // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：只读视图，真正的领取走 /api/idle/run。
+  async function idle(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyIdle(instance, protocol, { config, player: session.player });
+    const plan = planIdle(survey, { config });
+    const pending = plan.actions.map((step) => step.label);
+    return {
+      afk: survey.afk,
+      mail: survey.mail,
+      levelReward: survey.levelReward,
+      upgrade: survey.upgrade,
+      actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+      notes: plan.notes,
+      text: formatIdleSummary(survey) + (pending.length ? `\n待领：${pending.join('、')}` : '\n没有可领的（等下一段封顶/新邮件）'),
+    };
+  }
+
+  // 搁浅的货轮（世界宝藏）：只读视图 + 派兵计划，真正的派兵走 /api/treasure/run。
+  // 单独跑（不经过循环）时要自己拉库存 —— 只为了那个汽油数。
+  async function treasure(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
+    const view = viewTreasure(survey, { config });
+    const plan = planTreasure(view, {});
+    return {
+      // 活动有效期：页面直接据此显示「还有多久到期 / 已结束」。
+      activity: view.activity,
+      dailyLimit: view.dailyLimit,
+      todayRewardTimes: view.todayRewardTimes,
+      remainingRewards: view.remainingRewards,
+      dailyFull: view.dailyFull,
+      nextRefreshTime: view.nextRefreshTime,
+      petrol: view.petrol,
+      petrolCost: view.petrolCost,
+      minColor: view.minColor,
+      maxFleets: view.maxFleets,
+      treasures: view.treasures.map((one) => ({
+        uid: one.uid,
+        name: one.name,
+        color: one.color,
+        progress: one.progress,
+        ownerGuildIdx: one.ownerGuildIdx,
+        ownerFleetNum: one.ownerFleetNum,
+        ourFleets: one.ourFleets,
+        claimable: one.claimable,
+        gridIdx: one.gridIdx,
+        rewardText: one.rewardText,
+      })),
+      fleets: view.fleets,
+      actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+      notes: plan.notes,
+      text: formatTreasureSummary(view) + `\n${formatTreasurePlan(view, plan)}`,
+    };
+  }
+
   async function heroes(session, account) {
     const instance = await ensureConnected(session, account);
     const heroList = await instance.request('AllHeroRequest', {}, 'AllHeroResponse', 15000);
@@ -504,6 +598,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const store = loadStore();
         const account = pickAccount(store, payload.id);
         if (!account) throw new Error('没有这个账号');
+        // 先停掉这个账号的连接与循环：sessions.delete() 只是丢掉 Map 里的引用，
+        // 正在跑的 runLoop 还持着 client 的强引用，会继续操作一个凭证已经被删掉的账号；
+        // 那些 socket / tickTimer 之后再也拿不到，也就永远停不了。
+        const dead = sessions.get(account.id);
+        if (dead) {
+          dead.loop.stop.aborted = true;
+          try {
+            dead.client?.stop();
+          } catch {
+            /* 已经断了 */
+          }
+        }
         removeAccount(store, account.id);
         saveStore(store);
         sessions.delete(account.id);
@@ -569,7 +675,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       // 今天归档了什么：哪个接口、多少条、多大的文件，以及落在哪个目录。
       // 不碰网关、不碰账号，纯文件系统读取，所以不带 ?account。
       if (route === 'GET /api/archive') {
-        const day = parsed.searchParams.get('day') || dayOf();
+        // 只接受 YYYY-MM-DD。这个值会直接进 path.join，放任 `../..` 就等于把任意目录
+        // （连同绝对路径回显与同步全量读）暴露给任何能访问本机 17321 的进程。
+        const wanted = parsed.searchParams.get('day') ?? '';
+        const day = /^\d{4}-\d{2}-\d{2}$/.test(wanted) ? wanted : dayOf();
         json({ root: ARCHIVE_ROOT, day, days: listDays(), entries: summarizeDay(ARCHIVE_ROOT, day) });
         return;
       }
@@ -635,6 +744,89 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         json({
           results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
           ...(await radar(session, account)),
+        });
+        return;
+      }
+      // ---- 装备厂（锻造） ----
+      if (route === 'GET /api/forge') {
+        const { account, session } = scoped_(parsed);
+        json(await forge(session, account));
+        return;
+      }
+      // 收取 + 排产：跟情报一样先探测再计划再执行。一轮最多一个收取 + 一个排产。
+      if (route === 'POST /api/forge/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const survey = await surveyEquip(instance, protocol, { config });
+        const plan = planEquip(survey, { config });
+        const { results } = await runWorld(instance, protocol, plan, {
+          allowMutate: true,
+          window: 800,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `锻造「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `锻造 ${entry.step.label}` : `锻造 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await forge(session, account)),
+        });
+        return;
+      }
+      if (route === 'GET /api/idle') {
+        const { account, session } = scoped_(parsed);
+        json(await idle(session, account));
+        return;
+      }
+      // 立刻领取一次：不看间隔，跟挂机里那套完全一样（探测 → 计划 → 执行）。
+      if (route === 'POST /api/idle/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const survey = await surveyIdle(instance, protocol, { config, player: session.player });
+        const plan = planIdle(survey, { config });
+        const { results } = await runIdle(instance, protocol, plan, {
+          allowMutate: true,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `挂机领取「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `挂机领取 ${entry.step.label}` : `挂机领取 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await idle(session, account)),
+        });
+        return;
+      }
+      // 搁浅的货轮：手动「立刻抢一次」，判据与循环里那套完全一样（只抢无人占领的）。
+      if (route === 'POST /api/treasure/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
+        const view = viewTreasure(survey, { config });
+        const plan = planTreasure(view, {});
+        const { results } = await runWorld(instance, protocol, plan, {
+          allowMutate: true,
+          window: 800,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `抢货轮「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `抢货轮 ${entry.step.label}` : `抢货轮 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await treasure(session, account)),
         });
         return;
       }
@@ -854,7 +1046,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         json({
           results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
-          plan: after.plan, text: after.text, population: after.population,
+          // 跟 /api/radar/run 一样把整份世界视图带回去。页面执行完要重画工厂/订单/仓库/订单表，
+          // 只回 results/plan/text 的话 renderWorld 会读到 undefined，在「已清空面板」之后抛
+          // TypeError，页面停在半更新状态，连本轮执行结果都显示不出来。
+          ...after,
           floaterText, floaterLoot,
         });
         return;
@@ -874,20 +1069,47 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
         loop.running = true;
-        loop.rounds = Number(payload.rounds ?? 1);
+        // 参数一律先过有限数校验：`"abc"` 会让 Number() 得到 NaN，
+        // rounds 变 NaN 等于「永久挂机」（NaN 不满足 > 0），
+        // everySeconds 变 NaN 则让 setTimeout(NaN) 退化成 1ms 间隔的高频轰炸。
+        const secondsArg = (value, fallback) => {
+          const n = Number(value ?? fallback);
+          return Number.isFinite(n) && n >= 0 ? n : fallback;
+        };
+        const roundsArg = Number(payload.rounds ?? 1);
+        loop.rounds = Number.isFinite(roundsArg) ? roundsArg : 1;
         loop.completed = 0;
-        loop.everyMs = Number(payload.everySeconds ?? 60) * 1000;
+        loop.everyMs = secondsArg(payload.everySeconds, 60) * 1000;
         // 0 或负数 = 不节流（旧行为）。负数按 0 处理，免得写成 -1 时被当成「永远不做」。
-        loop.pickEveryMs = Math.max(0, Number(payload.pickEverySeconds ?? 0)) * 1000;
+        loop.pickEveryMs = secondsArg(payload.pickEverySeconds, 0) * 1000;
         loop.lastPickAt = null;
         // 农田默认开，前端取消勾选才关；间隔同样 0 = 不限制。
         loop.farmEnabled = payload.farm !== false;
-        loop.farmEveryMs = Math.max(0, Number(payload.farmEverySeconds ?? 120)) * 1000;
+        loop.farmEveryMs = secondsArg(payload.farmEverySeconds, 120) * 1000;
         loop.lastFarmAt = null;
         // 情报默认开；powerRatio 前端可调（默认 1.2，越大越保守）；间隔默认 60 秒。
         loop.radarEnabled = payload.radar !== false;
-        loop.radarEveryMs = Math.max(0, Number(payload.radarEverySeconds ?? 60)) * 1000;
+        loop.radarEveryMs = secondsArg(payload.radarEverySeconds, 60) * 1000;
         loop.lastRadarAt = null;
+        // 锻造默认开，间隔默认 180 秒（一件蓝装约 25 分钟，没必要每轮去问）。
+        loop.forgeEnabled = payload.forge !== false;
+        loop.forgeEveryMs = secondsArg(payload.forgeEverySeconds, 180) * 1000;
+        loop.lastForgeAt = null;
+        // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，间隔默认 300 秒。
+        loop.idleEnabled = payload.idle !== false;
+        loop.idleEveryMs = secondsArg(payload.idleEverySeconds, 300) * 1000;
+        loop.lastIdleAt = null;
+        // 搁浅的货轮默认开，间隔默认 60 秒（整点刷新，抢的是刷新后那几十秒）。
+        // 品质下限与单次派船数可调：3=蓝(小型) 4=紫(中型) 5=橙(万吨)。
+        loop.treasureEnabled = payload.treasure !== false;
+        loop.treasureEveryMs = secondsArg(payload.treasureEverySeconds, 60) * 1000;
+        loop.lastTreasureAt = null;
+        loop.treasureMaxFleets = Number.isFinite(Number(payload.treasureMaxFleets)) && Number(payload.treasureMaxFleets) > 0
+          ? Math.min(10, Math.floor(Number(payload.treasureMaxFleets)))
+          : DEFAULT_MAX_FLEETS;
+        loop.treasureMinColor = Number.isFinite(Number(payload.treasureMinColor)) && Number(payload.treasureMinColor) >= 3
+          ? Math.min(5, Math.floor(Number(payload.treasureMinColor)))
+          : DEFAULT_MIN_COLOR;
         loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
         loop.history = [];
         loop.error = null;
@@ -899,7 +1121,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const radarText = loop.radarEnabled
           ? `情报${loop.radarEveryMs > 0 ? `每 ${Math.round(loop.radarEveryMs / 1000)} 秒一次` : '每轮都看'}（战力余量 ${loop.minPowerRatio}×）`
           : '情报关';
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${payload.everySeconds ?? 60} 秒；${gateText}；${farmText}；${radarText}`);
+        const forgeText = loop.forgeEnabled
+          ? (loop.forgeEveryMs > 0 ? `锻造每 ${Math.round(loop.forgeEveryMs / 1000)} 秒看一眼` : '锻造每轮都看')
+          : '锻造关';
+        const idleText = loop.idleEnabled
+          ? (loop.idleEveryMs > 0 ? `挂机领取每 ${Math.round(loop.idleEveryMs / 1000)} 秒看一眼` : '挂机领取每轮都看')
+          : '挂机领取关';
+        const treasureText = loop.treasureEnabled
+          ? (loop.treasureEveryMs > 0 ? `货轮每 ${Math.round(loop.treasureEveryMs / 1000)} 秒抢一次` : '货轮每轮都抢')
+          : '货轮关';
+        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${radarText}；${forgeText}`);
         runLoop(instance, protocol, {
           config,
           player: session.player,
@@ -915,6 +1146,14 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           farmEveryMs: loop.farmEveryMs,
           radarEnabled: loop.radarEnabled,
           radarEveryMs: loop.radarEveryMs,
+          forgeEnabled: loop.forgeEnabled,
+          forgeEveryMs: loop.forgeEveryMs,
+          idleEnabled: loop.idleEnabled,
+          idleEveryMs: loop.idleEveryMs,
+          treasureEnabled: loop.treasureEnabled,
+          treasureEveryMs: loop.treasureEveryMs,
+          treasureMaxFleets: loop.treasureMaxFleets,
+          treasureMinColor: loop.treasureMinColor,
           minPowerRatio: loop.minPowerRatio,
           stop: loop.stop,
           onRound: (summary) => {
@@ -922,6 +1161,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastPickAt = summary.gates?.pick?.lastAt ?? loop.lastPickAt;
             loop.lastFarmAt = summary.gates?.farm?.lastAt ?? loop.lastFarmAt;
             loop.lastRadarAt = summary.gates?.radar?.lastAt ?? loop.lastRadarAt;
+            loop.lastForgeAt = summary.gates?.forge?.lastAt ?? loop.lastForgeAt;
+            loop.lastIdleAt = summary.gates?.idle?.lastAt ?? loop.lastIdleAt;
+            loop.lastTreasureAt = summary.gates?.treasure?.lastAt ?? loop.lastTreasureAt;
             loop.history.push(summary);
             if (loop.history.length > 50) loop.history.shift();
             emit(session, 'info', formatLoopRound(summary));
@@ -955,6 +1197,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       json({ error: 'not found' }, 404);
     } catch (error) {
       emit(scoped, 'error', error.message);
+      // 响应头已经发出去时不能再 writeHead（典型：图集/二维码先 writeHead(200) 再 readFileSync
+      // 抛 ENOENT）。那个二次异常发生在 catch 之外，会变成未处理的 rejection 把进程带走。
+      if (res.headersSent) {
+        try {
+          res.end();
+        } catch {
+          /* 客户端已经断了 */
+        }
+        return;
+      }
       json({ error: error.message }, 400);
     } finally {
       if (scoped && scoped.busy === route) scoped.busy = null;
@@ -976,18 +1228,73 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       radarEnabled: loop.radarEnabled,
       radarEveryMs: loop.radarEveryMs,
       lastRadarAt: loop.lastRadarAt,
+      forgeEnabled: loop.forgeEnabled,
+      forgeEveryMs: loop.forgeEveryMs,
+      lastForgeAt: loop.lastForgeAt,
+      idleEnabled: loop.idleEnabled,
+      idleEveryMs: loop.idleEveryMs,
+      lastIdleAt: loop.lastIdleAt,
+      treasureEnabled: loop.treasureEnabled,
+      treasureEveryMs: loop.treasureEveryMs,
+      lastTreasureAt: loop.lastTreasureAt,
+      treasureMaxFleets: loop.treasureMaxFleets,
+      treasureMinColor: loop.treasureMinColor,
       minPowerRatio: loop.minPowerRatio,
       history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
       error: loop.error,
     };
   }
 
+  // 请求体上限：控制台只收很小的 JSON，给一个宽松但有限的天花板，
+  // 免得任意本机进程一个超大 POST 就把控制台的内存吃光。
+  const MAX_BODY_BYTES = 16 * 1024 * 1024;
   const server = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
+    // 先收 Buffer、最后一次性转字符串：`body += chunk` 会对每个分片各做一次
+    // toString('utf8')，一个中文字正好跨 TCP 分片时会被拆成两个替换字符
+    // （账号 label 是要落盘的，坏了就是脏数据）。
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    req.on('error', () => {
+      // 客户端中途断开时不处理会从 http 服务器内部抛出去。
+      settled = true;
     });
-    req.on('end', () => handle(req, res, body));
+    req.on('data', (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        settled = true;
+        chunks.length = 0;
+        try {
+          res.writeHead(413, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: `请求体超过 ${MAX_BODY_BYTES} 字节` }));
+        } catch {
+          /* 已经断了 */
+        }
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      const body = Buffer.concat(chunks).toString('utf8');
+      // handle 是 async：不接住它的 reject 就是未处理的 promise rejection，
+      // Node 15+ 默认行为是直接退出进程（控制台整体挂掉）。
+      handle(req, res, body).catch((error) => {
+        emit(null, 'error', error.message);
+        try {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: error.message }));
+          } else {
+            res.end();
+          }
+        } catch {
+          /* 已经断了 */
+        }
+      });
+    });
   });
 
   return {
@@ -1002,7 +1309,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     close: () => new Promise((resolve) => server.close(resolve)),
     emit,
     sessions,
-    captureState: () => capture,
+    captureState,
   };
 }
 

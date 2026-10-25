@@ -328,6 +328,7 @@ MonthCardDailyRewardRequest          领取月卡每日奖励，无响应类型
 
 ```bash
 node src/app.mjs state --out        # 采集状态并写入 data/state.json
+node src/app.mjs state --out a.json # 同上，写到指定文件（不给文件名就是 data/state.json）
 node src/app.mjs state --raw        # 采集并打印原始响应体
 node src/app.mjs worlds             # 列出账号区服与登录区服的用户信息
 node src/app.mjs worlds <worldId>   # 进入指定区服并打印其用户信息
@@ -662,10 +663,16 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
 游戏里的「联盟情报」就是客户端的 `RADAR_VIEW`，数据来自 `RadarInfoRequest`：
 
 ```
-radarInfo = { events[], level, exp, storedNum, nextRefreshTime }
+radarInfo = { events[], level, exp, storedNum, nextRefreshTime, fixedEvent? }
 events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,level},
               refugee?:{requirements[]}, createTime, state }
+fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个字段，不在 events 里
 ```
+
+**固定事件在单独的 `fixedEvent` 字段（单数，一次只有一个），只遍历 `events` 会整条看不见。**
+客户端 `WorldRadarModel._updateRadar` 是这么做的：`var f = [].concat(e.events); if (e.fixedEvent) f.push(e.fixedEvent);`
+—— 追加进同一份列表，再用同一个模型类包装，靠 `eventData instanceof RadarFixedEvent` 区分
+（本地 uid 固定成 `RadarUtil.FIXED_UID = 1`）。「路易斯的行踪」就是固定事件。
 
 - **`state`** 是 `RadarEventState`：`1 INIT`（可派兵）/ `2 LOCKED`（被占）/ `3 START`（我方在打）/ `4 FINISHED`（可领奖）。
   实测抓包时 10 个事件全是 `1`。
@@ -673,17 +680,30 @@ events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,leve
   type 1/2/3 = 海盗先锋/精锐/头目，lv1 分别是 84200 / 123000 / 118000。
   `eventId >= 10000` 的才是随机事件表 `RadarRandEventCfg` 里的类型；`eventId < 10000` 是固定事件
   （`RadarFixedEventCfg`，150 档，自带 `power`，最小 155000、最大 4 亿）。
+- **固定事件没有 `reward` / `color` / `pirate`**：奖励要回 `RadarFixedEventCfg.reward`（`[[id,num],…]` 对子）补，
+  战力查 `RadarFixedEventCfg.power`。代码里 `fixed` 标记优先信「来自 `fixedEvent` 字段」这个事实，
+  `eventId < 10000` 只作兜底（且必须带 `eventId > 0`，否则 events 里 eventId 缺省的畸形条目会被当成固定事件）。
+- **固定事件「我方已派兵」有两个信号**：`state` 变 3，以及 `startTime > 0` ——
+  客户端 `isBatting() = startTime>0 && (isPirate || isFixed)` 就是这条（专门给海盗和固定事件留的）。
+  服务端还会主动推 `SCRadarEventState` 更新 state/startTime，且**只在 state 变 FINISHED 时才
+  `removeTrackRadarUid()`**（解除「本会话已派过」的防重）。所以 state 的推送有延迟时，靠 `startTime` 兜住，
+  否则挂机会每 60 秒重复派一次、白烧 500 汽油/次。
+- **配置查不到战力时不能放行**：`power = 0` 会让 `need = 0`、`fits` 恒真，变成闭眼派船去打。代码标 `powerUnknown`，
+  跳过并在文案里写「配置过期」（说明该跑 `tools/sync-config.mjs` 刷配置了）。
 - **`refugee.requirements`** 是「解救难民」要交的材料，材料不齐别派（派了也是白跑）。
 - 其余事件（打捞宝箱 / 救助海兽 / 收集资源）没有 `pirate` 字段，属于「无需战斗」，但**仍要派舰队**
   —— 客户端所有情报事件都走同一个 `RadarSendFleetsRequest`。
 
-请求（`tools/describe.mjs` 读出的字段）：
+请求（`tools/describe.mjs` + 反编译客户端双重确认）：
 
 | 请求 | 字段 | 说明 |
 |---|---|---|
 | `RadarSendFleetsRequest` | `uid: int64`, `fleetBuildingIds: repeated string` | 固定事件（`isFixed()`）**不带 uid**，只带舰队 |
 | `RadarGetRewardRequest` | `uid: int64` | 按事件领 |
-| `RadarGetAllRewardsRequest` | 空体 | 一键全领，本工具用它 |
+| `RadarGetAllRewardsRequest` | 空体 | 一键全领，本工具用它（固定事件也走这条，因为它没有 uid） |
+
+固定事件派兵的编码实测：不带 uid 的 payload 是 `120a31…`（只有 field 2）；
+带 uid 的以 `08` 开头。所以「不带 uid」不是省字段，是服务端靠它认「当前固定事件」。
 
 舰队：`MyFleetsResponse.fleets[] = { buildingId, state, durability, power, maxDura, autoFight, cityId }`。
 `FleetState`：`1 IDLE` / `2 MOVING` / `3 BATTLING` / `4 REPAIRING` / `5 QUEUING` —— **只有 IDLE 能派**。
@@ -693,7 +713,9 @@ events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,leve
 1. **先领奖**：`state === 4` 的事件合成一条 `RadarGetAllRewardsRequest`。
 2. **再派兵**：只在有 IDLE 舰队时派，且 `舰队战力 ≥ 敌方战力 × minPowerRatio`（默认 **1.2**）。
    战败会掉舰船耐久、修船要资源，所以宁可少打一个也不拿船去赌。
-3. **排序**：`color` 降序（4 紫 > 3 蓝 > 2 绿）→ 敌方战力降序 → 奖励件数。
+3. **排序**：固定事件优先 → `color` 降序（4 紫 > 3 蓝 > 2 绿）→ 敌方战力降序 → 奖励件数。
+   **固定事件必须排最前**：它没有 `color`（恒为 0），按颜色排会永远垫底，而空闲船少于事件数时
+   垫底就等于永远轮不到 —— 「路易斯的行踪」就是这么一次都没被打过的。
    **不能只按奖励件数排** —— 打捞宝箱带 `GOLD 3700`，按件数算会把分数拉得虚高，结果船天天去捞箱子。
 4. **每艘空闲船各派一个**：一艘船同一时刻只能打一个点，所以空闲船数就是并发上限；
    同一事件不会被派两次（`taken` 集合按事件 key 去重，固定事件用 `eventId+gridIdx` 兜底 key）。
@@ -701,6 +723,9 @@ events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,leve
    战力不够的事件不硬派（打输掉耐久，修船要资源）。派出去后 `state` 变 MOVING，
    下一轮探测自然看不到那几艘船。
    失败隔离按船分组（`group: radarDispatch:<buildingId>`）：一条被拒只停这艘船，别的船照派。
+   每个事件的判定文案（`可派` / `已派兵` / `材料不齐` / `战力不够` / `配置过期` / `待领奖`）
+   由 `viewRadar` 的 `verdict` / `verdictChip` 统一给出，文本视图和网页只读这两个字段 ——
+   以前两边各算一套，加了固定事件后就漂移了（页面不认识「已派兵」）。
 5. **按自己的间隔跑**（`runLoop` 的 `radarEveryMs`，默认 60 秒）：这也是后来补的 ——
    事件会随时刷出来，但每轮都探测等于每轮多发 `RadarInfo + MyFleets + AllItem` 三个请求。
    现在跟拾荒/农田共用 `gateDue`：没到点整段跳过（一个请求都不发），到点才跑一整套
@@ -718,6 +743,199 @@ events[]  = { uid, eventId, color, gridIdx, reward:{asset[]}, pirate?:{type,leve
 
 汽油：派兵要消耗（`情报事件消耗汽油` × 舰队数）。实测账号 16.7 万汽油，够用很久；
 `surveyRadar` 会把汽油余额读出来给页面看，但**不做余额拦截**（参数名跨表查不到时按 0 处理，拦了反而误伤）。
+
+### 12.9 装备厂（锻造）：收取 + 按部位均衡排产
+
+锻造不挂在 `factory` 上 —— 装备厂是**另一种建筑**，状态在
+`DispWaterBuilding.equipMaking = { makeId, equipId, star, finishTime }`，全城 65 座建筑里只有
+「1装备厂」带这个字段。所以 `planWorld` 完全不碰它，逻辑独立在 `src/equip.mjs`。
+
+**为什么必须进挂机**：同一时间只能造一件，客户端点「锻造」先判 `_makeUpLeftSeconds() > 0`，
+还在造就只弹提示、连排队都不给 → **造好不收 = 整座工厂停产**。
+实测代价：`1装备厂` 从 2026-10-24 13:25:45 造好「蓝饰品1」，到 10-25 10:40 的 14007 条回包
+一次没变，卡了 21.8 小时。
+
+请求（`tools/describe.mjs` + 反编译客户端双重确认）：
+
+| 请求 | 字段 | 说明 |
+|---|---|---|
+| `PickMadeEquipRequest` | `buildingId` | 收取，回 `PickMadeEquipResponse { equipId }` |
+| `MakeEquipRequest` | `buildingId`, `makeId`, `universal` | 无 Response，结果靠 `SCUpdateWaterBuilding` 推送 |
+| `SpeedMakeEquipRequest` | `buildingId`, `speedUp` | **花钻石加速，本项目永不使用** |
+
+`universal` 是客户端的 `_isAutoExchange`（材料不够时自动兑换），我们恒发 `false`。
+
+配方 `BuildingEquipMakeCfg` 12 行 = 3 部位（武器 1xxx / 防具 2xxx / 饰品 3xxx）× 4 品质
+（末位 1~4 = 蓝/紫/橙/红），`seconds` 1800 / 7200 / 21600 / 43200，红装标 `season: 2`。
+**赛季号在协议里拿不到**（没有哪条状态消息带 season 字段），所以按材料筛 ——
+红材料要 800 个，攒够之前不会去试；真攒够了但赛季没开，服务端会拒一次，日志里能看到。
+
+锻造时间有委任减免：`AppointPosCfg posId 13/14/15 =「锻造时间」`（playerLevel 17/22/26）。
+本账号海森堡 7 星紫卡占 posId 13 → `76 + 28×7 = 272` 秒 → 蓝装 1800s 实际约 25.5 分钟。
+**但不按这个算时长** —— 造没造好以服务端给的 `finishTime` 为准。
+
+排产策略（英雄每个部位只能穿一件，所以「可分配库存」必须成套）：
+
+1. 件数口径 = **背包 + 打造中**（已穿在英雄身上的不算：那是「已在用」，不是「可分配」）；
+2. 哪个部位件数少就补哪个；件数相同时按 **武器 → 防具 → 饰品** 固定轮转
+   （`Array#sort` 在 V8 里稳定，所以造完一件自然轮到下一个部位）；
+3. 部位内先试品质最高的配方，材料或金币不够就**自动降级** ——
+   紫材料攒够 160 时会自动改造紫装，不用改代码；
+4. 一轮最多一个收取 + 一个排产，两条动作共用 `group: equip:forge:<buildingId>`，
+   收取失败时同一轮不再硬排一件（否则两条必然一起失败，日志全是噪音）。
+
+挂机里是第 6 阶段（`forgeEnabled` / `forgeEveryMs`，默认 **180 秒**），复用 world 那一轮已经拉到的
+建筑与库存（含 GOLD —— `surveyWorld` 把 `AllResourceResponse` 合进了 `stock`），所以这轮只多一个
+`EquipsRequest`。计时语义跟情报一样：**探测成功就计时**。
+
+### 12.10 挂机领取：邮件 / 本段收益 / 等级奖励 / 等级升级
+
+这一节记的是 2026-10-25 补的第 6 个自动模块（`src/idle.mjs`，循环里的 `idleEnabled`）。
+起因是一个洞：**挂机本段收益以前只由日常任务 1004 驱动**——服务端那天没下发这条日常，收益就整天没人领，
+而 `DrawAfkRewardResponse` 会把时间段重置成新的 8 小时，封顶之后产出等于停摆。
+
+四件事一次探测一起处理，判据全部照抄客户端：
+
+| 动作 | 请求 | 判据（客户端出处） |
+|---|---|---|
+| 邮件附件 | `QuickGotReadEmailRequest{all:true}` | `MailView._gotAllMail` 的按钮灰化条件：存在 `status==EmailStatus.ES_NEW(2)` 的邮件，或 `attachment != null && !got` |
+| 挂机本段收益 | `DrawAfkRewardRequest{}` | `afkFinishTime > 0 && now >= afkFinishTime`（OfflineRewardView 领取按钮） |
+| 挂机等级奖励 | `DrawAfkLevelRewardRequest{level}` | `nextLvRewardCfg(rewardedLevel)` = `OfflineLvRewardCfg` 里第一个 `level > rewardedLevel` 且 `reward` 非空的行；再要求 `level <= afkInfo.level` |
+| 挂机等级升级 | `UpgradeAfkLevelRequest{level}` | `OfflineRewardView._refreshLevelUpBtn` |
+
+**三条容易踩错的细节：**
+
+1. `EmailStatus` 只有 `ES_READ=1` / `ES_NEW=2` 两个值 —— **没有「已领」状态**，领没领看 `EmailDetail.got`。
+   所以判「有没有得领」必须同时看 `status` 和 `got`。
+2. `AfkModel.maxLevel()` = `OfflineCfg` 里 `stage <= playerInfo.mainlineStage - 1` 的最大 `level`。
+   主线关卡不够时，客户端连按钮都不亮（只弹「达到主线第 X 关解锁 Y 级」）。所以我们同样按等级上限拦，
+   不靠服务端拒绝。
+3. **`UpgradeAfkLevelRequest.level` 是「升几级」，不是目标等级。** 客户端把 `_jumpLevelUp` 塞进这个字段，
+   而 `_jumpLevelUp` 只会是 10 / 5 / 1：先试连升 5 级（累计 `offlineCfg(level+1..level+5).consume[1]`），
+   够了再试 10 级，都不够就退回 1 级。`consume` 形如 `["挂机徽章", 1]`，数量在 `consume[1]`。
+
+**升级会重置本段计时** —— `UpgradeAfkLevelResponse { level, afkStartTime, afkFinishTime }` 回传新的
+时间段，客户端 `_onLevelUp` 直接 `setAfkInfo` 覆盖。所以「本段已经累积 7 小时、但还没到封顶时升级」
+等于把那 7 小时的产出白扔。实现上做了两层保护：
+
+- **计划层**：只有 `afk.fresh`（本段计时不到 2 分钟）或 `afk.ready`（已封顶，这一轮就会领）才排升级；
+- **执行层**：升级动作带 `after: 'afkDraw'`，`runIdle` 发现本段收益没成功就跳过升级，
+  一个字节都不发（`selftest` 有断言钉住这条）。
+
+顺序固定：邮件 → 本段收益 → 等级奖励 → 升级。概览一行：
+`挂机 Lv40（已领到 35） · 本段还剩 42 分 · 挂机徽章 0/1（上限 Lv41） · 邮件 20 封都已领`。
+
+挂机里是第 4 阶段（放在海面之后，直接复用 `worldSurvey.stock`，省一次 `AllItemRequest`），
+`idleEnabled` / `idleEveryMs` 默认 **300 秒**：收益 8 小时封顶、等级奖励按级一次，都是小时级节奏。
+
+### 12.11 搁浅的货轮（世界宝藏）：只抢无人占领的，一次压一个
+
+游戏里叫「世界宝藏」（`moduleId = 世界宝藏`，`dispName = 搁浅的货轮`，2026-10-25 起玩家 19 级开放）。
+`src/treasure.mjs`，循环里第 5 阶段（`treasureEnabled` / `treasureEveryMs`，默认 **60 秒**）。
+
+**玩法**（游戏内「世界宝藏」说明 + 配置表 + 抓包三方对齐）：
+
+| 事实 | 出处 |
+|---|---|
+| 每天 8:00~22:00 每个整点刷新 | `SCTreasureLootRefresh.nextRefreshTime` 实测回的就是下一个整点（`1792936000 → 1792936800`） |
+| 万吨 1 / 中型 3 / 小型 6（本剧本） | 同一条推送的 `stats: [{color:4,count:3},{color:3,count:6},{color:5,count:1}]` |
+| 每人每天最多 3 次奖励 | `TreasureLootParamCfg`「每日宝藏奖励次数」= 3，`TreasureLootStatsResponse.totalRewardTimes` = 3 |
+| 进度 100% 结算，前 5 名有奖，满次顺延 | 游戏内说明「货轮奖励」四条 |
+| 同联盟最多 10 支占同一个 | 游戏内说明「舰队数量限制」 |
+| 单支派兵消耗汽油 500 | `WorldParamCfg`「进攻宝藏消耗汽油」 |
+
+**品质枚举偏移**：协议 `color` 是全局品质枚举（3 蓝 / 4 紫 / 5 橙），`TreasureLootCfg` 用的是
+`qualityIndex` 1/2/3，两者**差 2**。抓包验证：`color 3` 的奖励是「蓝装材料自选包」，
+`color 4` 是「紫装材料自选包」，`color 5` 是「橙装材料自选包」。代码里按 `color - 2` 反查表，
+不硬编码名字（配置表改名不用动代码；查不到就降级成「货轮（品质 N）」而不是丢掉）。
+
+**只抢 `ownerGuildIdx = 0` 的原因**：`TreasureLootInstance.battlePoint` 里只有
+`rightFighter.{name, avatar, isNpc, guildIdx, skinId}` —— **没有战力字段**。
+抢别人占着的货轮要先打赢守军，拿不到对手战力就等于闭着眼派船，输了掉舰船耐久（维修 6 汽油/点）。
+己方联盟已经在打也不用加：那边的舰队数够了，进度是共同推进的。
+
+**舰队判据照抄客户端**：`state === 1`（`FleetState.IDLE`）且 `treasureLootUid === 0`。
+`MyFleet.treasureLootUid` 是 field 19 int32，为 0 时 protobuf 不编码、字段直接不出现 ——
+所以读出来是 `undefined`，统一按 0 处理。客户端 `CmdUtil.autoTreasureLoot` 的原话：
+`f.troopState == u.Idle && 0 == f.treasureLootUid`。
+
+**一次只打一个货轮**：一条 `TreasureLootSendFleetsRequest{uid, fleetBuildingIds:[…]}` 把选中的空闲船全塞进去
+（客户端「自动抢万吨」也是这么发的）。理由：进度是「所有占领者同速推进」，船越多越快结算；
+而每天只有 3 次奖励、一天 14 次刷新，分散到多个货轮只是把每场都拖慢，拖慢就更容易被人抢走。
+默认最多 3 支（`DEFAULT_MAX_FLEETS`），汽油不够自动少派（派到一半卡住比不派更糟）。
+
+**排序不能用总件数**：`reward.asset` 里 `type 0` = 物品、`type 1` = 资源。抓包实测有
+「GOLD×8300」的金币货轮，按总件数排会永远排第一 —— 跟 12.8 里「带 GOLD 3700 的打捞宝箱把分数拉得虚高」
+是同一个坑。`rewardScore` 返回 `{items, resources}`，排序是 品质 → items → resources → uid，
+资源只做同分时的次级比较。
+
+**没有领取请求**：协议里只有 List / SendFleets / Defence / Rank / Stats，结算奖励由服务端自动发
+（战报进邮件），由 12.10 的「挂机领取」一并收掉。所以本模块唯一的写操作就是派舰队。
+
+**为什么默认 60 秒**：抢的是整点刷新后那几十秒 —— 万吨全服 1 艘，客户端「自动抢万吨」是
+收到 `SCTreasureLootRefresh` 推送立刻抢。固定间隔的架构下，60 秒意味着刷新后最多 1 分钟响应，
+与情报同节奏；稳态一轮只多 3 个只读请求（Stats / List / MyFleets，汽油复用海面那一段的库存），
+没有可抢的时候一个写请求都不发。
+
+**为什么排在情报之前**：两边抢的是同一批空闲舰队。`planRadar` 是「有多少空闲船就派多少」，
+放在前面会把船全派去刷 6 小时才刷一批的情报事件，货轮就永远排不上。所以循环顺序是
+海面 → 挂机领取 → **货轮** → 情报 → 锻造。
+
+**没做的那件事**：客户端 `autoTreasureLoot` 在舰队回港且耐久不满时会自动
+`RepairFleetRequest`（修完再派回同一个货轮）。本模块不修船 —— 维修按 6 汽油/点，属于
+「花资源换收益」的决策，交给人在游戏里判断；只在日志里说明「舰队在修理中」。
+
+#### 12.11.1 活动有效期（赛季窗口）
+
+需求原话是「这个活动是有有效期的，获取一下有效期，过期之后不再进行，并且在日志中打印」。
+先把「有效期到底存在哪」这件事查清楚 —— **它不在活动体系里**：
+
+| 查过的地方 | 结论 |
+|---|---|
+| `SCAllActivity`（18 个字段） | 只有首充 / 七日登录 / 限时礼包 / 皮肤 / 金鱼 / 春分 / 集市 / 节日 / 漫海这些**运营活动**，世界宝藏不在其中 |
+| `TreasureLootStatsResponse` | 只有 `nextRefreshTime`（下一个整点），没有起止时间 |
+| `ModuleOpenCfg` | `世界宝藏` 只有 `playerLevel: 19`（等级门槛） |
+| `GameplayOpenCfg` | `世界宝藏: openDays: [3,1,1,1]` —— 这是**开放条件**：S1 第 3 天开、S2 之后第 1 天开，不是结束时间 |
+| 客户端 `TreasureLootPop` | 界面上只有一个倒计时，就是「下次刷新」 |
+| `SeasonRankInfoResponse` | ✅ `startTime / midEndTime / endTime / midAutoGrantTime / autoGrantTime` |
+
+所以真正的边界是**赛季结束**（世界宝藏属于 `WorldGameplay`，随赛季存在）：
+
+- 赛季一收，世界重置、货轮清空；
+- 新赛季前 1 小时连船都派不了（游戏内「合服计划」说明：
+  「进入新赛季前的 1 小时内，玩家将不再能操作舰队参与包括但不限于货轮争夺…」）；
+- 新赛季按 `GameplayOpenCfg.openDays` 重新开放。
+
+**两个来源互为兜底，且在 S1 上实测完全相等（差 0 秒）**：
+
+```
+① SeasonRankInfoResponse.endTime                    = 1794499170 = 2026-11-12 23:59:30
+② playerInfo.worldOpenTime(10-20 00:00) + 24 天      = 1794499170 = 2026-11-12 23:59:30
+```
+
+- 赛季从 `worldOpenTime` 的**当天零点**算第 1 天，第 N 天最后一秒是 `23:59:30`（不是 59 秒）。
+- 赛季天数取 `SeasonTaskCfg` 里该赛季最大的 `lastDay`：S1~S3 = 24、S4~S7 = 45
+  （配置包里 `SeasonTaskCfg` / `1_` / `2_` 三份按服不同，全部扫一遍取最大）。
+- 赛季号从 `worldId` 编解码：`Math.floor(worldId / 1e6 % 1000)`，`2001014410 → S1`。
+
+**截止时间 = `endTime − 1 小时`**（`SEASON_CLOSE_GUARD_SECONDS = 3600`），因为最后 1 小时派不了船。
+
+实现要点：
+
+- `seasonWindow()` 请求 `SeasonRankInfoRequest` 拿 `endTime`，**进程内按 worldId 缓存 1 小时**
+  （这个值一天最多变一次，60 秒一轮问一次纯浪费；按 worldId 分键防多账号串号）。
+- 拿不到服务端值就用 `worldOpenTime + lastDay` 复算；两个都算不出来时 `endAt = 0`，
+  此时**按「未结束」处理**（`activity.unknown = true`）—— 算不出来不等于活动结束了，
+  不能因为一个接口挂了就把功能停掉。
+- 过期后 `planTreasure` 直接返回空计划，`formatTreasureSummary` 只印一句：
+  `活动已结束（11-12 23:59 赛季收官），自动化停用 —— src/treasure.mjs 这段可以删了`。
+  这句话就是给「活动下线后把整块删掉」用的路标。
+- 未过期时每轮概览尾部都带 `有效至 11-12 22:59（还剩 433 小时 5 分）`，CLI 的 `treasure` 子命令
+  另起一行写全：`活动有效期：S1 · 赛季结束 11-12 23:59 · 派船截止 11-12 22:59（新赛季前 1 小时封盘）`。
+
+**看到的那个状态也顺手修了**：`[被联盟 3 占]` 在自家舰队已经在推的时候也会出现 ——
+协议只给联盟**编号**，我们拿不到自己的 `guildIdx`，所以改用舰队上的 `treasureLootUid` 反查：
+`我方在途`（还在航行，货轮 `ownerGuildIdx` 仍是 0）/ `我方在占`（已到达，进度在涨）。
 
 ## 13. 账号、素材与网页控制台
 

@@ -281,6 +281,17 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
           }
         : null,
       product: (raw.product?.asset ?? []).map((a) => ({ id: a.id, num: Number(a.num ?? 0) })),
+      // 装备厂（锻造）挂在 building.equipMaking 上：{ makeId, equipId, star, finishTime }。
+      // 它**没有 factory 字段**，所以不走 BuildingProduce 那套排产 —— planWorld 完全不碰它，
+      // 锻造由 equip.mjs 单独算（同一时间只能造一件，造好不收就等于停产）。
+      equipMaking: raw.equipMaking && Number(raw.equipMaking.makeId) > 0
+        ? {
+            makeId: Number(raw.equipMaking.makeId) || 0,
+            equipId: raw.equipMaking.equipId || '',
+            star: Number(raw.equipMaking.star) || 0,
+            finishTime: Number(raw.equipMaking.finishTime) || 0,
+          }
+        : null,
       buildStartTime: raw.buildStartTime ?? 0,
       buildFinishTime: raw.buildFinishTime ?? 0,
       auto: raw.auto === true,
@@ -504,25 +515,32 @@ export function planWorld(survey, {
   // 本项目明确不做。详见 docs/gameplay.md「潜水为什么不能自动化」。
 
   // 1. 收成品：工厂走 GainFactoryProduce，非工厂建筑的囤积产物一次性批量收。
+  //    items 是「这一条动作到底收进了什么」，日志按它汇总成「收成品 淡水×2、木板×1」，
+  //    而不是只报「收成品×3」—— 后者看不出收了什么，等于没记。
   for (const b of survey.factories) {
-    if ((b.factory.finishedProducts ?? []).length > 0) {
+    const finished = b.factory.finishedProducts ?? [];
+    if (finished.length > 0) {
+      const items = finished.map((asset) => [asset.id, assetCount(asset.num)]);
       actions.push({
         kind: 'gainFactory',
         request: 'GainFactoryProduceRequest',
         response: 'GainFactoryProduceResponse',
         body: { buildingId: b.buildingId },
-        label: `收成品 ${b.buildingId}`,
+        items,
+        label: `收成品 ${b.buildingId}（${itemText(items)}）`,
       });
     }
   }
-  const collectible = survey.buildings.filter((b) => !b.factory && b.product.length > 0).map((b) => b.buildingId);
+  const collectible = survey.buildings.filter((b) => !b.factory && b.product.length > 0);
   if (collectible.length > 0) {
+    const items = collectible.flatMap((b) => b.product.map((asset) => [asset.id, assetCount(asset.num)]));
     actions.push({
       kind: 'collectProduct',
       request: 'CollectBuildingProductRequest',
       response: 'CollectBuildingProductResponse',
-      body: { buildingId: collectible },
-      label: `收建筑产物 ${collectible.join(',')}`,
+      body: { buildingId: collectible.map((b) => b.buildingId) },
+      items,
+      label: `收建筑产物 ${collectible.map((b) => b.buildingId).join(',')}（${itemText(items)}）`,
     });
   }
 
@@ -586,11 +604,16 @@ export function planWorld(survey, {
 
   // 4. 交居民订单：材料齐就交；不齐先试着用自选包补，补不上再按开关决定要不要拒绝重刷。
   for (const order of survey.orders) {
-    // order.missing 的 num 是「还差多少」，cover 里再按 free() 扣掉本轮已补的量，不会重复兑。
-    if (!order.missing.every((m) => free(m.id) >= m.num)) cover(order.missing, `订单 #${order.index}`);
-    const buildable = order.missing.every((m) => free(m.id) >= m.num);
+    // 判「能不能交」必须拿**全量需求**（requirements）跟可用量比。
+    // order.missing 是 `max(0, 需求 - 探测时库存)`，是缺口；而 free() 返回的是绝对可用量。
+    // 拿缺口去跟绝对量比等于把库存扣两次：库存 3、需求 5 时 missing=2，free=3 >= 2 会被
+    // 误判成「材料齐」，请求发出去必被服务端拒，还会把 reserved 抬到虚高、
+    // 把后面的建造/升级判断一起打成负数。missing 只留给排产优先级（demand）和提示文案。
+    const needs = (order.requirements ?? []).map((r) => ({ id: r.id, num: Number(r.num ?? 0) }));
+    if (!needs.every((n) => free(n.id) >= n.num)) cover(needs, `订单 #${order.index}`);
+    const buildable = needs.every((n) => free(n.id) >= n.num);
     if (buildable) {
-      for (const r of order.requirements) reserve(r.id, r.num);
+      for (const n of needs) reserve(n.id, n.num);
       actions.push({
         kind: 'finishOrder',
         request: 'FinishWorkerOrderRequest',
@@ -600,7 +623,7 @@ export function planWorld(survey, {
       });
       continue;
     }
-    const short = order.missing.map((m) => `${m.id} ${free(m.id)}/${m.num}`).join(' ');
+    const short = needs.filter((n) => free(n.id) < n.num).map((n) => `${n.id} ${free(n.id)}/${n.num}`).join(' ');
     if (!allowReroll) {
       notes.push(`订单 #${order.index} 材料不足（${short}），未开 --reroll，保留`);
     } else if ((order.rewardExp ?? 0) < minOrderExp) {
@@ -645,9 +668,18 @@ export function planWorld(survey, {
     if (queue.length > 0) continue;
     const slots = Math.max(0, Number(survey.factorySlots) || 0);
     if (slots === 0) continue;
+    // 产品持有量 = 仓库 + 这个工厂待收的 + 队列里排着的 —— 跟服务端判 storage full 的口径一致。
+    // 存量上限的过滤必须用它，不能只看仓库：仓库没满但工厂已囤满时，只按仓库过滤会把这条配方
+    // 当成"可排"，循环里再 break，结果最优先的那条配方一条占住位置，后面真正能排的配方永远轮不到，
+    // 整座工厂长期空转。
+    const heldOf = (itemId) => have(itemId)
+      + (b.factory.finishedProducts ?? [])
+        .filter((asset) => asset.id === itemId)
+        .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
+      + queue.filter((job) => job.productId === itemId).length;
     const cand = produceRows
       .filter((row) => row.buildType === b.type && row.unlockLevel <= b.level)
-      .filter((row) => (survey.stockCap > 0 ? have(row.itemId) < survey.stockCap : true))
+      .filter((row) => (survey.stockCap > 0 ? heldOf(row.itemId) < survey.stockCap : true))
       .filter((row) => (row.costItem ?? []).every(([id, n]) => free(id) >= n))
       .sort((a, b2) => scoreOf(b2) - scoreOf(a));
     if (cand.length === 0) {
@@ -665,12 +697,9 @@ export function planWorld(survey, {
       hint: instantHints.has(`${b.type}\u0000${best.itemId}`),
     });
     const wanted = fillInstantQueue && instant ? slots : 1;
-    // 产品持有量 = 仓库 + 工厂待收 + 队列里排着的，跟服务端 storage full 的口径一致。
-    const held = have(best.itemId)
-      + (b.factory.finishedProducts ?? [])
-        .filter((asset) => asset.id === best.itemId)
-        .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
-      + queue.filter((job) => job.productId === best.itemId).length;
+    // 这条配方的持有量（仓库 + 待收 + 队列）。cand 已经按同一个 heldOf 过滤过上限，
+    // 这里只是把它取出来给循环里的「瞬成排满」再逐份卡上限用。
+    const held = heldOf(best.itemId);
     // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」。
     const costText = (best.costItem ?? []).map(([id, n]) => `${id}×${n}`).join(' ');
     const timeText = instant
@@ -696,6 +725,8 @@ export function planWorld(survey, {
         request: 'StartFactoryProduceRequest',
         response: null,
         body: { buildingId: b.buildingId, productId: best.itemId },
+        // 一条动作 = 一个成品。日志按 items 累加，瞬成排 3 个就显示「排产 木板×3」。
+        items: [[best.itemId, 1]],
         // 瞬成排满是同一座工厂连发 N 条：key 必须带上序号，否则 stepKey 会把它们算成同一个动作。
         // transient：排产失败几乎都是瞬时原因（队列满/库存满/料不够），不该被 rejected 永久记住。
         key: `startProduce:${b.buildingId}#${k}`,
@@ -723,6 +754,10 @@ export function planWorld(survey, {
         request: 'FarmHarvestRequest',
         response: null,
         body: { buildingId: ripe.map((b) => b.buildingId) },
+        // 农田的「数量」是地块数不是作物件数（收获件数要乘 FarmlandPlantCfg.produceNum，
+        // 而协议回包是空的、拿不到实际入库量），所以单位标成「块」，别让人以为是 4 个小麦。
+        items: ripe.map((b) => [b.farm.productId, 1]),
+        unit: '块',
         label: `收农田 ${ripe.map((b) => `${b.buildingId}(${b.farm.productId})`).join(' ')}`,
       });
     }
@@ -767,6 +802,9 @@ export function planWorld(survey, {
           request: 'FarmPlantRequest',
           response: null,
           body: { args },
+          // 同上：单位是地块数（args 一个元素 = 一块地）。
+          items: args.map((a) => [a.productId, 1]),
+          unit: '块',
           label: `播种 ${args.length} 块（${mix}）`,
         });
       }
@@ -923,6 +961,23 @@ export function assetCount(num) {
   if (typeof num === 'number') return Number.isFinite(num) ? num : 0;
   if (num && typeof num === 'object') return Number(num.low ?? 0) + Number(num.high ?? 0) * 2 ** 32;
   return Number(num ?? 0) || 0;
+}
+
+// 物品明细的统一格式：`淡水×2、木板×1`。重复 id 合并、数量 <=0 的丢掉。
+// 海面计划、循环日志、锻造提示都走这一个函数 —— 各写一份的话，同一批动作在不同地方
+// 迟早会显示成不同的数字。
+export function itemText(pairs, { unit = '', limit = 6 } = {}) {
+  const merged = new Map();
+  for (const pair of pairs ?? []) {
+    const [id, num] = pair ?? [];
+    if (!id) continue;
+    const n = assetCount(num);
+    if (n <= 0) continue;
+    merged.set(id, (merged.get(id) ?? 0) + n);
+  }
+  const list = [...merged].slice(0, limit).map(([id, num]) => `${id}×${num}${unit}`);
+  if (merged.size > limit) list.push(`另有 ${merged.size - limit} 种`);
+  return list.join('、');
 }
 
 // 藏品碎片在奖励里是按编号分开的（藏品蓝10碎片、藏品蓝11碎片、藏品紫2碎片…），

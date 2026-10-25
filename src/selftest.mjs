@@ -4,7 +4,7 @@ import { loadProtocol } from './proto.mjs';
 import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
 import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
-import { gateDue, humanDuration, formatLoopRound } from './loop.mjs';
+import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap } from './loop.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -191,6 +191,19 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(isSeqNoInRange(5, 5), true, 'seq in range');
   assert.equal(isSeqNoInRange(MAX_SEQ, 1), true, 'seq wraps inside range');
   assert.equal(isSeqNoInRange(9, 5), false, 'seq out of range');
+
+  // 断线 / 重连必须清掉心跳 interval：onClose 只把 socket 置空，interval 留着的活
+  // 会变成孤儿（this.tickTimer 被新值覆盖后再也 clear 不到），两个 tick 交替发 ping。
+  const broken = new GameClient({ protocol });
+  let ticks = 0;
+  broken.on('tick', () => { ticks += 1; });
+  broken.tickTimer = setInterval(() => broken.tick(), 10);
+  broken.onClose({ code: 1006, reason: 'gone' });
+  assert.equal(broken.tickTimer, null, 'onClose 要清掉心跳定时器');
+  const ticksAtClose = ticks;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(ticks, ticksAtClose, '断开后不该再有 tick');
+  assert.equal(broken.socket, null, 'onClose 要把 socket 置空');
   checked += 1;
 }
 
@@ -320,6 +333,33 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const end = PAGE.lastIndexOf('</script>');
   assert.ok(start > 0 && end > start, 'console page has an inline script');
   new vm.Script(PAGE.slice(start, end), { filename: 'page-inline.js' });
+
+  // 单元格契约：putCell 的 cell 分支要的是 {icon, id} 资产对象，chip 分支要的是
+  // {chip, text} 包装。之前把图标对象和 chip() 返回的 <span> 直接当 spec 传，
+  // 名称列渲染成 undefined、状态列整列空白，而且不报错（静默），只能靠这条静态检查兜住。
+  // 允许 `cell: null`（没有图标、只显示文字，走 fallback）和 `cell: { ... }`，
+  // 不允许把图标对象本身直接塞进去 —— 那样 entry.icon / entry.id 都取不到，
+  // 名字会渲染成 undefined 且不报错。
+  const cellSpecs = [...PAGE.matchAll(/\{\s*cell:\s*([^{}\n]*)/g)].map((match) => match[1].trim());
+  // 只关心「标识符或 xxx.yyy 后面直接跟逗号/花括号」这种真正把对象塞进去的写法；
+  // 注释里的 `{ cell: 图标项 }` 说明文字不算。
+  const badCells = cellSpecs.filter(
+    (rest) => /^[A-Za-z_$][\w$.]*\s*[,}]/.test(rest) && !/^(null|undefined)\b/.test(rest),
+  );
+  assert.deepEqual(badCells, [], 'cell 不能直接传图标对象，要包成 { icon, id }');
+  assert.equal(/\?\s*chip\(/.test(PAGE), false,
+    'chip() 返回 DOM 节点，当单元格用要写成 { chip, text }');
+  // 执行一轮海面的响应曾经缺 factories/orders/stock/resFields，renderWorld 直接抛 TypeError。
+  assert.ok(/\(data\.factories \|\| \[\]\)\.length/.test(PAGE),
+    'renderWorld 要容忍 /api/world/run 的响应缺字段');
+
+  // DOM id 契约：`$('forge-on')` 这类引用如果 in HTML 里没有对应的 id，
+  // 页面会在运行时抛 TypeError（或者对 null 取属性），而且只在点开那个页签时才炸。
+  // 静态比对一遍最省事。
+  const definedIds = new Set([...PAGE.matchAll(/\bid="([\w-]+)"/g)].map((match) => match[1]));
+  const usedIds = new Set([...PAGE.matchAll(/\$\('([\w-]+)'\)/g)].map((match) => match[1]));
+  const missingIds = [...usedIds].filter((id) => !definedIds.has(id));
+  assert.deepEqual(missingIds, [], '页面里 $() 引用的 id 必须在 HTML 里有定义');
   checked += 1;
 }
 
@@ -594,6 +634,36 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(held.notes.some((note) => note.includes('材料不足')), 'the kept order says why');
   const rerolled = planWorld(surveyFor(0), { config, allowReroll: true, minOrderExp: 500 });
   assert.equal(rerolled.actions.find((a) => a.kind === 'denyOrder')?.body.index, 1, 'low-value orders are denied when asked');
+
+  // 交单判据是**全量需求**（requirements），不是探测时算出来的缺口（missing）。
+  // 库存 3 / 需求 5 时 missing=2，拿 free()=3 去跟 2 比会误判成「材料齐」，
+  // 请求发出去必被服务端拒，而且会把预留抬到虚高、连累后面的建造与升级。
+  const partial = surveyFor(0);
+  partial.stock.set('布匹', 3);
+  partial.orders = [{
+    index: 1,
+    requirements: [{ id: '布匹', num: 5 }],
+    missing: [{ id: '布匹', num: 2 }],
+    rewardExp: 100,
+  }];
+  const shortOrder = planWorld(partial, { config });
+  assert.equal(shortOrder.actions.some((a) => a.kind === 'finishOrder'), false,
+    'have=3 / need=5 不能当成材料齐（缺口不是需求）');
+  assert.ok(shortOrder.notes.some((note) => note.includes('布匹 3/5')),
+    '提示要写 have/need，而不是 have/gap');
+
+  // 库存刚好等于需求：交得掉，且只预留需求那一份（不重复扣）。
+  const exact = surveyFor(0);
+  exact.stock.set('布匹', 5);
+  exact.orders = [{
+    index: 2,
+    requirements: [{ id: '布匹', num: 5 }],
+    missing: [],
+    rewardExp: 100,
+  }];
+  const exactPlan = planWorld(exact, { config });
+  assert.equal(exactPlan.actions.some((a) => a.kind === 'finishOrder'), true, 'have=5 / need=5 可以交');
+  assert.deepEqual(exactPlan.reserved, [['布匹', 5]], '只预留需求那一份，不重复扣');
   checked += 1;
 }
 
@@ -722,6 +792,38 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     assert.equal(firstFactory.filter((entry) => entry.ok).length, 1, 'the first slot goes through');
     assert.equal(firstFactory.filter((entry) => entry.skipped).length, 4, 'the rest of that factory stops');
     assert.equal(secondFactory.filter((entry) => entry.ok).length, 6, 'the other factory is untouched');
+  }
+
+  // 最优先的配方已经到上限时，要跳过它去排下一条，而不是让整座工厂空转。
+  // 之前候选过滤只看仓库（have）、上限判定看 held：仓库 0 但工厂囤了 50 个时，
+  // 第一条配方能通过过滤，随后在循环里被 break 掉，planned=0，后面能排的配方永远轮不到。
+  {
+    const fallbackConfig = { tables: {
+      BuildingCfg: { data: [{ buildingType: '食品厂' }] },
+      BuildingProduceCfg: { data: [
+        { buildType: '食品厂', itemId: '鱼肠线', produceTime: 100, unlockLevel: 1, costItem: [['海藻', 1]] },
+        { buildType: '食品厂', itemId: '鱼丸', produceTime: 900, unlockLevel: 1, costItem: [['海藻', 1]] },
+      ] },
+      BuildingUpgradeCfg: { data: [] },
+      SelectPackLibCfg: { data: [] },
+    } };
+    const stock = new Map([['海藻', 9], ['鱼肠线', 0], ['鱼丸', 0]]);
+    const factory = {
+      buildingId: '1食品厂',
+      type: '食品厂',
+      level: 1,
+      product: [],
+      factory: { factoryQ: [], finishedProducts: [{ type: 'product', id: '鱼肠线', num: 50 }], autoProductId: '' },
+    };
+    const survey = {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6,
+      buildings: [factory], factories: [factory], orders: [],
+    };
+    const plan = planWorld(survey, { config: fallbackConfig });
+    const produced = plan.actions.filter((action) => action.kind === 'startProduce');
+    assert.equal(produced.length, 1, '囤满的配方被过滤后还要继续排下一条，不能整座空转');
+    assert.equal(produced[0].body.productId, '鱼丸', '跳过已到上限的鱼肠线');
   }
   checked += 1;
 }
@@ -886,6 +988,18 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(fixedView.events[0].enemyPower, 500000, 'a fixed event reads its power from RadarFixedEventCfg');
   assert.deepEqual(planRadar(fixedView).actions[0].body, { fleetBuildingIds: ['1远征船'] }, 'fixed events are dispatched without a uid');
 
+  // 编码层再确认一次：不带 uid 时 payload 不能出现 field 1（tag 0x08）。
+  // 如果哪天有人给固定事件的 body 补个 uid:0，服务端会把它当「uid=0 的事件」而不是当前固定事件。
+  const payloadOf = (body) => {
+    const frame = codec.encode('RadarSendFleetsRequest', 1, body);
+    const headerLen = HEADER_PREFIX + 'RadarSendFleetsRequest'.length + 1;
+    return Buffer.from(frame.slice(headerLen)).toString('hex');
+  };
+  assert.equal(payloadOf({ fleetBuildingIds: ['1远征船'] }).startsWith('08'), false,
+    '固定事件派兵不能带 uid 字段');
+  assert.equal(payloadOf({ uid: 141943664636524, fleetBuildingIds: ['1远征船'] }).startsWith('08'), true,
+    '随机事件派兵必须带 uid 字段');
+
   // 难民事件要材料：材料不齐就不派（派了也只会被判失败）。
   const refugee = viewRadar(surveyFor({
     events: [event({
@@ -930,6 +1044,265 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 
   // uid 的 int64 形状：{low, high} 与数字必须归一到同一个 key，否则去重会失效。
   assert.equal(uidKey({ low: -709528980, high: 33048 }), uidKey(141943664636524), 'int64 uid keys must match the numeric form');
+
+  // 固定事件排在随机事件前面：它没有 color（恒 0），按颜色排会永远垫底；
+  // 空闲船少于事件数时垫底 = 永远轮不到（实测「路易斯的行踪」一次都没被打过）。
+  const orderFixed = viewRadar(surveyFor({
+    events: [
+      event({ key: 'purple', uid: 71, color: 4 }),
+      event({ key: 'boss', uid: undefined, eventId: 2, fixed: true, pirate: null }),
+    ],
+    fleets: [fleet({ power: 700000 })],
+  }), { config });
+  const orderPlan = planRadar(orderFixed).actions.filter((a) => a.kind === 'radarDispatch');
+  assert.equal(orderPlan.length, 1, 'one idle fleet => one dispatch');
+  assert.deepEqual(orderPlan[0].body, { fleetBuildingIds: ['1远征船'] },
+    '固定事件优先于颜色更高的随机事件（不带 uid 派兵 = 选中固定事件）');
+  checked += 1;
+}
+
+// 固定事件在第 6 个字段 fixedEvent，不在 events 里 —— 只遍历 events 会把它整条丢掉。
+// 这是「情报联盟不执行路易斯的行踪」的根因，必须有断言钉住。
+{
+  const { surveyRadar, viewRadar: view, planRadar: plan, formatRadarPlan } = await import('./radar.mjs');
+  const config = { tables: {
+    WorldPirateCfg: { data: [] },
+    RadarRandEventCfg: { data: [
+      { eventId: 10001, type: '击退海盗', eventName: '击退{0}', eventNameParams: ['海盗'] },
+    ] },
+    // RadarFixedEventCfg.reward 是 [[id, num]] 对子，不是回包的 {asset:[{id,num}]} 形状。
+    RadarFixedEventCfg: { data: [
+      { eventId: 11, eventName: '路易斯的行踪·{0}', eventNameParams: [11], power: 371500,
+        reward: [['波雅碎片', 3], ['汽油', 1400]] },
+      { eventId: 12, eventName: '路易斯的行踪·{0}', eventNameParams: [12], power: 400000,
+        reward: [['汽油', 100]] },
+    ] },
+  } };
+
+  const protocol = {
+    RadarInfoRequest: {}, RadarInfoResponse: {},
+    MyFleetsRequest: {}, MyFleetsResponse: {},
+  };
+  const mockClient = (fixedEvent, extraEvents = []) => ({
+    request: async (name) => (name === 'RadarInfoRequest'
+      ? { radarInfo: {
+        level: 5, exp: 0, storedNum: 0, nextRefreshTime: 0,
+        events: extraEvents, fixedEvent,
+      } }
+      : { fleets: [{ buildingId: '1远征船', state: 1, power: 681875 }] }),
+  });
+
+  const survey = await surveyRadar(
+    mockClient({ eventId: 11, gridIdx: 93979, state: 1 }),
+    protocol,
+    { config, stock: new Map([['汽油', 5000]]) },
+  );
+  assert.equal(survey.events.length, 1, 'fixedEvent 必须被并进 events（否则整条看不见）');
+  assert.equal(survey.events[0].eventId, 11);
+  assert.equal(survey.events[0].fixed, true, '来自 fixedEvent 字段的事件必须标 fixed');
+  assert.equal(survey.events[0].key, 'fixed:11:93979', '固定事件没有 uid，key 用 eventId+格位兜底');
+  assert.deepEqual(survey.events[0].reward, [{ id: '波雅碎片', num: 3 }, { id: '汽油', num: 1400 }],
+    '固定事件回包不带奖励，从 RadarFixedEventCfg 的 [[id,num]] 补');
+
+  const fixedView = view(survey, { config });
+  assert.equal(fixedView.events[0].name, '路易斯的行踪·11', '名字按固定事件表渲染');
+  assert.equal(fixedView.events[0].type, '固定事件');
+  assert.equal(fixedView.events[0].enemyPower, 371500, '战力查 RadarFixedEventCfg');
+  assert.equal(fixedView.events[0].fits, true, '681875 >= 371500 × 1.2');
+  assert.equal(fixedView.events[0].dispatchable, true);
+
+  const fixedPlan = plan(fixedView);
+  assert.deepEqual(fixedPlan.actions[0].body, { fleetBuildingIds: ['1远征船'] },
+    '固定事件派兵不带 uid（客户端 isFixed() 分支）');
+
+  // 固定事件换了一个 eventId（不同难度）时 key 必须跟着变，否则新事件会被当成旧的跳过。
+  const other = await surveyRadar(
+    mockClient({ eventId: 12, gridIdx: 93979, state: 1 }),
+    protocol,
+    { config, stock: new Map([['汽油', 5000]]) },
+  );
+  assert.notEqual(other.events[0].key, survey.events[0].key, '不同固定事件不能共用同一个 key');
+
+  // events 与 fixedEvent 同时存在时两者都要在，固定事件排在最后（只影响列表顺序，不影响计划优先级）。
+  const both = await surveyRadar(
+    mockClient({ eventId: 11, gridIdx: 93979, state: 1 }, [{ uid: 90001, eventId: 10001, color: 2, gridIdx: 5, state: 1 }]),
+    protocol,
+    { config, stock: new Map([['汽油', 5000]]) },
+  );
+  assert.equal(both.events.length, 2, '随机事件与固定事件要同时出现');
+  assert.equal(both.events.filter((one) => one.fixed).length, 1, '只有一个固定事件');
+
+  // 没有 fixedEvent（刷新期/未开放）时不能凭空造一个 state=1 的假事件去派兵。
+  const noFixed = await surveyRadar(mockClient(null), protocol, { config, stock: new Map() });
+  assert.equal(noFixed.events.length, 0, 'fixedEvent 缺失时不补假事件');
+
+  // eventId 缺省的畸形条目（protobuf 默认 0）必须被丢掉：`0 < 10000` 会把它当固定事件，
+  // 而固定事件派兵不带 uid，等于拿一条空数据去打。
+  const junk = await surveyRadar(
+    mockClient(null, [{ eventId: 0, state: 1 }]),
+    protocol,
+    { config, stock: new Map() },
+  );
+  assert.equal(junk.events.length, 0, 'eventId<=0 的畸形事件要被过滤掉');
+
+  // 固定事件已经派出去时不能再派：除了 state 变 3，客户端还有 startTime>0 这个信号
+  // （isBatting() = startTime>0 && (isPirate || isFixed)）。state 推送有延迟时靠它兜住。
+  const batting = await surveyRadar(
+    mockClient({ eventId: 11, gridIdx: 93979, state: 1, startTime: 1761360000 }),
+    protocol,
+    { config, stock: new Map() },
+  );
+  const battingView = view(batting, { config });
+  assert.equal(battingView.events[0].state, 1, 'state 还没更新');
+  assert.equal(battingView.events[0].dispatchable, false, 'startTime>0 表示我方已在打，不能再派一艘');
+  assert.equal(plan(battingView).actions.filter((a) => a.kind === 'radarDispatch').length, 0,
+    'startTime>0 的固定事件不会被重复派兵');
+  assert.ok(formatRadarPlan(battingView, plan(battingView)).includes('[已派兵]'),
+    '已派出去的固定事件要显示「已派兵」，不能写成「材料不齐」');
+  assert.ok(!plan(battingView).notes.some((note) => note.includes('打不了') || note.includes('打不过')),
+    '它不该混进「打不了」的清单');
+  assert.ok(plan(battingView).notes.some((note) => note.includes('已经派舰队去打')), '要说清它在打');
+
+  // 配置表没跟上游戏版本（固定事件 eventId 查不到）时不能按「无需战斗」放行：
+  // power=0 会让 need=0、fits 恒真，等于闭着眼派船去打，输了要修船。
+  const unknownCfg = await surveyRadar(
+    mockClient({ eventId: 99, gridIdx: 12345, state: 1 }),
+    protocol,
+    { config, stock: new Map() },
+  );
+  const unknownView = view(unknownCfg, { config });
+  assert.equal(unknownView.events[0].powerUnknown, true, '配置里查不到战力要标出来');
+  assert.equal(unknownView.events[0].dispatchable, false, '查不到战力就不能派');
+  assert.equal(plan(unknownView).actions.filter((a) => a.kind === 'radarDispatch').length, 0,
+    '不会盲派一个战力未知的固定事件');
+  assert.ok(plan(unknownView).notes.some((note) => note.includes('配置里查不到战力')), '要说明原因');
+  assert.ok(formatRadarPlan(unknownView, plan(unknownView)).includes('[配置过期]'), '状态行写「配置过期」');
+
+  // 固定事件打成 state=4 时走一键全领（固定事件没有 uid，领单条用不了）。
+  const done = await surveyRadar(
+    mockClient({ eventId: 11, gridIdx: 93979, state: 4 }),
+    protocol,
+    { config, stock: new Map() },
+  );
+  const donePlan = plan(view(done, { config }));
+  assert.equal(donePlan.actions[0].request, 'RadarGetAllRewardsRequest', '固定事件完成后靠一键全领收奖励');
+  assert.equal(donePlan.actions.filter((a) => a.kind === 'radarDispatch').length, 0, 'state=4 不再派兵');
+  checked += 1;
+}
+
+// 装备厂（锻造）：造好了先收，收完按部位件数最少的排下一件。
+// 英雄每个部位只能穿一件，所以三个部位的「可分配库存」（背包 + 打造中）必须成套。
+{
+  const { planEquip, pickRecipe, countByType } = await import('./equip.mjs');
+  const config = { tables: {
+    EquipCfg: { data: [
+      { id: '蓝武器1', type: '武器', qualityIndex: 2, qualityName: '蓝' },
+      { id: '蓝武器2', type: '武器', qualityIndex: 2, qualityName: '蓝' },
+      { id: '紫武器1', type: '武器', qualityIndex: 3, qualityName: '紫' },
+      { id: '蓝防具1', type: '防具', qualityIndex: 2, qualityName: '蓝' },
+      { id: '蓝饰品1', type: '饰品', qualityIndex: 2, qualityName: '蓝' },
+    ] },
+    EquipMakeLibCfg: { data: [
+      { libId: 1001, equipId: '蓝武器1', rate: 100 },
+      { libId: 1001, equipId: '蓝武器2', rate: 100 },
+      { libId: 1002, equipId: '紫武器1', rate: 100 },
+      { libId: 2001, equipId: '蓝防具1', rate: 100 },
+      { libId: 3001, equipId: '蓝饰品1', rate: 100 },
+    ] },
+    BuildingEquipMakeCfg: { data: [
+      { makeId: 1001, type: '武器', libId: 1001, seconds: 1800, season: 1, costItem: [['蓝武器材料', 40], ['GOLD', 2000]] },
+      { makeId: 1002, type: '武器', libId: 1002, seconds: 7200, season: 1, costItem: [['紫武器材料', 160], ['GOLD', 10000]] },
+      { makeId: 2001, type: '防具', libId: 2001, seconds: 1800, season: 1, costItem: [['蓝防具材料', 40], ['GOLD', 2000]] },
+      { makeId: 3001, type: '饰品', libId: 3001, seconds: 1800, season: 1, costItem: [['蓝饰品材料', 40], ['GOLD', 2000]] },
+    ] },
+  } };
+  const equipIndex = new Map(config.tables.EquipCfg.data.map((equip) => [equip.id, equip]));
+  const rich = new Map([
+    ['蓝武器材料', 400], ['紫武器材料', 160], ['蓝防具材料', 400], ['蓝饰品材料', 400], ['GOLD', 100_000],
+  ]);
+  const surveyFor = (over = {}) => ({
+    now: 1000,
+    building: { buildingId: '1装备厂', level: 1 },
+    making: null,
+    bag: [],
+    counts: { 武器: 0, 防具: 0, 饰品: 0 },
+    stock: rich,
+    ...over,
+  });
+
+  // 没有装备厂（新号没造）时不能乱发请求。
+  const none = planEquip({ building: null, making: null, bag: [], counts: {}, stock: rich }, { config });
+  assert.equal(none.actions.length, 0, '没有装备厂就不锻造');
+  assert.ok(none.notes.some((note) => note.includes('没有装备厂')));
+
+  // 同一时间只能造一件：还在造就只提示，不排第二件（客户端也是这一步直接弹「正在锻造」）。
+  const busy = planEquip(surveyFor({
+    making: { makeId: 3001, equipId: '蓝饰品1', star: 0, finishTime: 2000, remainSeconds: 1000, done: false },
+  }), { config });
+  assert.equal(busy.actions.length, 0, '正在锻造时不再排产');
+  assert.ok(busy.notes.some((note) => note.includes('还在锻造')), '要说清它还在造');
+
+  // 造好了：先收取，再排下一件。两个动作同一轮做，共用一个失败隔离组。
+  const done = planEquip(surveyFor({
+    making: { makeId: 3001, equipId: '蓝饰品1', star: 0, finishTime: 500, remainSeconds: 0, done: true },
+    counts: { 武器: 0, 防具: 0, 饰品: 1 },
+  }), { config });
+  assert.equal(done.actions.length, 2, '收取 + 排产两条动作');
+  assert.equal(done.actions[0].kind, 'equipPick');
+  assert.equal(done.actions[0].request, 'PickMadeEquipRequest');
+  assert.equal(done.actions[0].response, 'PickMadeEquipResponse', '收取有配套回包');
+  assert.deepEqual(done.actions[0].body, { buildingId: '1装备厂' }, '收取只要 buildingId');
+  assert.equal(done.actions[1].kind, 'equipMake');
+  assert.equal(done.actions[1].request, 'MakeEquipRequest');
+  assert.equal(done.actions[1].response, null, '锻造没有配套回包，走 sendWatch');
+  assert.equal(done.actions[1].body.universal, false, '不自动兑换材料（universal 恒 false）');
+  assert.equal(done.actions[0].group, done.actions[1].group, '收取失败要能停掉同一轮的排产');
+
+  // 部位均衡：武器 10 件、防具 3 件、饰品 5 件 → 补防具。
+  const lopsided = planEquip(surveyFor({ counts: { 武器: 10, 防具: 3, 饰品: 5 } }), { config });
+  assert.equal(lopsided.actions.find((action) => action.kind === 'equipMake').body.makeId, 2001,
+    '件数最少的部位优先（防具）');
+
+  // 件数相同时按固定顺序轮转（武器 → 防具 → 饰品），这样造完一件就自然轮到下一个部位。
+  // 同为武器时再看品质：紫材料够就造紫装，所以这里是 1002 而不是 1001。
+  const even = planEquip(surveyFor({ counts: { 武器: 3, 防具: 3, 饰品: 3 } }), { config });
+  const evenMake = even.actions.find((action) => action.kind === 'equipMake');
+  assert.equal(evenMake.body.makeId >= 1001 && evenMake.body.makeId < 2000, true,
+    '件数一样时先武器部位（部位内紫装优先，所以是 1002）');
+
+  // 部位内先试品质高的：紫材料够就造紫装，不够才降到蓝装。
+  const purple = planEquip(surveyFor({ counts: { 武器: 0, 防具: 5, 饰品: 5 } }), { config });
+  assert.equal(purple.actions.find((action) => action.kind === 'equipMake').body.makeId, 1002,
+    '材料够时先造品质高的配方');
+  const noPurple = planEquip(surveyFor({
+    counts: { 武器: 0, 防具: 5, 饰品: 5 },
+    stock: new Map([['蓝武器材料', 40], ['GOLD', 2000]]),
+  }), { config });
+  assert.equal(noPurple.actions.find((action) => action.kind === 'equipMake').body.makeId, 1001,
+    '紫材料不够就降到蓝装');
+
+  // 三个部位都没材料：不排产，但把原因说清楚（造好的那件仍然要收）。
+  const broke = planEquip(surveyFor({
+    making: { makeId: 3001, equipId: '蓝饰品1', star: 0, finishTime: 500, remainSeconds: 0, done: true },
+    stock: new Map([['GOLD', 10]]),
+  }), { config });
+  assert.equal(broke.actions.filter((action) => action.kind === 'equipMake').length, 0, '没材料就不排产');
+  assert.equal(broke.actions.filter((action) => action.kind === 'equipPick').length, 1, '但造好的照样收');
+  assert.ok(broke.notes.some((note) => note.includes('材料够造下一件')), '要说明为什么没排产');
+
+  // 计件口径：背包 + 打造中。打造中的那件已经算进去了，否则会同一部位连造两件。
+  const counts = countByType(
+    equipIndex,
+    [{ equipId: '蓝武器1' }, { equipId: '蓝武器2' }, { equipId: '蓝防具1' }],
+    { equipId: '蓝饰品1' },
+  );
+  assert.deepEqual(counts, { 武器: 2, 防具: 1, 饰品: 1 }, '背包 + 打造中一起算');
+
+  // 金币不够时不能造（GOLD 在资源表里，跟材料合并成一张 stock 才查得到）。
+  const noGold = pickRecipe(config, { 武器: 0, 防具: 9, 饰品: 9 }, new Map([
+    ['蓝武器材料', 400], ['GOLD', 100],
+  ]));
+  assert.equal(noGold, null, '材料够但金币不够也不造');
   checked += 1;
 }
 
@@ -1665,6 +2038,17 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(humanDuration(320), '5 分 20 秒');
   assert.equal(humanDuration(1800), '30 分');
   assert.equal(humanDuration(3780), '1 小时 3 分');
+
+  // 轮数 / 间隔的非法输入必须回退，不能静默变成「永久挂机」或 1ms 间隔。
+  assert.equal(loopTotal('abc'), 1, '非法轮数回退 1 轮，不能变成永久挂机');
+  assert.equal(loopTotal(undefined), 1, '缺省轮数同样回退 1');
+  assert.equal(loopTotal(3), 3, '正常轮数原样透传');
+  assert.equal(loopTotal(0), Infinity, '0 仍然是「一直跑」');
+  assert.equal(loopTotal(-1), Infinity, '负数仍然是「一直跑」');
+  assert.equal(loopGap('abc'), 60_000, '非法间隔回退 60 秒，不能退化成 1ms');
+  assert.equal(loopGap(-5), 60_000, '负数间隔回退 60 秒');
+  assert.equal(loopGap(0), 0, '0 仍然是「不节流」');
+  assert.equal(loopGap(1500), 1500, '正常间隔原样透传');
   checked += 1;
 }
 
@@ -1691,9 +2075,80 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   });
   assert.ok(radarGated.includes('情报 间隔未到，还差 42 秒（每 1 分一次）'), `应显示情报节流提示，实际：\n${radarGated}`);
 
+  // 锻造：探测过就要印出来（哪怕是「还在锻造、还剩多久」），被间隔挡住的那轮也要说清楚。
+  const forgeRound = formatLoopRound({
+    ...summary,
+    forge: { planned: 1, results: [], notes: ['「蓝防具1」还在锻造，还剩 6 分钟'], summary: '1装备厂 lv1 · 打造中「蓝防具1」还剩 6 分钟 · 武器 6/防具 5/饰品 5' },
+    gates: { forge: { enabled: true, everyMs: 180_000, lastAt: 1_700_000_000, waitSeconds: 90, throttled: true } },
+  });
+  assert.ok(forgeRound.includes('锻造 计划 1'), `锻造要有一行概览，实际：\n${forgeRound}`);
+  assert.ok(forgeRound.includes('打造中「蓝防具1」'), '概览要带上装备厂状态');
+  assert.ok(forgeRound.includes('锻造 间隔未到，还差 1 分 30 秒（每 3 分一次）'), `要有锻造节流提示，实际：\n${forgeRound}`);
+
   // 老 history（没有 gates 字段）不能炸。
   const legacy = formatLoopRound({ ...summary, gates: undefined });
   assert.ok(legacy.startsWith('第 3 轮'), '缺 gates 的旧轮次记录也要能正常格式化');
+  checked += 1;
+}
+
+// 循环日志的成功行必须带**具体物品**（收成品 淡水×2、排产 木板×3）。
+// 只报「收成品×3」看不出收了什么，等于没记 —— 这条断言钉住的是「别再退回纯计数」。
+{
+  const { itemText, planWorld } = await import('./world.mjs');
+
+  // 合并重复 id、丢掉 0 / 负数 / 空 id，超量时补「另有 N 种」。
+  assert.equal(itemText([['淡水', 2], ['木板', 1], ['淡水', 3]]), '淡水×5、木板×1', '同 id 要合并');
+  assert.equal(itemText([['淡水', 0], ['木板', -2], [null, 3], ['鱼', 1]]), '鱼×1', '0/负数/空 id 都不该出现');
+  assert.equal(itemText([['小麦', 4]], { unit: '块' }), '小麦×4块', '单位要能加后缀');
+  assert.equal(itemText([]), '', '空数组返回空串');
+  assert.equal(itemText([['a', 1], ['b', 1], ['c', 1]], { limit: 2 }), 'a×1、b×1、另有 1 种', '超量要说明还有几种');
+
+  // 收成品 / 排产这两类动作必须带 items，日志才能汇总出物品。
+  const stock = new Map([['木材', 9]]);
+  const factory = {
+    buildingId: '1工厂', type: '材料厂', level: 1, product: [],
+    factory: {
+      factoryQ: [],
+      finishedProducts: [{ id: '淡水', num: 2 }, { id: '木板', num: 1 }],
+      autoProductId: '',
+    },
+  };
+  const survey = {
+    now: 1000, player: { level: 1 }, population: 1, maxPopulation: 2, stockCap: 0, factorySlots: 6,
+    have: (id) => stock.get(id) ?? 0, stock,
+    buildings: [factory], factories: [factory], orders: [],
+  };
+  const config = { tables: {
+    BuildingProduceCfg: { data: [
+      { buildType: '材料厂', itemId: '木板', produceTime: 300, unlockLevel: 1, costItem: [['木材', 2]] },
+    ] },
+  } };
+  const plan = planWorld(survey, { config });
+  const gain = plan.actions.find((action) => action.kind === 'gainFactory');
+  assert.deepEqual(gain.items, [['淡水', 2], ['木板', 1]], '收成品要记录收到哪几样、各多少');
+  assert.ok(gain.label.includes('淡水×2'), `收成品的 label 要写明物品，实际：${gain.label}`);
+  const produce = plan.actions.find((action) => action.kind === 'startProduce');
+  assert.deepEqual(produce.items, [['木板', 1]], '排产要记录产出哪一样');
+
+  // 汇总：两类动作同一行印出来（瞬成排 2 个就累加成 木板×2）。
+  const round = formatLoopRound({
+    round: 1, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: {
+      planned: 2, notes: [], population: '1/2', floaterLoot: null,
+      results: [
+        { step: gain, ok: true },
+        { step: { kind: 'startProduce', items: [['木板', 1]], label: '排产 1工厂 -> 木板' }, ok: true },
+        { step: { kind: 'startProduce', items: [['木板', 1]], label: '排产 1工厂 -> 木板' }, ok: true },
+        // 失败/跳过的动作不能把物品算进成功行。
+        { step: { kind: 'startProduce', items: [['木板', 1]], label: '排产 1工厂 -> 木板' }, ok: false, error: 'queue full' },
+      ],
+    },
+    gates: {},
+  });
+  assert.ok(round.includes('成功 收成品 淡水×2、木板×1'), `成功行要带收成品物品，实际：\n${round}`);
+  assert.ok(round.includes('排产 木板×2'), `排产要按物品累加（失败的那条不算），实际：\n${round}`);
   checked += 1;
 }
 
@@ -1840,6 +2295,11 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 
   const noon = new Date(2026, 9, 23, 12, 0, 0).getTime();
   assert.equal(archive.dayOf(noon), '2026-10-23', '按本地日期切目录，不是 UTC');
+  // 日志时间戳也必须用本地时间：用 toISOString() 的话东八区下比目录日期早 8 小时，
+  // 事后再按「今天这一轮」对日志和归档目录就对不上。
+  const stamp = archive.stamp(noon);
+  assert.match(stamp, /^2026-10-23T12:00:00\.000[+-]\d{2}:\d{2}$/, '日志时间戳带本地时区偏移');
+  assert.equal(stamp.slice(0, 10), archive.dayOf(noon), '日志日期与归档目录日期必须是同一天');
   assert.equal(archive.archivePath('AllItemResponse', noon, '/tmp/r'), path.join('/tmp/r', '2026-10-23', 'AllItemResponse.jsonl'));
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-archive-'));
@@ -1855,4 +2315,384 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 日志脱敏与回包归档）`);
+// 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：三条判据全部照抄客户端，
+// 最要紧的是「升级会重置本段计时」这条不变量 —— 它决定了几时能升、以及升级必须等收益领到手。
+{
+  const { afkMaxLevel, nextLevelReward, planAfkUpgrade, planIdle, formatIdleSummary, runIdle, AFK_LV_ITEM } = await import('./idle.mjs');
+
+  const offline = (level, stage, cost = 1) => ({ level, stage, consume: [AFK_LV_ITEM, cost] });
+  const config = {
+    tables: {
+      // 主线关卡 = stage + 1。所以 stage 0/5/10 分别对应第 1/6/11 关解锁。
+      OfflineCfg: { data: [offline(1, 0), offline(2, 5), offline(3, 10), offline(4, 15)] },
+      OfflineLvRewardCfg: { data: [
+        { level: 1, reward: [] },
+        { level: 2, reward: [['英雄经验', 6000]] },
+        { level: 3, reward: [['抽卡券', 1]] },
+      ] },
+    },
+  };
+
+  // 上限由主线关卡决定：maxLevel = OfflineCfg 里 stage <= 主线关卡-1 的最大 level。
+  assert.equal(afkMaxLevel(config, 6), 2, '主线第 6 关（stage<=5）只能升到 2 级');
+  assert.equal(afkMaxLevel(config, 11), 3, '主线第 11 关才能到 3 级');
+  assert.equal(afkMaxLevel(config, null), null, '拿不到主线关卡时返回 null，不能当成「无上限」');
+
+  // reward 为空的行不产出，跳过去找下一个有奖的。
+  assert.equal(nextLevelReward(config, 0), 2, '1 级 reward 为空，下一个有奖的是 2 级');
+  assert.equal(nextLevelReward(config, 2), 3, '已领到 2 级，下一个是 3 级');
+  assert.equal(nextLevelReward(config, 3), null, '都领完了返回 null');
+
+  // 一次能连升 10 / 5 / 1 级，取最高的那档（客户端 _refreshLevelUpBtn 同款）。
+  const wide = { tables: { OfflineCfg: { data: Array.from({ length: 12 }, (_, i) => offline(i + 1, 0)) } } };
+  assert.equal(planAfkUpgrade(wide, { level: 1, have: 10, maxLevel: 12 }).jump, 10, '徽章够 10 个就一次升 10 级');
+  assert.equal(planAfkUpgrade(wide, { level: 1, have: 5, maxLevel: 12 }).jump, 5, '够 5 个就一次升 5 级');
+  assert.equal(planAfkUpgrade(wide, { level: 1, have: 4, maxLevel: 12 }).jump, 1, '只够 1 级就升 1 级');
+  const poor = planAfkUpgrade(wide, { level: 1, have: 0, maxLevel: 12 });
+  assert.equal(poor.jump, 0, '一个徽章都没有就不能升');
+  assert.ok(poor.reason.includes(AFK_LV_ITEM), `说明里要点明缺哪个道具，实际：${poor.reason}`);
+  const capped = planAfkUpgrade(config, { level: 2, have: 99, maxLevel: 2 });
+  assert.equal(capped.jump, 0, '到上限就不能升');
+  assert.ok(capped.reason.includes('第 11 关'), `到上限要说清卡在哪一关，实际：${capped.reason}`);
+
+  // 计划顺序：邮件 → 本段收益 → 等级奖励 → 升级（升级挂 after，等本段收益真的领到）。
+  const richSurvey = {
+    now: 1_000_000,
+    // 挂机 3 级、已领到 0 级：2 级的奖励此刻可领（1 级 reward 为空，2 级才有）。
+    afk: { level: 3, rewardedLevel: 0, afkStartTime: 900_000, afkFinishTime: 999_000, remainSeconds: 0, ready: true, fresh: false },
+    mail: { total: 3, fetched: 3, newCount: 1, ungotCount: 1, claimable: true },
+
+    upgrade: { level: 1, maxLevel: 40, have: 10, need: 10, jump: 10, safe: true, claimable: true, reason: null },
+    notes: [],
+  };
+  const plan = planIdle(richSurvey, { now: 1_000_000, config });
+  assert.deepEqual(plan.actions.map((step) => step.kind), ['mailQuickGet', 'afkDraw', 'afkLevelDraw', 'afkUpgrade'], `顺序不对：${plan.actions.map((s) => s.kind)}`);
+  const upgradeStep = plan.actions.find((step) => step.kind === 'afkUpgrade');
+  assert.equal(upgradeStep.after, 'afkDraw', '升级必须等本段收益领到（升级会重置本段计时）');
+  assert.equal(upgradeStep.afterSatisfied, false, '本段不是刚开的，就必须等领取动作');
+  assert.deepEqual(upgradeStep.body, { level: 10 }, 'body.level 是「升几级」，不是目标等级');
+
+  // 本段刚开（2 分钟内）时可以不等领取动作直接升 —— 此刻升级损失的是几分钟的收益。
+  const freshSurvey = {
+    ...richSurvey,
+    afk: { ...richSurvey.afk, ready: false, afkStartTime: 999_950, afkFinishTime: 1_028_750, remainSeconds: 28_750, fresh: true },
+  };
+  const freshPlan = planIdle(freshSurvey, { now: 1_000_000, config });
+  assert.equal(freshPlan.actions.some((step) => step.kind === 'afkDraw'), false, '没到封顶就不该领本段收益');
+  const freshUpgrade = freshPlan.actions.find((step) => step.kind === 'afkUpgrade');
+  assert.ok(freshUpgrade, '本段刚开时也要能升级');
+  assert.equal(freshUpgrade.afterSatisfied, true, '本段刚开就不用等领取动作');
+
+  // 概览一行要能看出等级、本段剩余、徽章、邮件。
+  const text = formatIdleSummary({ ...freshSurvey, upgrade: { ...freshSurvey.upgrade, need: 1, have: 2, maxLevel: 40 } });
+  assert.ok(text.includes('挂机 Lv3'), `概览要有挂机等级，实际：${text}`);
+  assert.ok(text.includes('本段还剩'), `概览要有本段剩余时间，实际：${text}`);
+  assert.ok(text.includes(AFK_LV_ITEM), `概览要有徽章数量，实际：${text}`);
+  assert.ok(text.includes('邮件'), `概览要有邮件状态，实际：${text}`);
+
+  // 执行的硬约束：领本段收益失败了，升级就必须跳过 —— 否则会把累积 7 小时的收益重置掉。
+  const fakeProtocol = {
+    QuickGotReadEmailRequest: {},
+    DrawAfkRewardRequest: {},
+    DrawAfkRewardResponse: {},
+    UpgradeAfkLevelRequest: {},
+    UpgradeAfkLevelResponse: {},
+  };
+  const sent = [];
+  const failingClient = {
+    async request(name) {
+      sent.push(name);
+      throw new Error('server said no');
+    },
+    async sendWatch(name) { sent.push(name); },
+  };
+  const depPlan = { actions: [
+    { kind: 'afkDraw', request: 'DrawAfkRewardRequest', response: 'DrawAfkRewardResponse', body: {}, label: '本段收益' },
+    { kind: 'afkUpgrade', request: 'UpgradeAfkLevelRequest', response: 'UpgradeAfkLevelResponse', body: { level: 1 }, label: '升级', after: 'afkDraw' },
+  ] };
+  const depRun = await runIdle(failingClient, fakeProtocol, depPlan, { allowMutate: true });
+  assert.equal(depRun.results[0].ok, false, '第一条要如实失败');
+  assert.equal(depRun.results[1].skipped, true, '收益没领到，升级必须跳过');
+  assert.ok(!sent.includes('UpgradeAfkLevelRequest'), '跳过时一个字节都不该发出去');
+
+  // 收益领到之后升级才放行，并且奖励物品要挂回 step（循环日志靠它印「成功 挂机收益 金币×800」）。
+  const okClient = {
+    async request(name) {
+      sent.push(name);
+      if (name === 'DrawAfkRewardRequest') return { reward: { assetPackage: { asset: [{ id: 'GOLD', num: 800 }, { id: '加速器', num: 8 }] } } };
+      return { level: 2 };
+    },
+    async sendWatch(name) { sent.push(name); },
+  };
+  const okPlan = { actions: [
+    { kind: 'afkDraw', request: 'DrawAfkRewardRequest', response: 'DrawAfkRewardResponse', body: {}, label: '本段收益' },
+    { kind: 'afkUpgrade', request: 'UpgradeAfkLevelRequest', response: 'UpgradeAfkLevelResponse', body: { level: 1 }, label: '升级', after: 'afkDraw' },
+  ] };
+  const okRun = await runIdle(okClient, fakeProtocol, okPlan, { allowMutate: true });
+  assert.equal(okRun.results[1].ok, true, '收益领到后升级要放行');
+  assert.deepEqual(okPlan.actions[0].items, [['GOLD', 800], ['加速器', 8]], '奖励物品要挂回 step，日志才印得出具体收益');
+
+  // 循环日志：探测过就印一行概览，被间隔挡住也要说清楚。
+  const idleRound = formatLoopRound({
+    round: 5, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    idle: {
+      planned: 1, notes: [], summary: '挂机 Lv1（已领到 0） · 本段已封顶 · 邮件 1 新',
+      results: [{ step: { kind: 'afkDraw', items: [['GOLD', 800]], label: '挂机本段收益' }, ok: true }],
+    },
+    gates: { idle: { enabled: true, everyMs: 300_000, lastAt: 1_700_000_000, waitSeconds: 120, throttled: true } },
+  });
+  assert.ok(idleRound.includes('挂机领取 计划 1'), `要有挂机领取概览行，实际：\n${idleRound}`);
+  assert.ok(idleRound.includes('成功 挂机收益 GOLD×800'), `成功行要带具体收益，实际：\n${idleRound}`);
+  assert.ok(idleRound.includes('挂机领取 间隔未到，还差 2 分'), `要有节流提示，实际：\n${idleRound}`);
+  checked += 1;
+}
+
+// 搁浅的货轮（世界宝藏）：只抢「无人占领」的货轮，一天 3 次奖励封顶，一次压一个货轮。
+// 判据全部对齐客户端：ownerGuildIdx = 0 才抢、state IDLE 且 treasureLootUid = 0 才能派。
+{
+  const {
+    viewTreasure, planTreasure, qualityOf, dailyLimitOf, formatTreasureSummary,
+    seasonWindowOf, seasonDaysOf, MAX_GUILD_FLEETS, SEASON_CLOSE_GUARD_SECONDS,
+  } = await import('./treasure.mjs');
+  const config = { tables: {
+    TreasureLootCfg: { data: [
+      { quality: 'BLUE', qualityIndex: 1, name: '小型货轮', score: 900 },
+      { quality: 'PURPLE', qualityIndex: 2, name: '中型货轮', score: 1500 },
+      { quality: 'ORANGE', qualityIndex: 3, name: '万吨货轮', score: 3000 },
+    ] },
+    TreasureLootParamCfg: { data: [{ paramName: '每日宝藏奖励次数', paramValue: 3 }] },
+    WorldParamCfg: { data: [{ paramName: '进攻宝藏消耗汽油', paramValue: 500 }] },
+  } };
+
+  // 协议 color 是全局品质枚举（3 蓝 / 4 紫 / 5 橙），货轮表用 qualityIndex = color - 2。
+  // 抓包实测：color 3 给「蓝装材料自选包」，color 4 给「紫装材料自选包」—— 这个偏移是硬事实。
+  assert.equal(qualityOf(config, 3).name, '小型货轮', 'color 3 → 小型货轮');
+  assert.equal(qualityOf(config, 4).name, '中型货轮', 'color 4 → 中型货轮');
+  assert.equal(qualityOf(config, 5).name, '万吨货轮', 'color 5 → 万吨货轮');
+  assert.equal(qualityOf(config, 9).name, '货轮（品质 9）', '配置缺档时要降级，不能把货轮丢掉');
+  // 上限以服务端为准（TreasureLootStatsResponse.totalRewardTimes），拿不到才回配置表。
+  assert.equal(dailyLimitOf(config, { totalRewardTimes: 4 }), 4, '服务端给的上限优先');
+  assert.equal(dailyLimitOf(config, null), 3, '服务端没给时回配置表');
+
+  // 活动有效期 = 赛季窗口。世界宝藏没有独立的活动时间字段（SCAllActivity 里没有它），
+  // 边界就是赛季结束：赛季一收世界重置、货轮清空；新赛季前 1 小时连船都派不了。
+  // 实测 S1：worldOpenTime 1792469292（10-20 00:00）+ 24 天 → 1794499170（11-12 23:59:30），
+  // 与 SeasonRankInfoResponse.endTime **完全相等（差 0 秒）**，所以两个来源互为兜底。
+  const seasonCfg = { tables: {
+    SeasonTaskCfg: { data: [
+      { season: 1, stage: 1, lastDay: 2 },
+      { season: 1, stage: 12, lastDay: 24 },
+      { season: 4, stage: 12, lastDay: 45 },
+    ] },
+  } };
+  assert.equal(seasonDaysOf(seasonCfg, 1), 24, 'S1 赛季 24 天');
+  assert.equal(seasonDaysOf(seasonCfg, 4), 45, 'S4 起 45 天');
+  assert.equal(seasonDaysOf(seasonCfg, 9), 24, '配置里没有的赛季回退 24 天');
+  assert.equal(SEASON_CLOSE_GUARD_SECONDS, 3600, '新赛季前 1 小时封盘（游戏内合服说明）');
+  // 服务端给了 endTime 就直接用，不再自己算。
+  assert.deepEqual(
+    seasonWindowOf(seasonCfg, { worldId: 2001014410, endTimeFromServer: 1794499170 }),
+    { season: 1, endAt: 1794499170, source: 'server' },
+    '服务端 endTime 优先',
+  );
+  // 兜底复算：只断言「落在开放日之后的第 24 天 23:59:30」，这样与时区无关
+  // （本机 UTC+8 时它就是 1794499170，与上面的服务端值一模一样）。
+  const fallback = seasonWindowOf(seasonCfg, { worldId: 2001014410, worldOpenTime: 1792469292 });
+  assert.equal(fallback.source, 'config', '没服务端值就走配置复算');
+  assert.equal(fallback.season, 1, 'worldId 2001014410 → S1（floor(worldId/1e6%1000)）');
+  const fallbackDate = new Date(fallback.endAt * 1000);
+  assert.equal(
+    fallbackDate.getHours() * 3600 + fallbackDate.getMinutes() * 60 + fallbackDate.getSeconds(),
+    23 * 3600 + 59 * 60 + 30,
+    '赛季末必须落在当天 23:59:30（服务端给的就是这个秒数）',
+  );
+  const openDay0 = new Date(1792469292 * 1000);
+  openDay0.setHours(0, 0, 0, 0);
+  const endDay0 = new Date(fallback.endAt * 1000);
+  endDay0.setHours(0, 0, 0, 0);
+  assert.equal(Math.round((endDay0 - openDay0) / 86400000), 23, '第 24 天的零点 = 开放日 + 23 天');
+  // 两个来源都没有 → endAt = 0，此时必须按「未结束」处理（算不出来不等于活动结束了）。
+  assert.equal(seasonWindowOf(seasonCfg, { worldId: 0 }).source, null, '算不出来时 source 为 null');
+
+  const treasure = (over) => ({
+    uid: 1, color: 3, name: '小型货轮', quality: 'BLUE', score: 900,
+    ownerGuildIdx: 0, ownerFleetNum: 0, progress: 0, gridIdx: 1,
+    reward: [{ type: 0, id: '蓝装材料自选包', num: 130 }],
+    itemScore: 130, resourceScore: 0, rewardText: '蓝装材料自选包×130',
+    ...over,
+  });  const fleet = (over) => ({
+    buildingId: '1远征船', state: 1, power: 500000, durability: 2000,
+    maxDurability: 2000, treasureLootUid: 0, targetGridIdx: 0, ...over,
+  });
+  const NOW = Math.floor(Date.now() / 1000);
+  const surveyFor = (over) => ({
+    now: 1000, statsAvailable: true, dailyLimit: 3, todayRewardTimes: 1,
+    nextRefreshTime: 0, counts: [], petrol: 5000, petrolCost: 500,
+    // 默认给一个「还在有效期内」的赛季窗口，免得每条断言都被「有效期未知」的 note 干扰。
+    season: { season: 1, endAt: NOW + 30 * 86400, stopAt: NOW + 30 * 86400 - 3600, source: 'server' },
+    treasures: [], fleets: [], ...over,
+  });
+
+  // 基本盘：两个无人货轮 + 两艘空闲船 → 一条请求带两艘船，打品质最高的那个。
+  const pick = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 10 }), treasure({ uid: 11, color: 4, name: '中型货轮', itemScore: 200 })],
+    fleets: [fleet({}), fleet({ buildingId: '2远征船', power: 400000 })],
+  }), { config });
+  const pickPlan = planTreasure(pick, {});
+  assert.equal(pickPlan.actions.length, 1, '一次只排一个动作（一条请求带多艘船）');
+  assert.equal(pickPlan.actions[0].request, 'TreasureLootSendFleetsRequest');
+  assert.deepEqual(pickPlan.actions[0].body, { uid: 11, fleetBuildingIds: ['1远征船', '2远征船'] },
+    '打品质最高的货轮，强船在前，uid 原样回传');
+  assert.equal(pickPlan.actions[0].transient, true, '派兵失败多是瞬时状态，不能记进 rejected 永远跳过');
+
+  // 被别的联盟占着的不抢：battlePoint 里没有战力字段，判断不了能不能赢，赌输要掉耐久。
+  const occupied = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 20, ownerGuildIdx: 2, ownerFleetNum: 3, progress: 40 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.ok(occupied.targets.length === 0 && planTreasure(occupied, {}).actions.length === 0, '不去抢别人占着的货轮');
+  assert.ok(planTreasure(occupied, {}).notes.some((note) => note.includes('被别的联盟占着')), '要说清楚为什么没抢');
+
+  // 我方在抢的货轮要看得出来：treasureLootUid 在**航行途中就有值**（实测派兵后立刻回 uid，船还是 MOVING），
+  // 所以「货轮列表里 ownerGuildIdx 还是 0」不代表没派 —— 只靠货轮列表会以为没派过，反复派同一批船。
+  const ours = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 25 })],
+    fleets: [fleet({ state: 2, treasureLootUid: 25 }), fleet({ buildingId: '2远征船', state: 2, treasureLootUid: 25 })],
+  }), { config });
+  assert.equal(ours.treasures[0].ourFleets, 2, '按 treasureLootUid 数出我方在抢的舰队');
+  assert.ok(formatTreasureSummary(ours).includes('我方 2 支在抢'), '概览要写明我方在抢');
+
+  // 每天 3 次奖励：满了就不派（再派等于白烧 500 汽油/船）。
+  const full = viewTreasure(surveyFor({
+    todayRewardTimes: 3,
+    treasures: [treasure({ uid: 30 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(full.dailyFull, true, 'todayRewardTimes >= 上限就是满');
+  assert.equal(planTreasure(full, {}).actions.length, 0, '奖励次数满了不派');
+  assert.ok(planTreasure(full, {}).notes.some((note) => note.includes('今日货轮奖励已满')), '要说清楚是次数满了');
+
+  // 拿不到 Stats 不能猜：上限未知时派出去可能白烧汽油。
+  const noStats = viewTreasure(surveyFor({
+    statsAvailable: false, todayRewardTimes: null,
+    treasures: [treasure({ uid: 31 })], fleets: [fleet({})],
+  }), { config });
+  assert.equal(planTreasure(noStats, {}).actions.length, 0, '不知道次数上限就不派');
+
+  // 活动过期就彻底停手 —— 这是给「活动下线后把整块删掉」留的闸门，日志必须说清楚。
+  const expired = viewTreasure(surveyFor({
+    season: { season: 1, endAt: NOW - 7200, stopAt: NOW - 10800, source: 'server' },
+    treasures: [treasure({ uid: 70 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(expired.activity.expired, true, 'stopAt 已过就是过期');
+  assert.equal(planTreasure(expired, {}).actions.length, 0, '活动过期不再派船');
+  assert.ok(planTreasure(expired, {}).notes.some((note) => note.includes('活动已结束')), '要说清楚是活动结束了');
+  const expiredText = formatTreasureSummary(expired);
+  assert.ok(expiredText.includes('活动已结束') && expiredText.includes('可以删了'),
+    `过期后日志要提示「可以删了」，实际：${expiredText}`);
+
+  // 没过期：概览里要印「有效至」+ 还剩多久（用户要的就是"日志里能看见还有多久到期"）。
+  const live = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 71 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(live.activity.expired, false, '默认窗口是未来 30 天，不算过期');
+  assert.ok(formatTreasureSummary(live).includes('有效至'), '正常时概览要印有效期');
+  // 有效期为未知时不能因为「算不出来」就停掉功能。
+  const unknownSeason = viewTreasure(surveyFor({
+    season: { season: 0, endAt: 0, stopAt: 0, source: null },
+    treasures: [treasure({ uid: 72 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(unknownSeason.activity.unknown, true, '算不出有效期');
+  assert.equal(planTreasure(unknownSeason, {}).actions.length, 1, '算不出有效期时照常派（不能因此停功能）');
+  assert.ok(planTreasure(unknownSeason, {}).notes.some((note) => note.includes('算不出活动有效期')), '要把未知说出来');
+
+  // 舰队筛选：只有 IDLE(1) 且 treasureLootUid = 0 才能派（客户端同款判据）。
+  const busy = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 40 })],
+    fleets: [
+      fleet({ buildingId: '1远征船', state: 2 }),
+      fleet({ buildingId: '2远征船', state: 4 }),
+      fleet({ buildingId: '3远征船', treasureLootUid: 40 }),
+    ],
+  }), { config });
+  assert.equal(busy.idleFleets.length, 0, '航行/修理/已经在抢货轮的船都不算空闲');
+  const busyPlan = planTreasure(busy, {});
+  assert.equal(busyPlan.actions.length, 0, '没有空闲船就不派');
+  assert.ok(busyPlan.notes.some((note) => note.includes('没有空闲舰队')), '要说清楚船都去哪了');
+
+  // 条数上限与汽油：maxFleets 截断、汽油不够少派（派到一半卡住比不派更糟）。
+  const many = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 50 })],
+    fleets: [fleet({}), fleet({ buildingId: '2远征船' }), fleet({ buildingId: '3远征船' })],
+  }), { config });
+  assert.equal(planTreasure(many, { maxFleets: 2 }).actions[0].body.fleetBuildingIds.length, 2, 'maxFleets 要截断');
+  const poor = viewTreasure(surveyFor({
+    petrol: 1200,
+    treasures: [treasure({ uid: 51 })],
+    fleets: [fleet({}), fleet({ buildingId: '2远征船' }), fleet({ buildingId: '3远征船' })],
+  }), { config });
+  assert.equal(planTreasure(poor, {}).actions[0].body.fleetBuildingIds.length, 2, '汽油只够 2 支就只派 2 支');
+  assert.ok(planTreasure(poor, {}).notes.some((note) => note.includes('汽油')), '要说清楚是汽油不够');
+
+  // 排序：同品质比**物品件数**，资源（GOLD/RUBY，type 1）只做次级比较。
+  // 不这么排的话「GOLD×8300 的金币货轮」会永远排第一 —— radar 里那个打捞宝箱的坑。
+  const gold = viewTreasure(surveyFor({
+    treasures: [
+      treasure({ uid: 60, itemScore: 130, resourceScore: 8300 }),
+      treasure({ uid: 61, itemScore: 950, resourceScore: 65 }),
+    ],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(planTreasure(gold, {}).actions[0].body.uid, 61, '物品多的优先，金币数量大不顶用');
+
+  // 编码层：uid 是 field 1（tag 0x08），必须真的进帧 —— 少了服务端会当 uid=0 处理。
+  const payloadOf = (body) => {
+    const frame = codec.encode('TreasureLootSendFleetsRequest', 1, body);
+    const headerLen = HEADER_PREFIX + 'TreasureLootSendFleetsRequest'.length + 1;
+    return Buffer.from(frame.slice(headerLen)).toString('hex');
+  };
+  assert.ok(payloadOf({ uid: 57, fleetBuildingIds: ['1远征船'] }).startsWith('08'), '派兵必须带 uid');
+  assert.equal(MAX_GUILD_FLEETS, 10, '同联盟最多 10 支占同一个货轮（游戏内说明）');
+
+  // 循环日志：探测过就印一行概览，被间隔挡住也要说清楚。
+  const treasureRound = formatLoopRound({
+    round: 6, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    treasure: {
+      planned: 1, notes: [], summary: '今日奖励 1/3（还能领 2 次） · 货轮 7 个（无人 6） · 空闲舰队 2/2',
+      results: [{ step: { kind: 'treasureDispatch', label: '派 1远征船 抢「小型货轮」' }, ok: true }],
+    },
+    gates: { treasure: { enabled: true, everyMs: 60_000, lastAt: 1_700_000_000, waitSeconds: 40, throttled: true } },
+  });
+  assert.ok(treasureRound.includes('货轮 计划 1'), `要有货轮概览行，实际：\n${treasureRound}`);
+  assert.ok(treasureRound.includes('成功 抢货轮'), `成功行要标出抢货轮，实际：\n${treasureRound}`);
+  assert.ok(treasureRound.includes('货轮 间隔未到，还差 40 秒'), `要有节流提示，实际：\n${treasureRound}`);
+
+  // 过期那一轮：日志要能一眼看到「活动已结束、这段可以删了」，否则用户不知道该什么时候收手。
+  const closedRound = formatLoopRound({
+    round: 7, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    treasure: {
+      planned: 0,
+      notes: planTreasure(expired, {}).notes,
+      summary: formatTreasureSummary(expired),
+      results: [],
+    },
+  });
+  assert.ok(closedRound.includes('货轮 计划 0'), `过期那轮也要有货轮行，实际：\n${closedRound}`);
+  assert.ok(closedRound.includes('活动已结束') && closedRound.includes('可以删了'),
+    `过期那轮要打印「可以删了」，实际：\n${closedRound}`);
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 日志脱敏与回包归档）`);

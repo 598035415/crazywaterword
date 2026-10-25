@@ -73,6 +73,10 @@ export class GameClient extends EventEmitter {
 
   async connect(loginBody = this.login, { timeout = LOGIN_TIMEOUT_MS } = {}) {
     if (this.connected) throw new Error('already connected');
+    // 上一次连接可能是异常断开的（onClose 只把 socket 置空）。不清掉旧 interval，
+    // 就会变成两个 tick 循环交替发 ping、互相覆盖 lastPingTimestamp，
+    // 表现为「刚连上就心跳超时」或者无谓的双倍请求。
+    this.stopTick();
     this.login = loginBody ?? this.login;
     this.stopping = false;
     // 落盘挂在这里而不是各命令里：CLI 的十几个子命令、网页控制台、自动循环全都走 connect，
@@ -337,6 +341,13 @@ export class GameClient extends EventEmitter {
     this.sendNoSeq('Nack', { seqNo });
   }
 
+  // tick 定时器全局只有一个：connect 建它，stop / onClose / 重连之前都要先清掉。
+  // 不清的话旧 interval 会成为孤儿 —— this.tickTimer 被新值覆盖后再也 clear 不到。
+  stopTick() {
+    if (this.tickTimer !== null) clearInterval(this.tickTimer);
+    this.tickTimer = null;
+  }
+
   tick() {
     if (!this.stopping) {
       const now = Date.now();
@@ -385,15 +396,16 @@ export class GameClient extends EventEmitter {
 
   onClose(event) {
     this.socket = null;
+    // 连接已经没了，心跳循环没有意义；留着它只会每秒 emit 一次 tick。
+    this.stopTick();
     this.emit('close', { code: event?.code, reason: event?.reason });
     if (!this.stopping) this.setState('CLOSED', `code=${event?.code ?? ''}`);
   }
 
   stop() {
     this.stopping = true;
-    if (this.tickTimer !== null) clearInterval(this.tickTimer);
+    this.stopTick();
     if (this.ackTimer !== null) clearTimeout(this.ackTimer);
-    this.tickTimer = null;
     this.ackTimer = null;
     for (const entry of this.pending.splice(0)) {
       clearTimeout(entry.timer);

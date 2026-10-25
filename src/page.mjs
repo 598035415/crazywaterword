@@ -152,8 +152,29 @@ export const PAGE = `<!doctype html>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
     </div>
-    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 情报」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
+    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 锻造」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
 这里只放自动化：要手动点一次的「任务奖励」「海面」「联盟情报」都在「日常」页。</pre>
+
+    <h2>搁浅的货轮（世界宝藏）</h2>
+    <div class="bar">
+      <label class="dim" title="整点刷新的货轮，派舰队占领到 100% 结算奖励。这里只抢「没人占」的，不跟人抢打">
+        <input type="checkbox" id="treasure-on" checked> 自动抢货轮
+      </label>
+      <label class="dim">时间间隔 <input id="treasure-every" value="60" style="width:64px"> 秒</label>
+      <button id="treasure-run">立刻抢一次</button>
+      <span id="treasure-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="treasure-view">货轮每天 8:00~22:00 的**每个整点**刷新（万吨 1 艘、中型、小型各若干），派舰队占领到 100% 就结算奖励，
+每人每天最多拿 3 次（TreasureLootParamCfg「每日宝藏奖励次数」）。抢的是刷新后那几十秒，所以默认 60 秒看一次 ——
+与情报同节奏，但**排在情报前面**：两边抢的是同一批空闲舰队，情报事件挂 6 小时还在，货轮错过就没了。
+只抢「无人占领」（ownerGuildIdx = 0）的：抢别人占着的要先打赢守军，而协议里拿不到对手战力，赌输要掉耐久。
+一次只打一个货轮（品质最高、奖励最多的那个），把空闲船压上去推快 —— 同联盟最多 10 支能占同一个，默认派 3 支。
+单支消耗汽油 500（WorldParamCfg「进攻宝藏消耗汽油」），汽油不够会自动少派。奖励没有领取请求，结算后进邮件，
+由上面的「自动领取」一并收掉。间隔填 0 = 每轮都看。
+**活动有效期**：世界宝藏没有独立的活动时间，边界是**赛季结束** —— 服务端 SeasonRankInfoResponse.endTime
+（拿不到就按 worldOpenTime + SeasonTaskCfg 的赛季天数复算，两者实测完全相等）。赛季结束前 1 小时连船都派不了
+（游戏内「合服计划」说明），所以真正的截止是 endTime − 1 小时。到点后本模块**自动停手**，日志与这里都会打印
+「活动已结束」——那时把 src/treasure.mjs 和几处接线删掉即可。</pre>
 
     <h2>自动联盟情报</h2>
     <div class="bar">
@@ -190,6 +211,35 @@ export const PAGE = `<!doctype html>
 作物最快 30 分钟成熟，所以默认 120 秒看一眼就够；只有**真的排出了收/种动作**才记时间，地里没熟、也没空地时不占用间隔。
 收：熟一片全收（一条 FarmHarvestRequest）；种：空地和刚收的地同一轮补种（一条 FarmPlantRequest），种子按库存从**价值高的先用**（成熟时间长的更值钱），不够的地块会逐块列出原因。
 游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。</pre>
+
+    <h2>挂机收益 / 邮件</h2>
+    <div class="bar">
+      <label class="dim" title="邮件附件 + 挂机本段收益 + 挂机等级奖励/升级：四件都免费，不发就白放着（收益 8 小时封顶后产出停摆）">
+        <input type="checkbox" id="idle-on" checked> 自动领取
+      </label>
+      <label class="dim">时间间隔 <input id="idle-every" value="300" style="width:64px"> 秒</label>
+      <button id="idle-run">立刻领取一次</button>
+      <span id="idle-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="idle-view">跟拾荒、农田、情报、锻造同一套节奏：自动循环每轮都会看一眼，只有「距上次执行」超过间隔才真的探测一次。
+领的四样：邮件附件（一键领取，all:true）、挂机本段收益（到封顶才领）、挂机等级奖励（OfflineLvRewardCfg 里下一个有奖的等级）、
+挂机等级升级（消耗「挂机徽章」，一次能连升 10/5/1 级就取最高的那档）。
+升级**会重置本段计时**，所以只有「本段刚开」或「这一轮先把本段收益领了」才升级，不会把累积的收益扔掉。
+升级受主线关卡限制：OfflineCfg 里 stage ≤ 主线关卡-1 的最高等级就是上限。间隔填 0 = 每轮都看。</pre>
+
+    <h2>装备锻造</h2>
+    <div class="bar">
+      <label class="dim" title="装备厂：造好了收取，收完按部位件数最少的排下一件（武器/防具/饰品成套，英雄每个部位只能穿一件）">
+        <input type="checkbox" id="forge-on" checked> 自动锻造
+      </label>
+      <label class="dim">时间间隔 <input id="forge-every" value="180" style="width:64px"> 秒</label>
+      <button id="forge-run">立刻锻造一次</button>
+      <span id="forge-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="forge-view">装备厂同一时间只能造一件，**造好不收 = 整座工厂停产**，所以它比农田更值得勤看（一件蓝装约 25 分钟，默认 180 秒看一眼）。
+排产按「背包 + 打造中」的件数算：哪个部位少就补哪个（英雄每个部位只能穿一件，三个部位要成套）；件数相同时按 武器 → 防具 → 饰品 轮转。
+部位内先试品质最高的配方，材料或金币不够就自动降级 —— 所以紫材料攒够 160 时会自动改造紫装，不用改设置。
+已穿在英雄身上的不计入（那是「已在用」，不是「可分配」）。**永不动钻石、不加速**（SpeedMakeEquipRequest 需要花钻石）。</pre>
 
     <pre class="dim" style="color:#7c8695">潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
   </section>
@@ -706,9 +756,15 @@ function renderLoop(data) {
   syncInterval('pick-every', data.pickEveryMs);
   syncInterval('farm-every', data.farmEveryMs);
   syncInterval('radar-every', data.radarEveryMs);
+  syncInterval('forge-every', data.forgeEveryMs);
+  syncInterval('idle-every', data.idleEveryMs);
+  syncInterval('treasure-every', data.treasureEveryMs);
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked, data.running);
   renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked, data.running);
   renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, $('loop-radar').checked, data.running);
+  renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, $('forge-on').checked, data.running);
+  renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, $('idle-on').checked, data.running);
+  renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, $('treasure-on').checked, data.running);
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
     return;
@@ -743,6 +799,15 @@ $('loop-start').onclick = async () => {
         // 情报默认开，跟拾荒/农田一样有独立间隔（默认 60 秒）；战力余量越小越激进（战败掉耐久）。
         radar: $('loop-radar').checked,
         radarEverySeconds: Number($('radar-every').value || 0),
+        // 锻造默认开，默认 3 分钟看一眼（一件蓝装约 25 分钟；造好不收等于停产）。
+        forge: $('forge-on').checked,
+        forgeEverySeconds: Number($('forge-every').value || 0),
+        // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，默认 5 分钟看一眼。
+        idle: $('idle-on').checked,
+        idleEverySeconds: Number($('idle-every').value || 0),
+        // 搁浅的货轮（世界宝藏）默认开，默认 60 秒看一次（整点刷新，抢的是刷新后那几十秒）。
+        treasure: $('treasure-on').checked,
+        treasureEverySeconds: Number($('treasure-every').value || 0),
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -764,6 +829,64 @@ $('loop-stop').onclick = async () => {
 $('world-pick').onchange = refreshLoop;
 $('world-farm').onchange = refreshLoop;
 $('loop-radar').onchange = refreshLoop;
+$('forge-on').onchange = refreshLoop;
+$('idle-on').onchange = refreshLoop;
+$('treasure-on').onchange = refreshLoop;
+
+// 手动「立刻领取一次」：不看间隔，跟挂机里那套完全一样。
+$('idle-run').onclick = async () => {
+  $('idle-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/idle/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : '';
+    $('idle-view').textContent = (data.text || '') + tail;
+    $('idle-state').textContent = results.length ? '执行完成' : '没有可领的';
+    refreshLoop();
+  } catch (error) {
+    $('idle-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻抢一次」：不看间隔，跟挂机里那套完全一样（探测 → 只抢无人占领的货轮）。
+$('treasure-run').onclick = async () => {
+  $('treasure-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/treasure/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : String.fromCharCode(10, 10) + '这一轮没有可抢的货轮';
+    $('treasure-view').textContent = (data.text || '') + tail;
+    $('treasure-state').textContent = results.length ? '执行完成' : '没有可抢的';
+    refreshLoop();
+  } catch (error) {
+    $('treasure-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻锻造一次」：不看间隔，跟挂机里的那套完全一样（探测 → 收取 → 排产）。
+$('forge-run').onclick = async () => {
+  $('forge-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/forge/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    // 注意：整个页面是一段模板字符串，这里不能写反引号，换行用 String.fromCharCode。
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : '';
+    $('forge-view').textContent = (data.text || '') + tail;
+    $('forge-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  } catch (error) {
+    $('forge-state').textContent = error.message;
+  }
+};
 
 $('tasks-plan').onclick = async () => {
   $('tasks-hint').textContent = '检查中 ...';
@@ -788,15 +911,15 @@ function renderWorld(data) {
   if (slots.length) {
     fbox.appendChild(el('h2', null, '空位'));
     fbox.appendChild(table(['空位', '类型', '状态'], slots.map((b) => [
-      { cell: b.icon, text: b.buildingId },
+      { cell: { icon: b.icon, id: b.buildingId } },
       b.type || '未知类型',
-      b.building ? chip('waiting', '施工中') : chip('ready', '待建'),
+      b.building ? { chip: 'waiting', text: '施工中' } : { chip: 'ready', text: '待建' },
     ])));
   }
-  if (data.factories.length) {
+  if ((data.factories || []).length) {
     fbox.appendChild(el('h2', null, '工厂'));
     fbox.appendChild(table(['建筑', '类型', '等级', '队列', '自动生产'], data.factories.map((b) => [
-      { cell: b.icon, text: b.buildingId },
+      { cell: { icon: b.icon, id: b.buildingId } },
       b.type,
       'lv' + b.level,
       String(b.queue),
@@ -807,25 +930,27 @@ function renderWorld(data) {
   if ((data.farms || []).length) {
     fbox.appendChild(el('h2', null, '农田' + (data.autoFarming ? '（游戏内自动种植已开，只收不种）' : '')));
     fbox.appendChild(table(['农田', '作物', '状态'], data.farms.map((f) => [
-      { cell: f.icon, text: f.buildingId },
-      f.productId ? { cell: f.cropIcon, text: f.productId } : '空',
-      f.ripe ? chip('ready', '可收') : f.idle ? chip('waiting', '空闲，待播种') : chip('waiting', '生长中 ' + f.remainSeconds + 's'),
+      { cell: { icon: f.icon, id: f.buildingId } },
+      f.productId ? { cell: { icon: f.cropIcon, id: f.productId } } : '空',
+      f.ripe ? { chip: 'ready', text: '可收' }
+        : f.idle ? { chip: 'waiting', text: '空闲，待播种' }
+          : { chip: 'waiting', text: '生长中 ' + f.remainSeconds + 's' },
     ])));
   }
   const obox = clear($('world-orders'));
-  if (data.orders.length) {
+  if ((data.orders || []).length) {
     obox.appendChild(el('h2', null, '居民订单'));
     obox.appendChild(table(['订单', '居民', '需求', '缺口'], data.orders.map((o) => [
       '#' + o.index,
       { cell: null, text: o.workerId + (o.isSpecial ? '（特殊）' : '') },
       { cells: o.requirements },
-      o.missing.length === 0 ? chip('done', '材料齐') : { cells: o.missing, prefix: '缺 ' },
+      (o.missing || []).length === 0 ? { chip: 'done', text: '材料齐' } : { cells: o.missing, prefix: '缺 ' },
     ])));
   }
   const sbox = clear($('world-stock'));
-  for (const entry of data.stock) sbox.appendChild(cell(entry.icon, 30, entry.id, fmt(entry.num)));
+  for (const entry of data.stock || []) sbox.appendChild(cell(entry.icon, 30, entry.id, fmt(entry.num)));
   if (!sbox.childElementCount) sbox.appendChild(el('span', 'dim', '仓库空'));
-  $('world-fields').textContent = data.resFields.text || '';
+  $('world-fields').textContent = data.resFields?.text || '';
 }
 
 // ---- 联盟情报 --------------------------------------------------------------
@@ -846,17 +971,19 @@ function renderRadar(data) {
     ])));
   }
   box.appendChild(el('h2', null, '情报事件'));
-  if (!data.events.length) {
+  const events = data.events || [];
+  if (!events.length) {
     box.appendChild(el('div', 'dim', '情报里现在没有事件'));
     return;
   }
-  box.appendChild(table(['事件', '敌方战力', '状态', '奖励'], data.events.map((event) => [
-    event.name,
+  box.appendChild(table(['事件', '敌方战力', '状态', '奖励'], events.map((event) => [
+    // 固定事件来自 fixedEvent 字段，跟随机事件同名同格式地混在一张表里，
+    // 不标出来会让人以为「这条怎么一直在、打不掉」。
+    event.fixed ? event.name + '（固定）' : event.name,
     event.enemyPower > 0 ? fmt(event.enemyPower) : '无需战斗',
-    event.state === 4 ? chip('done', '待领奖')
-      : event.state !== 1 ? chip('waiting', event.stateText)
-        : event.dispatchable ? chip('ready', '可派')
-          : chip('blocked', event.fits ? '缺材料' : '战力不够'),
+    // 判定由服务端算好（radar.mjs 的 verdict / verdictChip）：页面再自己算一套，
+    // 就会漏掉「已派兵」「配置过期」这类新状态，跟文本视图各说各话。
+    { chip: event.verdictChip || 'blocked', text: event.verdict || event.stateText || '' },
     (event.reward || []).slice(0, 3).map((asset) => asset.id + '×' + fmt(asset.num)).join('、')
       + ((event.reward || []).length > 3 ? ' 等 ' + (event.reward || []).length + ' 项' : ''),
   ])));
@@ -945,7 +1072,7 @@ function renderHeroes(data) {
   $('hero-view').textContent = data.text;
   const box = clear($('hero-table'));
   box.appendChild(table(['英雄', '等级', '星级', { label: '战力', num: true }, '技能'], data.heroes.map((hero) => [
-    { cell: hero.head || hero.icon, text: hero.heroId },
+    { cell: { icon: hero.head || hero.icon, id: hero.heroId } },
     'lv' + hero.level,
     hero.star + ' 星',
     { num: true, text: fmt(hero.power) },
@@ -985,7 +1112,7 @@ function renderDailies(data) {
   box.appendChild(table(['任务', '进度', '状态', '动作 / 原因'], data.tasks.map((entry) => [
     entry.task.title,
     entry.task.progress + '/' + entry.task.targetProgress,
-    chip(entry.status, DAILY_LABEL[entry.status] || entry.status),
+    { chip: entry.status, text: DAILY_LABEL[entry.status] || entry.status },
     entry.status === 'ready' || entry.status === 'paid'
       ? (entry.actions || []).map((a) => a.cost || a.request).join('；') || '直接完成'
       : (entry.reason || ''),
@@ -996,7 +1123,7 @@ function renderDailies(data) {
       const tail = tiers.length
         ? '第 ' + tiers.map((t2) => t2.id).join(' / ') + ' 档'
         : (chest.nextAt == null ? '这一季的档位都领完了' : '下一档要 ' + chest.nextAt + ' 点活跃');
-      return [label, chest.activity + ' 活跃', chip(tiers.length ? 'ready' : 'done', tiers.length ? '可领' : '不欠'), tail];
+      return [label, chest.activity + ' 活跃', { chip: tiers.length ? 'ready' : 'done', text: tiers.length ? '可领' : '不欠' }, tail];
     };
     box.appendChild(table(['活跃奖励', '活跃度', '状态', '动作 / 原因'], [
       line('每日宝箱', data.chests.daily),
@@ -1006,7 +1133,7 @@ function renderDailies(data) {
   if (data.gift) {
     const free = data.gift.freeAvailable;
     box.appendChild(table(['每日礼包', '状态', '动作 / 原因'], [
-      ['每日精选赠礼', chip(free ? 'ready' : 'done', free ? '可领' : '已领'),
+      ['每日精选赠礼', { chip: free ? 'ready' : 'done', text: free ? '可领' : '已领' },
         free ? '免费，一键领取会顺手领掉' : '今天那份已经领过了，明天 0 点重置'],
     ]));
   }
@@ -1084,7 +1211,8 @@ function recipeTitle(recipe) {
   // 瞬成的配方写清楚「原时长 → 0 秒」：这是自动挂机一次性排满队列的前提。
   const parts = [recipe.instant
     ? '生产瞬成（原 ' + dur(recipe.produceTime) + '，减免后 0 秒，排下去就完成）'
-    : '生产 ' + dur(recipe.produceTime)];
+    : '生产 ' + dur(recipe.finalSeconds ?? recipe.produceTime)
+      + (recipe.finalSeconds != null && recipe.finalSeconds !== recipe.produceTime ? '（原 ' + dur(recipe.produceTime) + '）' : '')];
   if (recipe.costs.length) {
     parts.push('消耗 ' + recipe.costs.map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num + (c.enough ? '' : '（不够）')).join('，'));
   }
@@ -1146,7 +1274,9 @@ function factoryCard(factory, data) {
     const left = el('span', 'left', job.pending ? '排队中' : countdown(job.remain));
     row.appendChild(left);
     qcol.appendChild(row);
-    facState.ticks.push({ node: left, fill, finishAt: job.finishAt, total: job.produceTime, pending: job.pending });
+    // 分母用减免后的秒数：840 秒减免下 1200 秒的配方实际 360 秒就完成，
+    // 拿原时长当分母的话进度条真做完时只走到三成，然后突然跳满。
+    facState.ticks.push({ node: left, fill, finishAt: job.finishAt, total: job.finalSeconds ?? job.produceTime, pending: job.pending });
   }
   if (factory.finished.length) {
     qcol.appendChild(el('div', 'col-title', '待收成品'));
@@ -1175,7 +1305,7 @@ function factoryCard(factory, data) {
     // 状态直接写在副标题上：满 / 缺料 / 已排几个。光把格子变暗，看不出是为什么。
     const sub = el('span', 'sub');
     // 瞬成配方显示「瞬成」而不是原时长：写 5 分 0 秒会让人以为还得等 5 分钟。
-    sub.appendChild(document.createTextNode(recipe.instant ? '瞬成' : dur(recipe.produceTime)));
+    sub.appendChild(document.createTextNode(recipe.instant ? '瞬成' : dur(recipe.finalSeconds ?? recipe.produceTime)));
     if (!recipe.unlocked) sub.appendChild(document.createTextNode(' · lv' + recipe.unlockLevel));
     if (recipe.atCap) sub.appendChild(el('span', 'miss', ' · 满'));
     else if (!recipe.enough) sub.appendChild(el('span', 'miss', ' · 缺料'));
@@ -1205,7 +1335,7 @@ function factoryCard(factory, data) {
     if (picked.atCap) why.push('仓库到上限');
     if (factory.full) why.push('制造位满');
     const foot = el('div', 'pick');
-    foot.appendChild(el('div', 'dim', '已选 ' + picked.itemId + '：' + dur(picked.produceTime)
+    foot.appendChild(el('div', 'dim', '已选 ' + picked.itemId + '：' + dur(picked.finalSeconds ?? picked.produceTime)
       + (picked.costs.length ? '，耗 ' + picked.costs.map((c) => c.id + '×' + c.num).join(' ') : '')
       + (why.length ? '（' + why.join('、') + '）' : '')));
     const btn = el('button', 'primary tiny', '制造 ' + picked.itemId);
