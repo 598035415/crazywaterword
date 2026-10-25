@@ -176,11 +176,12 @@ export async function surveyTasks(client, protocol, { config = null, water = nul
   return { main: mainView, branch: branchView, achievement: achievementView, orderOfTheDay: orderView, plan, notes };
 }
 
-// 逐条领取。同一条被服务端拒过就记下来，本轮之后不再重发——否则循环模式里会每轮骚扰一次。
-export async function runTasks(client, protocol, survey, { allowMutate = false, window = 400, onStep } = {}) {
+// 逐条领取。同一条被服务端拒过就记进 rejected —— 跨轮传递才有意义：
+// 循环把它自己的 Set 传进来（loop.mjs 的 rejected.tasks），这样「这条必被拒」只发生一次；
+// 不传就是一次性的临时 Set（CLI 单次运行、网页「立刻领一次」都不需要跨轮记忆）。
+export async function runTasks(client, protocol, survey, { allowMutate = false, window = 400, rejected = new Set(), onStep } = {}) {
   if (!allowMutate) throw new Error('领取任务奖励会改变账号状态，需要 --yes');
   const results = [];
-  const rejected = new Set();
   for (const step of survey.plan) {
     const key = `${step.kind}:${step.id}`;
     if (rejected.has(key)) {

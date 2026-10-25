@@ -220,11 +220,16 @@ export class GameClient extends EventEmitter {
   // PromptResponse 不带我们发出去的 seq，只能按顺序认领：服务端按请求到达顺序应答，
   // 所以一条 prompt 属于「最早那条还没被应答的发送」。若那条刚好是 sendWatch 发出的，
   // 就归它；否则才是某个在飞的 request()。
+  //
+  // pending 是按发送顺序 push、回包到达时按项摘除的，所以**最早未应答的就是 pending[0]**。
+  // 这里曾经取 pending[length-1]（最新那条）：并发场景（collectState 一次 48 条）下，
+  // 一条 prompt 会拒掉无关的新请求，真正被拒的那条干等满 timeout，
+  // 与 docs/gameplay.md 11.3 的规则和下面的注释都不一致。
   attributePrompt(body) {
     const reason = (body?.args ?? []).join(' ') || `prompt=${body?.prompt}`;
     const error = new Error(`server prompt: ${reason}`);
     error.prompt = body;
-    const pendingEntry = this.pending.length ? this.pending[this.pending.length - 1] : null;
+    const pendingEntry = this.pending.length ? this.pending[0] : null;
     const watcher = this.watchers.length && (!pendingEntry || this.watchers[0].order < pendingEntry.order) ? this.watchers[0] : null;
     if (watcher) {
       this.watchers = this.watchers.filter((item) => item !== watcher);
@@ -234,7 +239,7 @@ export class GameClient extends EventEmitter {
       return;
     }
     if (pendingEntry) {
-      this.pending.splice(this.pending.length - 1, 1);
+      this.pending.splice(0, 1);
       clearTimeout(pendingEntry.timer);
       error.request = pendingEntry.name;
       pendingEntry.reject(error);

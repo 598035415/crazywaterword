@@ -165,6 +165,9 @@ export function planAfkClaims(afk, config, now = Math.floor(Date.now() / 1000)) 
       request: 'DrawAfkRewardRequest',
       response: 'DrawAfkRewardResponse',
       body: {},
+      // body 是空的 → runIdle 的 key 退化成常量 'afkDraw:'。本段收益是每 8 小时循环的，
+      // 一次「还没封顶/状态没同步」的拒绝不能变成整场挂机都不领。
+      transient: true,
       label: `挂机本段收益（Lv${level}）`,
     });
   }
@@ -288,6 +291,9 @@ export function planIdle(survey, { now = null, config = null, allowUpgrade = tru
       request: 'QuickGotReadEmailRequest',
       response: null,
       body: { all: true },
+      // 常量 key（'mailQuickGet:'）：一次瞬时失败不该让整个挂机会话再也不领邮件，
+      // 每轮重新探一遍邮箱本来就是幂等的，重试安全。
+      transient: true,
       label: `邮件一键领取（新 ${survey.mail.newCount} / 未领附件 ${survey.mail.ungotCount}）`,
     });
   }
@@ -305,6 +311,8 @@ export function planIdle(survey, { now = null, config = null, allowUpgrade = tru
       response: 'UpgradeAfkLevelResponse',
       body: { level: survey.upgrade.jump },
       label: `挂机等级 +${survey.upgrade.jump}（花 ${survey.upgrade.need} ${AFK_LV_ITEM}）`,
+      // 升级失败多半是「徽章刚被别处花掉」，下一轮的 survey 会重新算够不够，重试安全。
+      transient: true,
       // 升级会重置本段计时：必须等本段收益真的领到了再发。
       after: 'afkDraw',
       // 只有「本段本来就刚开」时不需要等领取动作。
@@ -362,7 +370,9 @@ export async function runIdle(client, protocol, plan, {
           entry = { step, ok: true, sent };
         }
       } catch (error) {
-        rejected.add(key);
+        // 被拒的动作跨轮记住（不再骚扰服务端），但瞬时动作不记：这些 key 里有的是常量
+        // （afkDraw / mailQuickGet），记下来等于把整块功能关到进程结束。
+        if (!step.transient) rejected.add(key);
         entry = { step, ok: false, error: error.message };
       }
     }

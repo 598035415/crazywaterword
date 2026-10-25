@@ -314,6 +314,10 @@ MonthCardDailyRewardRequest          领取月卡每日奖励，无响应类型
 - 已对真实账号执行过的变更：一轮 `loot --yes`（见第 10 节）、日常任务一轮（见 11.4）、
   英雄养成两轮（见 11.4）、进度任务领取与海面排产各若干轮（见 12.6）。
 - 付费动作单独门控：点金/折扣商店这类要花钻石的，还要 `--paid` 才执行，默认跳过。
+  实现上由 `dailies.mjs` 的 `needsPaid()` 判三段：驱动的 `status === 'paid'`、动作上的
+  `paid: true`、或 `cost` 文案里含「钻石」，任一命中就整条驱动跳过。新加付费驱动必须标其中之一 ——
+  2026-10-25 之前折扣店（1007）标的是 `ready`，`runDailies` 只认 `status === 'paid'`，
+  于是没开 `--paid` 也照样买（归档实证：`DiscountShopBuyRequest{id:5}`，RUBY 9742→9730）。
 - 加速与拒单各有独立开关（`--speed-up` / `--reroll`），默认关闭；加速**只花「加速器」道具**，
   `SpeedUpCostParam.type` 永远发 2，钻石(1)与广告(3)不碰。
 - 不使用 `LoginRequest` 里的 `testAccount` / `superToken` 等开发者字段（鉴权后门，不在范围内）。
@@ -417,7 +421,10 @@ node tools/selftest-describe.mjs    # 字段布局还原自检
 
 规则：**服务端按请求到达顺序应答，所以一条 prompt 属于最早那条还没被应答的发送**。
 `GameClient.sendWatch(name, body, {window})` 为无响应请求开一个观察窗口（守到 prompt 即被拒，
-窗口内没动静即成功），`GameClient.attributePrompt()` 按上面的顺序规则认领。
+窗口内没动静即成功），`GameClient.attributePrompt()` 按上面的顺序规则认领 ——
+观察者按发送顺序排队，在飞的 `request()` 用 `pending[0]`（最早一条）。
+2026-10-25 之前这里取的是 `pending[最后一条]`，并发场景（`collectState` 一次 48 条只读请求）
+下会拒错对象，与本节规则不符，已修正并有自检断言。
 
 同类请求还包括 `StartFactoryProduceRequest`、`UpgradeBuildingRequest`、`BuildBuildingRequest`、
 `SelectPackRequest`（自选包兑换）等。**完整清单维护在 `src/selftest.mjs` 的 `SILENT` 集合里**，

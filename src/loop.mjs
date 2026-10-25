@@ -153,27 +153,40 @@ export async function runLoop(client, protocol, {
     const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, idle: null, treasure: null, radar: null, forge: null };
 
     // 1. 任务奖励
-    const tasksSurvey = await surveyTasks(client, protocol, { config });
-    summary.tasks = { planned: tasksSurvey.plan.length, results: [] };
-    if (tasksSurvey.plan.length > 0) {
-      summary.tasks.results = await runTasks(client, protocol, tasksSurvey, {
-        allowMutate,
-        onStep: (entry) => onStep?.({ round, phase: 'tasks', ...entry }),
-      });
+    summary.tasks = { planned: 0, results: [], notes: [] };
+    try {
+      const tasksSurvey = await surveyTasks(client, protocol, { config });
+      summary.tasks.planned = tasksSurvey.plan.length;
+      if (tasksSurvey.plan.length > 0) {
+        summary.tasks.results = await runTasks(client, protocol, tasksSurvey, {
+          allowMutate,
+          // 跨轮去重：被拒过的那条下一轮直接跳过，否则每轮都会再骚扰一次必败请求。
+          rejected: rejected.tasks,
+          onStep: (entry) => onStep?.({ round, phase: 'tasks', ...entry }),
+        });
+      }
+    } catch (error) {
+      // 探测失败只跳过这一段：整轮中止会让一次超时把整条挂机停掉，其它模块本来都能跑。
+      summary.tasks.notes = [`任务领取探测失败：${error.message}`];
     }
 
     // 2. 日常。活跃度宝箱与每日免费赠礼也算进计划数，否则「任务都做完了、只差领取」的轮次会被整段跳过。
-    const dailySurvey = await surveyDailies(client, protocol, { config, player });
-    const dailyActions = dailySurvey.tasks.reduce((sum, entry) => sum + (entry.actions ?? []).length, 0)
-      + (dailySurvey.chests?.actions.length ?? 0)
-      + (dailySurvey.gift?.actions.length ?? 0);
-    summary.dailies = { planned: dailyActions, results: [] };
-    if (dailyActions > 0) {
-      summary.dailies.results = await runDailies(client, protocol, dailySurvey, {
-        allowMutate,
-        allowPaid,
-        onStep: (entry) => onStep?.({ round, phase: 'dailies', ...entry }),
-      });
+    summary.dailies = { planned: 0, results: [], notes: [] };
+    try {
+      const dailySurvey = await surveyDailies(client, protocol, { config, player });
+      const dailyActions = dailySurvey.tasks.reduce((sum, entry) => sum + (entry.actions ?? []).length, 0)
+        + (dailySurvey.chests?.actions.length ?? 0)
+        + (dailySurvey.gift?.actions.length ?? 0);
+      summary.dailies.planned = dailyActions;
+      if (dailyActions > 0) {
+        summary.dailies.results = await runDailies(client, protocol, dailySurvey, {
+          allowMutate,
+          allowPaid,
+          onStep: (entry) => onStep?.({ round, phase: 'dailies', ...entry }),
+        });
+      }
+    } catch (error) {
+      summary.dailies.notes = [`日常探测失败：${error.message}`];
     }
 
     // 3. 海面世界。拾荒按自己的间隔节流：间隔没到就这轮不发，到点才发。
@@ -461,8 +474,11 @@ export function formatLoopRound(summary) {
     `第 ${summary.round} 轮`,
     line('任务', summary.tasks),
     ...detailLines(summary.tasks),
+    // 探测失败只跳过本段，但必须让它出现在日志里 —— 否则「任务一直是 计划 0」看不出是被跳过了。
+    ...(summary.tasks.notes ?? []).map((note) => `    注意 ${note}`),
     line('日常', summary.dailies),
     ...detailLines(summary.dailies),
+    ...(summary.dailies.notes ?? []).map((note) => `    注意 ${note}`),
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
     ...detailLines(summary.world),
     // 挂机领取同理：这一轮真的探测过就印一行（哪怕「本段还剩 7 小时」「邮件都已领」）——

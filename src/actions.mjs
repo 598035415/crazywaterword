@@ -254,7 +254,13 @@ export const ACTIONS = {
     params: ['gridIdx'],
     body: ({ gridIdx, fleetBuildingIds }) => ({
       resFieldGridIdx: Number(gridIdx),
-      fleetBuildingIds: String(fleetBuildingIds).split(',').map((s) => s.trim()).filter(Boolean),
+      // 没给舰队时必须是空数组：`String(undefined)` 会得到 ['undefined']，
+      // 服务端收到一个不存在的 buildingId，报错信息还看不出是参数没传。
+      fleetBuildingIds: (Array.isArray(fleetBuildingIds)
+        ? fleetBuildingIds
+        : String(fleetBuildingIds ?? '').split(','))
+        .map((id) => String(id).trim())
+        .filter(Boolean),
     }),
   },
   giveUpField: {

@@ -509,6 +509,51 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 折扣商店必须和点金一样被 allowPaid 拦住。
+// 客户端 _onBtnBuyDiscountItem 是 `checkResAndShowNotice(Resource.RUBY, floor(price*discount))`
+// 之后才发 DiscountShopBuyRequest —— 付的是**钻石**。2026-10-25 的归档里
+// `DiscountShopBuyRequest{id:5}` 紧跟在三条 free 点金之后，RUBY 9742→9730，就是这条漏网。
+{
+  const { DAILY_DRIVERS, needsPaid, runDailies } = await import('./dailies.mjs');
+  const bought = DAILY_DRIVERS[1007].evaluate({
+    task: { id: 1007, progress: 0, targetProgress: 1 },
+    probe: (name) => (name === 'DiscountShopRequest'
+      ? { shopItem: [{ id: 5, price: 150, discount: 0.4, isBuy: false }] }
+      : null),
+    ruby: 9999,
+  });
+  assert.equal(bought.status, 'paid', '折扣店是花钻石的动作，不能标成 ready');
+  assert.equal(bought.actions[0].paid, true, '动作本身也要带 paid 标记');
+  assert.equal(bought.actions[0].body.id, 5, '买的是最便宜那件');
+  assert.equal(needsPaid(bought), true);
+
+  const runWith = async (allowPaid, actions = bought.actions) => {
+    const sent = [];
+    const client = {
+      request: async () => ({ dailyTask: [], dailyActivity: 0, weeklyActivity: 0, dailyRewardClaimed: [], weeklyRewardClaimed: [] }),
+      sendWatch: async (name) => { sent.push(name); },
+    };
+    const results = await runDailies(client, { DiscountShopBuyRequest: {} }, {
+      tasks: [{ task: { id: 1007, title: '折扣商店购买' }, status: 'paid', actions }],
+      chests: { actions: [] },
+      gift: null,
+    }, { allowMutate: true, allowPaid, claimRewards: false });
+    return { sent, results };
+  };
+
+  const unpaid = await runWith(false);
+  assert.deepEqual(unpaid.sent, [], 'allowPaid=false 时折扣店一条请求都不许发');
+  assert.equal(unpaid.results[0].skipped, true);
+
+  const paid = await runWith(true);
+  assert.deepEqual(paid.sent, ['DiscountShopBuyRequest'], '开了 allowPaid 才允许买');
+
+  // 旧驱动（status 写成 ready、只有 cost 文案）也能被兜住：门控不能只认 status。
+  const legacy = await runWith(false, [{ request: 'DiscountShopBuyRequest', body: { id: 1 }, response: null, cost: '钻石 x60' }]);
+  assert.deepEqual(legacy.sent, [], 'cost 里写着钻石的旧动作同样要拦住');
+  checked += 1;
+}
+
 // PromptResponse 不带我们发出去的 seq，只能按发送顺序认领。英雄升级这类没有配套 Response
 // 的请求靠 sendWatch 守着 prompt；若归属错了，一条和英雄无关的 prompt 会拒掉当时在飞的
 // AllHeroRequest，整个养成运行就变成 400。
@@ -531,13 +576,24 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(query.state.settled, null, 'an unrelated in-flight request must not be rejected');
   assert.equal(client.pending.length, 1, 'the in-flight request stays pending');
 
-  // 没有观察者时，prompt 仍然按老办法落到最后一条在飞请求上。
+  // 没有观察者时，prompt 落到**最早**那条在飞请求上（docs/gameplay.md 11.3 的规则）。
   client.pending.length = 0;
   const only = fake('ArenaChallengeRequest', 2);
   client.pending.push(only.entry);
   client.attributePrompt({ args: ['no chance left'] });
-  assert.equal(only.state.settled, 'reject', 'without a watcher the newest pending entry takes the prompt');
+  assert.equal(only.state.settled, 'reject', 'without a watcher the oldest pending entry takes the prompt');
   assert.equal(client.pending.length, 0);
+
+  // 两条在飞时必须是**最早**那条认领：取最新那条会把无关请求拒掉、真正被拒的干等满 timeout。
+  // 并发场景真实存在 —— collectState 一次发 48 条只读请求。
+  client.pending.length = 0;
+  const first = fake('AllItemRequest', 5);
+  const second = fake('AllResourceRequest', 6);
+  client.pending.push(first.entry, second.entry);
+  client.attributePrompt({ args: ['feature locked'] });
+  assert.equal(first.state.settled, 'reject', 'the oldest in-flight request takes the prompt');
+  assert.equal(second.state.settled, null, '新的那条必须继续等自己的回包');
+  assert.deepEqual(client.pending.map((entry) => entry.name), ['AllResourceRequest'], '只摘掉被认领的那一条');
 
   // 在飞请求比观察者发得更早时，它就比观察者更该认领这条 prompt。
   client.pending.length = 0;
@@ -572,6 +628,36 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(tier.claimable, false, '7 orders is not enough for the 12-order tier');
   assert.equal(nextOrderTier(orderCfg, { orderNum: 12, rewardedNum: 6 }).claimable, true);
   assert.equal(nextOrderTier(orderCfg, { orderNum: 99, rewardedNum: 18 }).tier, null, 'the last tier claims nothing');
+  checked += 1;
+}
+
+// 任务领取的 rejected 必须由调用方传进来 —— 以前它是 runTasks 里的局部 Set，
+// 每个 (kind,id) 一轮只出现一次，等于这行永远不命中；循环里 rejected.tasks 初始化后
+// 从未被使用，于是「必被拒」的领取请求每轮都重发一次（loop.mjs 头部注释承诺的跨轮去重是失效的）。
+{
+  const { runTasks } = await import('./tasks.mjs');
+  const survey = {
+    plan: [{ kind: 'achievement', id: 7, request: 'GotAchievementRewardRequest', body: { id: 7 }, label: '成就 7' }],
+  };
+  const protocol = { GotAchievementRewardRequest: {} };
+  const rejected = new Set();
+
+  const failing = { sendWatch: async () => { throw new Error('server prompt: already claimed'); } };
+  const first = await runTasks(failing, protocol, survey, { allowMutate: true, rejected, window: 0 });
+  assert.equal(first[0].ok, false, '第一次真的发了请求并失败');
+  assert.equal(rejected.has('achievement:7'), true, '被拒的动作要记进调用方传进来的 Set（跨轮才有意义）');
+
+  let calls = 0;
+  const healthy = { sendWatch: async () => { calls += 1; } };
+  const second = await runTasks(healthy, protocol, survey, { allowMutate: true, rejected, window: 0 });
+  assert.equal(calls, 0, '同一份 rejected 的第二轮必须直接跳过，不再骚扰服务端');
+  assert.equal(second[0].skipped, true);
+
+  // 不传 rejected 时保持旧行为：单次运行自建临时 Set，不影响别的调用方。
+  let calls2 = 0;
+  const fresh = { sendWatch: async () => { calls2 += 1; } };
+  await runTasks(fresh, protocol, survey, { allowMutate: true, window: 0 });
+  assert.equal(calls2, 1, '不传 rejected 时照旧发一次');
   checked += 1;
 }
 
@@ -1649,6 +1735,72 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   ] }, { config });
   assert.deepEqual(done.actions.map((a) => a.kind), ['finishUpgrade'], '正在收尾的楼同一轮不该再排建造');
   assert.equal(done.actions[0].request, 'FinishUpgradeBuildingRequest');
+  checked += 1;
+}
+
+// 同类型多座建筑抢同一批材料：候选是一次性扫出来的，每条看到的 free() 都是同一份快照，
+// 所以必须在真正入列时按当前可用量再核一次。不核的话后一条请求必被服务端拒，
+// 而 build / upgrade 不是 transient，被拒的 buildingId 会被 rejected 带到整场挂机结束。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: 'A民居' }] },
+    BuildingProduceCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    BuildingUpgradeCfg: { data: [
+      { buildingType: 'A民居', level: 1, playerLevel: 1, curPeople: 0, costTime: 0, consume: [], condition: [], effect: [] },
+      { buildingType: 'A民居', level: 2, playerLevel: 1, curPeople: 0, costTime: 100, consume: [['木材', 10]], condition: [], effect: [['人口增加', 5]] },
+    ] },
+  } };
+  const surveyWith = (wood) => {
+    const stock = new Map([['木材', wood]]);
+    const block = (buildingId) => ({ buildingId, type: 'A民居', level: 1, product: [], buildFinishTime: 0, factory: null, farm: null });
+    return {
+      now: 1000, player: { level: 9 }, population: 50, maxPopulation: 99, stockCap: 99, factorySlots: 6,
+      stock, have: (id) => stock.get(id) ?? 0,
+      buildings: [block('1A民居'), block('2A民居')], factories: [], orders: [],
+    };
+  };
+
+  // 12 个木材只够升一座（每座 10）：多排的那一座必被拒，且会被永久记住。
+  const one = planWorld(surveyWith(12), { config, maxUpgrades: 2 });
+  assert.equal(one.actions.filter((a) => a.kind === 'upgrade').length, 1, '只够升一座时不能排两座');
+  assert.ok(one.notes.some((note) => note.includes('被本轮其它动作占用')), '被压住的那座要说明原因');
+
+  // 材料够两座时照旧排两座（别把正常情况也拦掉）。
+  const two = planWorld(surveyWith(40), { config, maxUpgrades: 2 });
+  assert.equal(two.actions.filter((a) => a.kind === 'upgrade').length, 2, '材料够就还是两座都升');
+  checked += 1;
+}
+
+// 常量 stepKey 的动作必须标 transient：runWorld 会把「非 transient 的失败」写进跨轮 rejected，
+// 而拾荒 / 收农田 / 播种的 body 里没有 buildingId 单值或 index，key 退化成常量 ——
+// 一次「已过期 / 种子不足」的 prompt 就会让整场挂机不再拾荒、不再种地。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [] }, BuildingProduceCfg: { data: [] }, BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    FarmlandPlantCfg: { data: [{ id: '玉米', time: 100, material: ['玉米种子', 1] }] },
+  } };
+  const stock = new Map([['玉米种子', 5]]);
+  const plot = (buildingId, productId, ripeAt) => ({
+    buildingId, type: '农田', level: 1, product: [], buildFinishTime: 0, factory: null,
+    farm: { productId, plantAt: 0, ripeAt },
+  });
+  const survey = {
+    now: 1000, player: { level: 9 }, population: 9, maxPopulation: 9, stockCap: 99, factorySlots: 6,
+    stock, have: (id) => stock.get(id) ?? 0,
+    buildings: [plot('1农田', '玉米', 900), plot('2农田', '', 0)],
+    factories: [], orders: [], autoFarming: false,
+    floaters: [{ floaterId: 'f1', num: 1 }],
+  };
+  const plan = planWorld(survey, { config, pickUpFloaters: true, farm: true });
+  for (const kind of ['farmHarvest', 'farmPlant', 'pickUpFloater']) {
+    const hit = plan.actions.filter((action) => action.kind === kind);
+    assert.equal(hit.length, 1, `${kind} 应该排进计划`);
+    assert.equal(hit[0].transient, true, `${kind} 的 key 是常量，必须 transient 才不会被永久拉黑`);
+  }
   checked += 1;
 }
 

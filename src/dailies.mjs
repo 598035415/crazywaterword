@@ -246,7 +246,7 @@ export const DAILY_DRIVERS = {
       return {
         status: 'paid',
         reason: `免费次数已用完，付费 ${price} 钻石一次`,
-        actions: [{ request: 'ClickGoldRequest', body: { times: remaining, free: false }, response: 'ClickGoldResponse', cost: `${RESOURCE_RUBY} x${price * remaining}`, note: '付费点金' }],
+        actions: [{ request: 'ClickGoldRequest', body: { times: remaining, free: false }, response: 'ClickGoldResponse', paid: true, cost: `${RESOURCE_RUBY} x${price * remaining}`, note: '付费点金' }],
       };
     },
   },
@@ -265,9 +265,21 @@ export const DAILY_DRIVERS = {
         .map((item) => ({ ...item, realPrice: Math.floor(item.price * item.discount) }))
         .sort((a, b) => a.realPrice - b.realPrice)[0];
       if (cheapest.realPrice > ruby) return { status: 'blocked', reason: `最便宜的一件要 ${cheapest.realPrice} 钻石，当前 ${ruby}` };
+      // 这里**必须**是 paid：客户端 `_onBtnBuyDiscountItem` 是
+      // `checkResAndShowNotice(Resource.RUBY, floor(price * discount))` 才发请求，付的就是钻石。
+      // 以前标成 ready，runDailies 只拦 status === 'paid'，于是「没开 --paid」也会照买 ——
+      // 归档里能看到 DiscountShopBuyRequest{id:5} 紧跟在三条 free 点金后面，RUBY 9742→9730。
       return {
-        status: 'ready',
-        actions: [{ request: 'DiscountShopBuyRequest', body: { id: cheapest.id }, response: null, cost: `${RESOURCE_RUBY} x${cheapest.realPrice}`, note: `购买商品 ${cheapest.id}` }],
+        status: 'paid',
+        reason: `折扣店最便宜一件要 ${cheapest.realPrice} ${RESOURCE_RUBY}`,
+        actions: [{
+          request: 'DiscountShopBuyRequest',
+          body: { id: cheapest.id },
+          response: null,
+          paid: true,
+          cost: `${RESOURCE_RUBY} x${cheapest.realPrice}`,
+          note: `购买商品 ${cheapest.id}`,
+        }],
       };
     },
   },
@@ -437,6 +449,13 @@ async function sendAction(client, protocol, action, timeout) {
   return null;
 }
 
+// 一个驱动是不是「要花钻石」：优先看驱动自己标的 status / 动作上的 paid 标记，
+// 再兜一层 cost 文案（防以后新驱动忘了标，也能被拦住）。三处任一命中就算付费。
+export function needsPaid(entry) {
+  if (entry?.status === 'paid') return true;
+  return (entry?.actions ?? []).some((action) => action?.paid === true || String(action?.cost ?? '').includes('钻石'));
+}
+
 // 有付费动作时必须显式开 allowPaid，否则默认只做免费的部分。
 //
 // claimRewards 走的是「收尾」：驱动动作发完服务端才更新完成数，所以这里重新问一次
@@ -447,7 +466,9 @@ export async function runDailies(client, protocol, survey, { allowMutate = false
   const results = [];
   for (const entry of survey.tasks) {
     if (!entry.actions?.length) continue;
-    if (entry.status === 'paid' && !allowPaid) {
+    // 门控按「动作」判，不只看 status：折扣店以前标的是 ready，漏掉了 allowPaid 这一关，
+    // 结果没开 --paid 也会花钻石买东西（见 1007 的注释与 docs/gameplay.md 第 8 节）。
+    if (needsPaid(entry) && !allowPaid) {
       results.push({ id: entry.task.id, skipped: true, reason: '需要付费，未开 allowPaid' });
       onStep?.({ id: entry.task.id, title: entry.task.title, skipped: true, reason: '需要付费' });
       continue;
@@ -524,8 +545,17 @@ export async function claimDailies(client, protocol, { config = null, timeout = 
         await sendAction(client, protocol, action, timeout);
         const after = await client.request('DailyGiftPackRequest', {}, 'DailyGiftPackResponse', timeout);
         const ok = (after.drawnPack ?? []).includes(FREE_DAILY_PACK_ID);
-        report({ id: 'freeDailyPack', title: '每日免费赠礼', request: action.request, note: action.note, ok, body: ok ? null : { drawnPack: after.drawnPack } });
-        if (!ok) report({ id: 'freeDailyPack', title: '每日免费赠礼', request: action.request, note: action.note, ok: false, error: '服务端没有把它记进 drawnPack' });
+        // 一次动作只报一条结果：以前失败时先报一条无 error 的、再报一条带 error 的，
+        // 日志与「失败 N 条」的统计都会把同一个请求数成两次。
+        report({
+          id: 'freeDailyPack',
+          title: '每日免费赠礼',
+          request: action.request,
+          note: action.note,
+          ok,
+          body: ok ? null : { drawnPack: after.drawnPack },
+          ...(ok ? {} : { error: '服务端没有把它记进 drawnPack' }),
+        });
       } catch (error) {
         report({ id: 'freeDailyPack', title: '每日免费赠礼', request: action.request, note: action.note, ok: false, error: error.message });
       }

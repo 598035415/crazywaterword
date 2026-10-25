@@ -498,6 +498,9 @@ export function planWorld(survey, {
         request: 'PickUpFloaterRequest',
         response: 'PickUpFloaterResponse',
         body: { floaterId: ids },
+        // transient：这条的 stepKey 里没有 buildingId/index，退化成常量 'pickUpFloater:'。
+        // 不标的话，一次「floater 已过期」的 prompt 会让 picked 集合记住它，整个挂机会话都不再拾荒。
+        transient: true,
         label: `拾荒 ${ids.length} 件漂浮物`,
       });
     }
@@ -590,8 +593,23 @@ export function planWorld(survey, {
     builds.push({ building: b, row, consume });
   }
   builds.sort((a, b) => a.row.playerLevel - b.row.playerLevel || a.building.buildingId.localeCompare(b.building.buildingId));
-  for (const u of builds.slice(0, maxBuilds)) {
+  // 额度与库存都要在**这里**再核一次：候选是上面一次性扫出来的，每条看到的 free() 都是同一份快照。
+  // 线上 level 1 那 49 条 consume 目前全是空的（建造不耗材料），所以现在恒过；
+  // 一旦版本更新给建造加了消耗，同类型多座会在同轮里抢同一批材料 —— 后一条必被服务端拒，
+  // 而 build 不是 transient，被拒的 buildingId 会被 rejected 带到整场挂机结束。
+  let built = 0;
+  for (const u of builds) {
+    if (built >= maxBuilds) {
+      notes.push(`${u.building.buildingId} 本轮建造额度用完，下一轮再建`);
+      continue;
+    }
+    const short = u.consume.find((c) => free(c.id) < c.num);
+    if (short) {
+      notes.push(`${u.building.buildingId} 建造材料被本轮其它动作占用（${short.id} ${free(short.id)}/${short.num}），下一轮再建`);
+      continue;
+    }
     for (const c of u.consume) reserve(c.id, c.num);
+    built += 1;
     actions.push({
       kind: 'build',
       request: 'BuildBuildingRequest',
@@ -600,7 +618,6 @@ export function planWorld(survey, {
       label: `建造 ${u.building.buildingId}（需等级 ${u.row.playerLevel}）`,
     });
   }
-  for (const u of builds.slice(maxBuilds)) notes.push(`${u.building.buildingId} 本轮建造额度用完，下一轮再建`);
 
   // 4. 交居民订单：材料齐就交；不齐先试着用自选包补，补不上再按开关决定要不要拒绝重刷。
   for (const order of survey.orders) {
@@ -754,6 +771,9 @@ export function planWorld(survey, {
         request: 'FarmHarvestRequest',
         response: null,
         body: { buildingId: ripe.map((b) => b.buildingId) },
+        // transient：body 里没有 buildingId 单值/index，stepKey 退化成常量 'farmHarvest:'。
+        // 「这一块刚好被别人收过」是瞬时状态，记住它等于整场挂机不再收农田。
+        transient: true,
         // 农田的「数量」是地块数不是作物件数（收获件数要乘 FarmlandPlantCfg.produceNum，
         // 而协议回包是空的、拿不到实际入库量），所以单位标成「块」，别让人以为是 4 个小麦。
         items: ripe.map((b) => [b.farm.productId, 1]),
@@ -802,6 +822,9 @@ export function planWorld(survey, {
           request: 'FarmPlantRequest',
           response: null,
           body: { args },
+          // transient：同 farmHarvest —— 常量 key，一次「种子不足/地块状态变了」的 prompt
+          // 会让播种在本进程内永久停掉。下一轮探测会重新判种子，重试是安全的。
+          transient: true,
           // 同上：单位是地块数（args 一个元素 = 一块地）。
           items: args.map((a) => [a.productId, 1]),
           unit: '块',
@@ -834,9 +857,22 @@ export function planWorld(survey, {
     upgrades.push({ building: b, row, consume, costTime: row.costTime ?? 0 });
   }
   upgrades.sort((a, b) => a.row.curPeople - b.row.curPeople || a.costTime - b.costTime);
-  const picked = upgrades.slice(0, maxUpgrades);
-  for (const u of picked) {
+  // 同建造：升级候选也是一次性扫出来的，而 level>=2 的行**全都有消耗**，
+  // 同类型多座（民居、仓库…）时两条候选看到的 free() 完全相同 —— 必须边发边核销，
+  // 否则第二条必被服务端拒，且 upgrade 不是 transient，那座建筑整场挂机都不会再升。
+  let upgraded = 0;
+  for (const u of upgrades) {
+    if (upgraded >= maxUpgrades) {
+      notes.push(`${u.building.buildingId} 本轮升级额度用完，下一轮再升`);
+      continue;
+    }
+    const short = u.consume.find((c) => free(c.id) < c.num);
+    if (short) {
+      notes.push(`${u.building.buildingId} 升级材料被本轮其它动作占用（${short.id} ${free(short.id)}/${short.num}），下一轮再升`);
+      continue;
+    }
     for (const c of u.consume) reserve(c.id, c.num);
+    upgraded += 1;
     actions.push({
       kind: 'upgrade',
       request: 'UpgradeBuildingRequest',
@@ -845,8 +881,6 @@ export function planWorld(survey, {
       label: `升级 ${u.building.buildingId} ${u.building.level}->${u.building.level + 1}（${u.costTime}s，人口 ${u.row.curPeople}）`,
     });
   }
-  const held = upgrades.slice(maxUpgrades);
-  for (const u of held) notes.push(`${u.building.buildingId} 本轮升级额度用完，下一轮再升`);
 
   // 7. 加速：只花「加速器」，而且只对真的在等的建造/生产用。
   //    每个数量都过 Number.isFinite，宁可这次不加速，也别把 NaN 当数量发出去。
