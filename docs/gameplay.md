@@ -835,7 +835,7 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 挂机里是第 4 阶段（放在海面之后，直接复用 `worldSurvey.stock`，省一次 `AllItemRequest`），
 `idleEnabled` / `idleEveryMs` 默认 **300 秒**：收益 8 小时封顶、等级奖励按级一次，都是小时级节奏。
 
-### 12.11 搁浅的货轮（世界宝藏）：只抢无人占领的，一次压一个
+### 12.11 搁浅的货轮（世界宝藏）：等级多选，被占着的也派，一次压一个
 
 游戏里叫「世界宝藏」（`moduleId = 世界宝藏`，`dispName = 搁浅的货轮`，2026-10-25 起玩家 19 级开放）。
 `src/treasure.mjs`，循环里第 5 阶段（`treasureEnabled` / `treasureEveryMs`，默认 **60 秒**）。
@@ -856,10 +856,25 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 `color 4` 是「紫装材料自选包」，`color 5` 是「橙装材料自选包」。代码里按 `color - 2` 反查表，
 不硬编码名字（配置表改名不用动代码；查不到就降级成「货轮（品质 N）」而不是丢掉）。
 
-**只抢 `ownerGuildIdx = 0` 的原因**：`TreasureLootInstance.battlePoint` 里只有
-`rightFighter.{name, avatar, isNpc, guildIdx, skinId}` —— **没有战力字段**。
-抢别人占着的货轮要先打赢守军，拿不到对手战力就等于闭着眼派船，输了掉舰船耐久（维修 6 汽油/点）。
-己方联盟已经在打也不用加：那边的舰队数够了，进度是共同推进的。
+**等级是多选的**（2026-10-26 按用户要求改）：页面上「抢哪些」勾 小型 / 中型 / 万吨，对应协议 `color` 3/4/5，
+`DEFAULT_COLORS = [5]` 即**默认只抢万吨（大货轮）**。`colorsOf()` 负责归一：不传 → 默认值；显式空数组 → 空
+（三个全不勾 = 一个都不抢，**不能**悄悄回退成默认，否则用户「全取消」会变成「仍抢万吨」）；
+只认 `>= 3` 的整数，脏值丢掉。
+
+**已经有人占领的也照派**（同一天按用户要求改，原本只抢 `ownerGuildIdx === 0`）：`ownerGuildIdx != 0`
+只说明「被某个联盟占着」，而协议只给联盟编号、拿不到自己的 `guildIdx` —— 自家联盟在推的货轮同样是这个值；
+而且整点刷新后几十秒就可能被别人占光，干等着等于当天空手。派过去要先打赢守军才算数
+（`TreasureLootInstance.battlePoint.rightFighter` 里**没有战力字段**，只有 name / avatar / isNpc / guildIdx / skinId），
+输赢只能看战报（进邮件，由 12.10 的挂机领取一并收）。代价是输了掉舰船耐久（维修 6 汽油/点），
+所以**同一等级里无人占领的排在前面**先派。
+
+**优先级 = 等级（万吨 > 中型 > 小型）→ 同等级里 无人占领(0) → 我方在推(1) → 别人占着(2) → 物品件数 → 资源 → uid**。
+等级排在「有没有人占」前面是刻意的：让「无人占领的中型」盖过「被占的万吨」，就变成宁愿捡小的也不去抢大的，
+与需求相反（`selftest` 有断言锁这条）。
+
+**名额按我方舰队数算**：`slotsLeft = 10 − 我方在该货轮上的舰队数`（`MyFleet.treasureLootUid` 反查）。
+不能用 `10 − ownerFleetNum`：那是**占领方联盟**的船数，可能是别人的 —— 别人占满 10 支时会把我们算成 0 支，
+永远不派（这正是「只抢无人占领」年代留下的隐患）。
 
 **舰队判据照抄客户端**：`state === 1`（`FleetState.IDLE`）且 `treasureLootUid === 0`。
 `MyFleet.treasureLootUid` 是 field 19 int32，为 0 时 protobuf 不编码、字段直接不出现 ——
@@ -873,7 +888,7 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 
 **排序不能用总件数**：`reward.asset` 里 `type 0` = 物品、`type 1` = 资源。抓包实测有
 「GOLD×8300」的金币货轮，按总件数排会永远排第一 —— 跟 12.8 里「带 GOLD 3700 的打捞宝箱把分数拉得虚高」
-是同一个坑。`rewardScore` 返回 `{items, resources}`，排序是 品质 → items → resources → uid，
+是同一个坑。`rewardScore` 返回 `{items, resources}`，排序是 等级 → 占领状态 → items → resources → uid，
 资源只做同分时的次级比较。
 
 **没有领取请求**：协议里只有 List / SendFleets / Defence / Rank / Stats，结算奖励由服务端自动发
@@ -943,6 +958,66 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 **看到的那个状态也顺手修了**：`[被联盟 3 占]` 在自家舰队已经在推的时候也会出现 ——
 协议只给联盟**编号**，我们拿不到自己的 `guildIdx`，所以改用舰队上的 `treasureLootUid` 反查：
 `我方在途`（还在航行，货轮 `ownerGuildIdx` 仍是 0）/ `我方在占`（已到达，进度在涨）。
+2026-10-26 起状态文案补了三种：`可抢（无人占领）` / `可抢（要先打赢联盟 N 的 M 支守军）` /
+`等级没勾（只抢 …）` / `我方已占满 10 支`，每轮概览多一段 `抢 万吨货轮` 便于核对当前配置。
+
+### 12.12 海兽培育室：收成熟的 + 队列空位排产
+
+2026-10-26 补的第 8 个自动模块（`src/pet.mjs`，循环里的 `petEnabled` / `petEveryMs`）。
+游戏里 UI 叫「海兽培育室」，**配置表里的 `buildingType` 是「宠物培育室」** —— 按 UI 名去找建筑会一个都匹配不上。
+
+| 事实 | 出处 |
+|---|---|
+| 培育室是普通水上建筑，`BuildingCfg` 有 6 条宠物类：`宠物` / `宠物B` / `宠物C` / `宠物战备室` / `宠物训练营` / `宠物培育室`（`name` = 海兽培育室，`resPath` = building/PetCultivationRoom） | 本地配置表 `BuildingCfg` |
+| 培育状态挂在 **`DispWaterBuilding.petBreed`**：`{ breedQ: DispPetBreedJob[], maturePets: MaturePet[], maxQLength }` | `tools/describe.mjs` 扫全表引用：只有 `DispWaterBuilding` 引用了 `PetBreedBuildingInfo` |
+| 队列位数以**服务端给的 `maxQLength`** 为准；客户端显示用 `min(level+1, maxBuildLevel)`，并不可靠 | `PetBreedView.open` 的 `_lst_queue.numItems`，以及 `OnWaterResponse` 里每个建筑都带 `petBreed`（没建成的 `maxQLength=0`） |
+| 培育出来的星级由 `PetBreedLevelCfg` 的概率表按培育室等级掷 | `PetBreedLevelCfg`：50 行，`level` / `breedExp` / 每个品质一条 10000 分制权重数组（逐项语义未实测，只当展示用） |
+
+**请求**（客户端 `PetBreedView` 的按钮回调里一条条抠出来的）：
+
+| 动作 | 请求 | 回包 | 客户端判据 |
+|---|---|---|---|
+| 培育一只 | `PetBreedRequest { petId, universal }` | **无**，结果靠 `SCUpdateWaterBuilding` 推送 | `_onBtnBreed`：该队列位为空 + 基因够（`_isLackFrag`）+ 金币够（`isAssetsEnough([cost[1]], true)`） |
+| 收成熟 | `GetMaturePetRequest {}` | **无** | `_onBtnReward`：`maturePets.length != 0` 才发，一次全领 |
+| 喂食加速 | `PetFeedRequest { jobIdx }` | **无** | `_onBtnFood`：`feedRequirements` 够就喂 —— **本项目不做**，见下 |
+| 升级培育室 | （走建筑升级那套） | | `_onBtnLevelUp` → `toUpgradeBuilding` —— 不做，跟其它建筑一样需要用户自己决定 |
+
+`universal` 是客户端的 `_isAutoExchange`（缺口用「万能基因」补），跟 `MakeEquipRequest.universal` 同一个意思，
+**恒发 false** —— 不拿通用材料去补专用材料。
+
+**配方 `PetBreedCfg`**：6 物种 × 4 品质 = 24 行，`petId` 形如「橙宠物3」，`cost = [[基因, 数量], ["GOLD", 金币]]`：
+
+| 品质 | 时长 | 成本 | 备注 |
+|---|---|---|---|
+| 蓝 | 4 小时 | 80 基因 + 4000 金 | |
+| 紫 | 12 小时 | 400 基因 + 20000 金 | |
+| 橙 | 36 小时 | 800 基因 + 250000 金 | |
+| 红 | 72 小时 | 1200 基因 + 1000000 金 | 标 `season: 2`，常态打不开 |
+
+基因是**该物种专属**的（「宠物3蓝基因」只用于宠物3），攒着没有任何别的用途，所以「有就排」不会浪费。
+物种 5 / 6 标 `season: 4/5`，用材料自然过滤（没开赛季就拿不到那些基因）。
+
+**排产策略**（`planPet`）：
+
+1. 有 `maturePets` 先领 —— 整轮只放**一条** `GetMaturePetRequest`（它是空体、一次领全部，不分建筑）；
+2. 每座培育室按 `maxQLength - breedQ.length` 算空位，空几个排几个；
+3. 空位里挑配方：品质从高到低（受 `maxQuality` 上限约束，**默认橙**），同品质按 `spId` 升序；
+4. 选中的配方**就地扣减**共享余额表，跨培育室不会把同一批基因算两遍；同一批里同一个 `petId` 只排一次。
+
+`items` 用「品质+物种名」（如「橙声波海豚」）而不是 `petId`，日志里能直接读。
+动作 `key` 带序号（`petBreed:<建筑>:<petId>:<序号>`）—— 一次排满多个空位时，如果不带序号，
+后面几条会被第一条的失败记录整片挡住。
+
+**两条安全边界**：
+
+- **不做 `PetFeedRequest`**：它按 `jobIdx` 消耗该队列位的 `feedRequirements` 换时间，材料是什么、
+  值不值，得看真实队列才能判断。在确认它不碰通用材料之前，自动喂食就是拿账号库存去赌。
+  真要做的话，判据照抄 `_onBtnFood` 的 `isAssetsEnough(feedRequirements, false)`。
+- **不加速、不动钻石**：没有对应的免费加速请求。
+
+挂机里是第 8 阶段（在锻造之后，复用 `worldSurvey.buildings` / `worldSurvey.stock`，**零额外请求**），
+`petEveryMs` 默认 **300 秒**（蓝配方 4 小时、橙 36 小时，看太勤没意义）。计时语义同情报：
+**探测成功就计时**。
 
 ## 13. 账号、素材与网页控制台
 

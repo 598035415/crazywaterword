@@ -1,8 +1,8 @@
 // 自动循环：每轮依次跑 任务领取 → 日常（含任务奖励与活跃度宝箱） → 海面（收成品/竣工/建造/交单/排产/升级）
-// → 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级） → 搁浅的货轮（抢无人占领的货轮）
-// → 联盟情报（领奖 + 派舰队） → 装备厂（收装备 + 锻造）。
+// → 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级） → 搁浅的货轮（按勾选等级抢货轮，默认只抢万吨）
+// → 联盟情报（领奖 + 派舰队） → 装备厂（收装备 + 锻造） → 海兽培育室（收成熟 + 排空位）。
 //
-// 拾荒 / 农田 / 货轮 / 情报 / 锻造 / 挂机领取 各自有独立间隔（gateDue）：自动循环每轮都会看一眼，
+// 拾荒 / 农田 / 货轮 / 情报 / 锻造 / 挂机领取 / 培育 各自有独立间隔（gateDue）：自动循环每轮都会看一眼，
 // 只有「距上次执行」超过自己的间隔才真的跑一次，其余轮次整段跳过（连探测请求都不发）。
 //
 // 货轮排在情报**前面**是刻意的：两边抢的是同一份资源 —— 空闲舰队。
@@ -18,6 +18,7 @@ import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
 import { surveyRadar, viewRadar, planRadar, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
+import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
 import {
   surveyTreasure,
@@ -25,7 +26,8 @@ import {
   planTreasure,
   formatTreasureSummary,
   DEFAULT_MAX_FLEETS,
-  DEFAULT_MIN_COLOR,
+  DEFAULT_COLORS,
+  colorsOf,
 } from './treasure.mjs';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -106,6 +108,13 @@ export async function runLoop(client, protocol, {
   // 它比农田更值得勤看：同一时间只能造一件，造好不收等于整座工厂停产。
   forgeEnabled = true,
   forgeEveryMs = 180_000,
+  // 海兽培育室：收成熟的 + 队列空位排新的一批。最短的蓝配方也要 4 小时，橙 36 小时，
+  // 所以 5 分钟看一次足够；它跟锻造一样「队列空着就是白亏」，值得按自己的节奏勤看。
+  petEnabled = true,
+  petEveryMs = 300_000,
+  // 品质上限（RED / ORANGE / PURPLE / BLUE，默认橙）：红配方标 season 2 且要 100 万金币，
+  // 常态打不开；要给金币留余地就往下调。
+  petMaxQuality = 'ORANGE',
   // 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励/升级。三件都免费、不发就白放着，
   // 但节奏是「小时级」的（收益 8 小时封顶、等级奖励是按级一次），所以 5 分钟看一次足够，
   // 不必每轮都多打 3 个请求（AfkInfo + EmailBox + 库存复用）。
@@ -117,8 +126,9 @@ export async function runLoop(client, protocol, {
   treasureEveryMs = 60_000,
   // 一次最多派几支舰队抢同一个货轮；同联盟最多 10 支能占同一个，3 支已经够把小型推完。
   treasureMaxFleets = DEFAULT_MAX_FLEETS,
-  // 最低品质：3 蓝(小型) / 4 紫(中型) / 5 橙(万吨)。默认 3 = 能抢就抢，先把 3 次名额拿满。
-  treasureMinColor = DEFAULT_MIN_COLOR,
+  // 抢哪些等级（协议 color，多选）：3 蓝(小型) / 4 紫(中型) / 5 橙(万吨)。默认只抢万吨。
+  // 空数组 = 一个都不抢（页面上把三个全取消勾选时的语义，不是"回退默认"）。
+  treasureColors = DEFAULT_COLORS,
   minPowerRatio = DEFAULT_MIN_POWER_RATIO,
   sleep = defaultSleep,
   stop = { aborted: false },
@@ -126,7 +136,7 @@ export async function runLoop(client, protocol, {
   onStep,
 } = {}) {
   if (!allowMutate) throw new Error('循环会持续改变账号状态，需要 --yes');
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), forge: new Set(), idle: new Set(), treasure: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -138,6 +148,8 @@ export async function runLoop(client, protocol, {
   let lastRadarAt = 0;
   // 锻造同理：探测是一整套「读装备厂 → 收取 → 排产」，探测成功就计时。
   let lastForgeAt = 0;
+  // 培育同理：探测成功就计时（哪怕这一轮没有空位、也没有成熟的）。
+  let lastPetAt = 0;
   // 挂机领取同理：探测成功就计时（哪怕这一轮没有可领的）。
   let lastIdleAt = 0;
   // 货轮同理：探测成功就计时（哪怕这一轮没有可抢的）。
@@ -150,7 +162,7 @@ export async function runLoop(client, protocol, {
   for (let round = 1; round <= total; round += 1) {
     if (stop.aborted) break;
     const tickAt = Date.now();
-    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, idle: null, treasure: null, radar: null, forge: null };
+    const summary = { round, startedAt: Math.floor(tickAt / 1000), tasks: null, dailies: null, world: null, idle: null, treasure: null, radar: null, forge: null, pet: null };
 
     // 1. 任务奖励
     summary.tasks = { planned: 0, results: [], notes: [] };
@@ -251,7 +263,8 @@ export async function runLoop(client, protocol, {
       }
     }
 
-    // 5. 搁浅的货轮（世界宝藏）：只抢「无人占领」的货轮，一条请求把选中的空闲舰队全压上去。
+    // 5. 搁浅的货轮（世界宝藏）：按勾选的等级挑货轮（默认只抢万吨），
+    //    一条请求把选中的空闲舰队全压上去。无人占领的优先，被占着的也派（打守军换我们占）。
     //    必须在情报之前 —— 情报是「有多少空闲船就派多少」，放在前面会把船抢光，
     //    货轮就永远排不上（整点刷新错过就没了，情报事件挂 6 小时还在）。
     //    复用 world 那一段的库存（汽油），所以这一轮只多 Stats + List + MyFleets 三个只读请求。
@@ -262,11 +275,10 @@ export async function runLoop(client, protocol, {
         const treasureSurvey = await surveyTreasure(client, protocol, { config, player, stock: worldSurvey.stock });
         const treasureView = viewTreasure(treasureSurvey, {
           config,
-          minColor: treasureMinColor,
+          colors: colorsOf(treasureColors),
           maxFleets: treasureMaxFleets,
         });
         const treasurePlan = planTreasure(treasureView, {
-          minColor: treasureMinColor,
           maxFleets: treasureMaxFleets,
         });
         summary.treasure.planned = treasurePlan.actions.length;
@@ -360,6 +372,38 @@ export async function runLoop(client, protocol, {
       }
     }
 
+    // 8. 海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满。
+    //    复用 world 那一轮拉到的建筑与库存（含 GOLD），这轮零额外请求。
+    const petDue = petEnabled && gateDue(lastPetAt, petEveryMs, tickAt);
+    summary.pet = { planned: 0, notes: [], results: [] };
+    if (petDue) {
+      try {
+        const petSurvey = await surveyPet(client, protocol, {
+          config,
+          stock: worldSurvey.stock,
+          buildings: worldSurvey.buildings,
+        });
+        const petPlan = planPet(petSurvey, { config, maxQuality: petMaxQuality });
+        summary.pet.planned = petPlan.actions.length;
+        summary.pet.notes = petPlan.notes;
+        summary.pet.summary = formatPetSummary(petSurvey);
+        if (petPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, petPlan, {
+            allowMutate,
+            rejected: rejected.pet,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'pet', ...entry }),
+          });
+          rejected.pet = stillRejected;
+          summary.pet.results = results;
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastPetAt = tickAt;
+      } catch (error) {
+        summary.pet.notes = [`培育探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -371,6 +415,7 @@ export async function runLoop(client, protocol, {
       treasure: { ...gateSummary(treasureEnabled, treasureEveryMs, lastTreasureAt, tickAt), throttled: treasureEnabled && !treasureDue },
       radar: { ...gateSummary(radarEnabled, radarEveryMs, lastRadarAt, tickAt), throttled: radarEnabled && !radarDue },
       forge: { ...gateSummary(forgeEnabled, forgeEveryMs, lastForgeAt, tickAt), throttled: forgeEnabled && !forgeDue },
+      pet: { ...gateSummary(petEnabled, petEveryMs, lastPetAt, tickAt), throttled: petEnabled && !petDue },
     };
 
     history.push(summary);
@@ -397,6 +442,8 @@ const KIND_TEXT = {
   treasureDispatch: '抢货轮',
   equipPick: '收装备',
   equipMake: '锻造',
+  petPick: '收海兽',
+  petBreed: '培育海兽',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -510,10 +557,17 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.forge),
         ...(summary.forge.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 培育同理：探测过就印一行（哪怕是「队列满，最近一只还剩 20 小时」）。
+    ...(summary.pet && (summary.pet.summary || (summary.pet.notes ?? []).length > 0)
+      ? [`${line('海兽培育', summary.pet)}${summary.pet.summary ? `  ${summary.pet.summary}` : ''}`,
+        ...detailLines(summary.pet),
+        ...(summary.pet.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...(floater ? [`  ${floater}`] : []),
     ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
     ...[gateLine('锻造', summary.gates?.forge)].filter(Boolean),
+    ...[gateLine('海兽培育', summary.gates?.pet)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),

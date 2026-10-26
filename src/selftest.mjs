@@ -1392,6 +1392,105 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满。
+// 三条判据都照客户端 PetBreedView._onBtnBreed：队列位为空 + 基因够 + 金币够。
+{
+  const { planPet, pickRecipes, breedBuildingsOf, recipesOf } = await import('./pet.mjs');
+  const config = { tables: {
+    PetSpeciesCfg: { data: [{ spId: 1, name: '声波海豚' }, { spId: 2, name: '铁炮鲨鱼' }] },
+    PetBreedCfg: { data: [
+      { petId: '蓝宠物1', spId: 1, quality: 'BLUE', qualityIndex: 1, breedTime: 14400, season: 1, cost: [['宠物1蓝基因', 80], ['GOLD', 4000]] },
+      { petId: '紫宠物1', spId: 1, quality: 'PURPLE', qualityIndex: 2, breedTime: 43200, season: 1, cost: [['宠物1紫基因', 400], ['GOLD', 20000]] },
+      { petId: '橙宠物1', spId: 1, quality: 'ORANGE', qualityIndex: 3, breedTime: 129600, season: 1, cost: [['宠物1橙基因', 800], ['GOLD', 250000]] },
+      { petId: '蓝宠物2', spId: 2, quality: 'BLUE', qualityIndex: 1, breedTime: 14400, season: 1, cost: [['宠物2蓝基因', 80], ['GOLD', 4000]] },
+      { petId: '红宠物1', spId: 1, quality: 'RED', qualityIndex: 4, breedTime: 259200, season: 2, cost: [['宠物1红基因', 1200], ['GOLD', 1000000]] },
+    ] },
+    BuildingCfg: { data: [{ buildingType: '宠物培育室' }, { buildingType: '装备厂' }] },
+  } };
+  const recipes = recipesOf(config);
+  const building = (over = {}) => ({ buildingId: '1宠物培育室', level: 2, maxQ: 2, jobs: [], mature: [], ...over });
+  const surveyFor = (over = {}) => ({
+    now: 1000,
+    buildings: [building()],
+    recipes,
+    mature: [],
+    jobs: [],
+    maxQ: 2,
+    stock: new Map([
+      ['宠物1蓝基因', 800], ['宠物1紫基因', 400], ['宠物2蓝基因', 800],
+      ['宠物1橙基因', 800], ['宠物1红基因', 1200], ['GOLD', 100_000],
+    ]),
+    config,
+    ...over,
+  });
+
+  // 没有培育室（新号还没造）时不能乱发请求。
+  const none = planPet({ buildings: [], recipes, mature: [], jobs: [], maxQ: 0, stock: new Map() }, { config });
+  assert.equal(none.actions.length, 0, '没有培育室就不排产');
+  assert.ok(none.notes.some((note) => note.includes('宠物培育室')), '要说清缺的是什么建筑');
+
+  // maxQLength=0 = 队列还没开（建筑没建成），这时排产必然被拒，所以只写原因。
+  const locked = planPet(surveyFor({ buildings: [building({ maxQ: 0, level: 0 })], maxQ: 0 }), { config });
+  assert.equal(locked.actions.length, 0, '队列没开就不发培育请求');
+  assert.ok(locked.notes.some((note) => note.includes('maxQLength=0')), '要说明是队列没开');
+
+  // 成熟的先领：GetMaturePetRequest 没有 body，一次领全部。
+  const mature = planPet(surveyFor({
+    mature: [{ petId: '蓝宠物1', star: 2, buildingId: '1宠物培育室' }],
+  }), { config });
+  const pick = mature.actions.find((action) => action.kind === 'petPick');
+  assert.ok(pick, '有成熟海兽就要收');
+  assert.equal(pick.request, 'GetMaturePetRequest');
+  assert.equal(pick.response, null, '领取没有配套回包，走 sendWatch');
+  assert.deepEqual(pick.body, {}, '空体请求：一次领走全部成熟海兽');
+  assert.equal(pick.items[0][0], '蓝声波海豚', 'items 用中文名，日志里能直接读');
+
+  // 队列空位排产：品质从高到低。金币 10 万 → 橙要 25 万排不了，紫够 → 排紫。
+  const breed = planPet(surveyFor(), { config });
+  const made = breed.actions.filter((action) => action.kind === 'petBreed');
+  assert.equal(made.length, 2, 'maxQ=2 且材料够 → 一次排满两个空位');
+  assert.equal(made[0].body.petId, '紫宠物1', '有紫基因就先排紫（品质从高到低）');
+  assert.equal(made[0].body.universal, false, '不自动用万能基因兑换（universal 恒 false）');
+  assert.equal(made[0].request, 'PetBreedRequest');
+  assert.equal(made[0].response, null, '培育没有配套回包，走 sendWatch');
+  assert.notEqual(made[0].key, made[1].key, '同一批多条动作的 key 不能退化成同一个');
+  assert.equal(made[1].body.petId, '蓝宠物1', '第二个空位排下一个够材料的（同品质按 spId 升序）');
+
+  // 品质上限把红挡在外面：红要 season 2 + 100 万金币，默认不碰。
+  const richStock = () => new Map([['宠物1橙基因', 800], ['宠物1红基因', 1200], ['GOLD', 2_500_000]]);
+  const capped = pickRecipes(config, { stock: richStock(), limit: 1 });
+  assert.equal(capped[0].petId, '橙宠物1', '默认上限是橙，红不排');
+  const redAllowed = pickRecipes(config, { stock: richStock(), limit: 1, maxQuality: 'RED' });
+  assert.equal(redAllowed[0].petId, '红宠物1', '显式放开上限才会排红');
+
+  // 扣减要生效：同一批里不能把同一批基因算两遍（800 蓝基因只够 10 个蓝，但金币只够 1 个紫）。
+  const tight = pickRecipes(config, {
+    stock: new Map([['宠物1紫基因', 400], ['宠物1蓝基因', 100], ['GOLD', 20_000]]),
+    limit: 2,
+  });
+  assert.equal(tight.length, 1, '紫排完之后金币见底，第二个空位排不了');
+  assert.equal(tight[0].petId, '紫宠物1');
+
+  // 队列满 + 已排队的不重复排。
+  const full = planPet(surveyFor({
+    buildings: [building({ maxQ: 1, jobs: [{ idx: 1, petId: '蓝宠物2', star: 0, finishTime: 9999, remainSeconds: 8999, done: false, feed: [] }] })],
+    jobs: [{ idx: 1, petId: '蓝宠物2', star: 0, finishTime: 9999, remainSeconds: 8999, buildingId: '1宠物培育室' }],
+    maxQ: 1,
+  }), { config });
+  assert.equal(full.actions.length, 0, '队列满就不排');
+  assert.ok(full.notes.some((note) => note.includes('队列满')), '要说清是队列满不是材料不够');
+
+  // 建筑识别：只有「宠物培育室」算培育室，装备厂和其它建筑都不算。
+  const picked = breedBuildingsOf([
+    { buildingId: '1装备厂', type: '装备厂', level: 3, petBreed: { breedQ: [], maturePets: [], maxQLength: 0 } },
+    { buildingId: '1宠物培育室', type: '宠物培育室', level: 2, petBreed: { breedQ: [], maturePets: [{ petId: '蓝宠物1', star: 1 }], maxQLength: 3 } },
+  ], config, { now: 1000 });
+  assert.equal(picked.length, 1, '只挑培育室');
+  assert.equal(picked[0].maxQ, 3, 'maxQLength 以服务端给的为准，不按等级猜');
+  assert.deepEqual(picked[0].mature, [{ petId: '蓝宠物1', star: 1 }]);
+  checked += 1;
+}
+
 // 材料不齐时用自选包兜底：SelectPackRequest 的 num 是「要换到的数量」，
 // 兑换动作必须排在用到它的动作之前，且不能把包一次性烧光。
 {
@@ -2463,6 +2562,30 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(fs.existsSync(`${file}.1`), true, '超过上限要轮转，不能让单个日志无限涨');
   assert.equal(fs.readFileSync(file, 'utf8'), 'cccc\n', '轮转后新文件从头写');
   assert.equal(fs.readFileSync(`${file}.1`, 'utf8'), 'a\nb\n', '旧内容整段留在 .1');
+
+  // 网页运行记录（人话日志）：以前只存在内存的 400 条里，刷新或重启就没了。
+  // 现在一条一行落到 data/console/<本地日期>.log，格式要和 protocol.log 对得上。
+  assert.equal(archive.consoleLogPath(noon), path.join(archive.CONSOLE_ROOT, '2026-10-23.log'), '运行记录同样按本地日期切文件');
+  const oneLine = archive.formatConsoleLine({ t: noon, level: 'warn', message: '心跳超时\n连接可能断了', account: 'c06ad6ea-1111-2222-3333', extra: { detail: 'x' } });
+  assert.equal(
+    oneLine,
+    `${stamp} [c06ad6ea] [warn] 心跳超时 ⏎ 连接可能断了 {"detail":"x"}`,
+    '一条日志必须落成一行：多行消息要折叠，账号只留前 8 位，跟 protocol.log 的 tag 一致',
+  );
+  assert.equal(
+    archive.formatConsoleLine({ t: noon, level: 'info', message: '已进入游戏' }),
+    `${stamp} [info] 已进入游戏`,
+    '没有账号和 extra 时不留多余空格',
+  );
+  const consoleFile = path.join(dir, 'console.log');
+  archive.appendConsole({ t: noon, level: 'info', message: '第一行' }, { file: consoleFile });
+  archive.appendConsole({ t: noon + 1000, level: 'error', message: '第二行', account: 'c06ad6ea' }, { file: consoleFile });
+  assert.equal(
+    fs.readFileSync(consoleFile, 'utf8'),
+    `${stamp} [info] 第一行\n${archive.stamp(noon + 1000)} [c06ad6ea] [error] 第二行\n`,
+    '同步追加：函数返回时两条都已经在磁盘上',
+  );
+  assert.ok(archive.listConsoleDays(dir).length === 0, 'listConsoleDays 只认 <日期>.log，临时文件名不该被当成日期');
   fs.rmSync(dir, { recursive: true, force: true });
   checked += 1;
 }
@@ -2602,12 +2725,13 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-// 搁浅的货轮（世界宝藏）：只抢「无人占领」的货轮，一天 3 次奖励封顶，一次压一个货轮。
-// 判据全部对齐客户端：ownerGuildIdx = 0 才抢、state IDLE 且 treasureLootUid = 0 才能派。
+// 搁浅的货轮（世界宝藏）：等级多选（默认只抢万吨），一天 3 次奖励封顶，一次压一个货轮。
+// 判据全部对齐客户端：state IDLE 且 treasureLootUid = 0 才能派；被占领的也派（排在无人后面）。
 {
   const {
     viewTreasure, planTreasure, qualityOf, dailyLimitOf, formatTreasureSummary,
     seasonWindowOf, seasonDaysOf, MAX_GUILD_FLEETS, SEASON_CLOSE_GUARD_SECONDS,
+    DEFAULT_COLORS, colorsOf, colorsText,
   } = await import('./treasure.mjs');
   const config = { tables: {
     TreasureLootCfg: { data: [
@@ -2625,6 +2749,16 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(qualityOf(config, 4).name, '中型货轮', 'color 4 → 中型货轮');
   assert.equal(qualityOf(config, 5).name, '万吨货轮', 'color 5 → 万吨货轮');
   assert.equal(qualityOf(config, 9).name, '货轮（品质 9）', '配置缺档时要降级，不能把货轮丢掉');
+  // 等级多选：默认只抢万吨（用户口里的「大货轮」），输入归一成升序去重。
+  assert.deepEqual(DEFAULT_COLORS, [5], '默认只抢万吨货轮');
+  assert.deepEqual(colorsOf(undefined), [5], '不传等级 → 默认只抢万吨');
+  assert.deepEqual(colorsOf([5, 3, 3, 4]), [3, 4, 5], '多选去重并按等级升序');
+  assert.deepEqual(colorsOf(4), [4], '单个数字也认');
+  assert.deepEqual(colorsOf([]), [], '显式空数组 = 一个都不抢（不能偷偷回退默认）');
+  assert.deepEqual(colorsOf([1, 2, 'x', null, 4.7]), [4], '脏值丢掉、小数取整');
+  assert.equal(colorsText(config, [5]), '万吨货轮', '文案取配置表名字');
+  assert.equal(colorsText(config, [3, 5]), '小型货轮、万吨货轮');
+  assert.equal(colorsText(config, []), '未选等级');
   // 上限以服务端为准（TreasureLootStatsResponse.totalRewardTimes），拿不到才回配置表。
   assert.equal(dailyLimitOf(config, { totalRewardTimes: 4 }), 4, '服务端给的上限优先');
   assert.equal(dailyLimitOf(config, null), 3, '服务端没给时回配置表');
@@ -2689,10 +2823,12 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   });
 
   // 基本盘：两个无人货轮 + 两艘空闲船 → 一条请求带两艘船，打品质最高的那个。
+  // 显式勾上三个等级（默认只勾万吨，这里要测「等级怎么挑」之外的逻辑）。
+  const ALL = { config, colors: [3, 4, 5] };
   const pick = viewTreasure(surveyFor({
     treasures: [treasure({ uid: 10 }), treasure({ uid: 11, color: 4, name: '中型货轮', itemScore: 200 })],
     fleets: [fleet({}), fleet({ buildingId: '2远征船', power: 400000 })],
-  }), { config });
+  }), ALL);
   const pickPlan = planTreasure(pick, {});
   assert.equal(pickPlan.actions.length, 1, '一次只排一个动作（一条请求带多艘船）');
   assert.equal(pickPlan.actions[0].request, 'TreasureLootSendFleetsRequest');
@@ -2700,20 +2836,85 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     '打品质最高的货轮，强船在前，uid 原样回传');
   assert.equal(pickPlan.actions[0].transient, true, '派兵失败多是瞬时状态，不能记进 rejected 永远跳过');
 
-  // 被别的联盟占着的不抢：battlePoint 里没有战力字段，判断不了能不能赢，赌输要掉耐久。
-  const occupied = viewTreasure(surveyFor({
-    treasures: [treasure({ uid: 20, ownerGuildIdx: 2, ownerFleetNum: 3, progress: 40 })],
+  // 默认配置（不传 colors）只抢万吨：列表里全是小型/中型时一个都不派，并说明是等级没勾。
+  const defaultOnly = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 12 }), treasure({ uid: 13, color: 4, name: '中型货轮', itemScore: 900 })],
     fleets: [fleet({})],
   }), { config });
-  assert.ok(occupied.targets.length === 0 && planTreasure(occupied, {}).actions.length === 0, '不去抢别人占着的货轮');
-  assert.ok(planTreasure(occupied, {}).notes.some((note) => note.includes('被别的联盟占着')), '要说清楚为什么没抢');
+  assert.equal(defaultOnly.targets.length, 0, '默认只抢万吨，小型/中型不碰');
+  assert.ok(planTreasure(defaultOnly, {}).notes.some((note) => note.includes('不是勾选的等级')),
+    `要说清楚是等级没勾，实际：${planTreasure(defaultOnly, {}).notes.join(' / ')}`);
+  // 有万吨时默认配置就只打万吨（哪怕中型物品更多）。
+  const defaultBig = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 14, itemScore: 900 }), treasure({ uid: 15, color: 5, name: '万吨货轮', itemScore: 90 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.deepEqual(defaultBig.targets.map((one) => one.uid), [15], '默认配置只有万吨进候选');
+  assert.ok(formatTreasureSummary(defaultBig).includes('抢 万吨货轮'), '概览要印当前抢哪些');
+
+  // 一个等级都不勾 = 明确不抢（不能悄悄回退成默认的万吨）。
+  const noneChosen = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 26, color: 5, name: '万吨货轮' })],
+    fleets: [fleet({})],
+  }), { config, colors: [] });
+  assert.equal(noneChosen.targets.length, 0, '等级全不勾就不派');
+  assert.ok(noneChosen.notes.some((note) => note.includes('都没勾')), '要说清楚是一个都没勾');
+  assert.equal(planTreasure(noneChosen, {}).actions.length, 0, '空选择不派任何船');
+
+  // 有人占领也派（2026-10-26 起）：**等级优先**，同等级里无人占领的先派。
+  // 等级排在「有没有人占」前面是刻意的：让"无人占领的中型"盖过"被占的万吨"就等于
+  // 「宁愿捡小的也不去抢大的」，与需求相反。
+  const occupied = viewTreasure(surveyFor({
+    treasures: [
+      treasure({ uid: 20, color: 5, name: '万吨货轮', ownerGuildIdx: 2, ownerFleetNum: 3, progress: 40 }),
+      treasure({ uid: 21, color: 5, name: '万吨货轮' }),
+      treasure({ uid: 27, color: 4, name: '中型货轮', itemScore: 900 }),
+    ],
+    fleets: [fleet({})],
+  }), ALL);
+  assert.equal(occupied.targets.length, 3, '无人占领 + 被占着的都算可抢');
+  assert.deepEqual(occupied.targets.map((one) => one.uid), [21, 20, 27], '等级优先，同等级里无人占领的在前');
+  assert.equal(planTreasure(occupied, {}).actions[0].body.uid, 21, '同等级优先进无人占领的');
+  const bigContested = viewTreasure(surveyFor({
+    treasures: [
+      treasure({ uid: 28, color: 5, name: '万吨货轮', ownerGuildIdx: 2, ownerFleetNum: 3 }),
+      treasure({ uid: 29, color: 4, name: '中型货轮', itemScore: 900 }),
+    ],
+    fleets: [fleet({})],
+  }), ALL);
+  assert.equal(planTreasure(bigContested, {}).actions[0].body.uid, 28, '被占的万吨优先于无人占领的中型');
+
+  // 只剩被占着的：照样派，label 里写明要打守军。
+  const contested = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 22, color: 5, name: '万吨货轮', ownerGuildIdx: 2, ownerFleetNum: 4, progress: 40 })],
+    fleets: [fleet({})],
+  }), { config });
+  const contestedPlan = planTreasure(contested, {});
+  assert.equal(contestedPlan.actions.length, 1, '被别人占着也派舰队');
+  assert.equal(contestedPlan.actions[0].body.uid, 22, 'uid 就是被占的那个');
+  assert.ok(contestedPlan.actions[0].label.includes('守军'),
+    `label 要写明打守军，实际：${contestedPlan.actions[0].label}`);
+
+  // 名额只能按**我方**舰队数算：ownerFleetNum 是占领方联盟的船数，别人占满 10 支不代表我们没名额。
+  const othersFull = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 23, color: 5, name: '万吨货轮', ownerGuildIdx: 3, ownerFleetNum: MAX_GUILD_FLEETS, progress: 30 })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(othersFull.targets[0].slotsLeft, MAX_GUILD_FLEETS, '别人占满 10 支仍算我方 10 个名额');
+  assert.equal(planTreasure(othersFull, {}).actions.length, 1, '别人占满也要派');
+  // 我方自己已经 10 支压在上面才该停手。
+  const weFull = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 24, color: 5, name: '万吨货轮', ownerGuildIdx: 3, progress: 30 })],
+    fleets: Array.from({ length: MAX_GUILD_FLEETS }, (_, index) => fleet({ buildingId: `${index + 1}远征船`, state: 2, treasureLootUid: 24 })),
+  }), { config });
+  assert.equal(weFull.targets.length, 0, '我方已占满 10 支就不再派');
 
   // 我方在抢的货轮要看得出来：treasureLootUid 在**航行途中就有值**（实测派兵后立刻回 uid，船还是 MOVING），
   // 所以「货轮列表里 ownerGuildIdx 还是 0」不代表没派 —— 只靠货轮列表会以为没派过，反复派同一批船。
   const ours = viewTreasure(surveyFor({
     treasures: [treasure({ uid: 25 })],
     fleets: [fleet({ state: 2, treasureLootUid: 25 }), fleet({ buildingId: '2远征船', state: 2, treasureLootUid: 25 })],
-  }), { config });
+  }), ALL);
   assert.equal(ours.treasures[0].ourFleets, 2, '按 treasureLootUid 数出我方在抢的舰队');
   assert.ok(formatTreasureSummary(ours).includes('我方 2 支在抢'), '概览要写明我方在抢');
 
@@ -2722,7 +2923,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     todayRewardTimes: 3,
     treasures: [treasure({ uid: 30 })],
     fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(full.dailyFull, true, 'todayRewardTimes >= 上限就是满');
   assert.equal(planTreasure(full, {}).actions.length, 0, '奖励次数满了不派');
   assert.ok(planTreasure(full, {}).notes.some((note) => note.includes('今日货轮奖励已满')), '要说清楚是次数满了');
@@ -2731,7 +2932,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const noStats = viewTreasure(surveyFor({
     statsAvailable: false, todayRewardTimes: null,
     treasures: [treasure({ uid: 31 })], fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(planTreasure(noStats, {}).actions.length, 0, '不知道次数上限就不派');
 
   // 活动过期就彻底停手 —— 这是给「活动下线后把整块删掉」留的闸门，日志必须说清楚。
@@ -2739,7 +2940,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     season: { season: 1, endAt: NOW - 7200, stopAt: NOW - 10800, source: 'server' },
     treasures: [treasure({ uid: 70 })],
     fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(expired.activity.expired, true, 'stopAt 已过就是过期');
   assert.equal(planTreasure(expired, {}).actions.length, 0, '活动过期不再派船');
   assert.ok(planTreasure(expired, {}).notes.some((note) => note.includes('活动已结束')), '要说清楚是活动结束了');
@@ -2751,7 +2952,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const live = viewTreasure(surveyFor({
     treasures: [treasure({ uid: 71 })],
     fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(live.activity.expired, false, '默认窗口是未来 30 天，不算过期');
   assert.ok(formatTreasureSummary(live).includes('有效至'), '正常时概览要印有效期');
   // 有效期为未知时不能因为「算不出来」就停掉功能。
@@ -2759,7 +2960,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     season: { season: 0, endAt: 0, stopAt: 0, source: null },
     treasures: [treasure({ uid: 72 })],
     fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(unknownSeason.activity.unknown, true, '算不出有效期');
   assert.equal(planTreasure(unknownSeason, {}).actions.length, 1, '算不出有效期时照常派（不能因此停功能）');
   assert.ok(planTreasure(unknownSeason, {}).notes.some((note) => note.includes('算不出活动有效期')), '要把未知说出来');
@@ -2772,7 +2973,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
       fleet({ buildingId: '2远征船', state: 4 }),
       fleet({ buildingId: '3远征船', treasureLootUid: 40 }),
     ],
-  }), { config });
+  }), ALL);
   assert.equal(busy.idleFleets.length, 0, '航行/修理/已经在抢货轮的船都不算空闲');
   const busyPlan = planTreasure(busy, {});
   assert.equal(busyPlan.actions.length, 0, '没有空闲船就不派');
@@ -2782,13 +2983,13 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const many = viewTreasure(surveyFor({
     treasures: [treasure({ uid: 50 })],
     fleets: [fleet({}), fleet({ buildingId: '2远征船' }), fleet({ buildingId: '3远征船' })],
-  }), { config });
+  }), ALL);
   assert.equal(planTreasure(many, { maxFleets: 2 }).actions[0].body.fleetBuildingIds.length, 2, 'maxFleets 要截断');
   const poor = viewTreasure(surveyFor({
     petrol: 1200,
     treasures: [treasure({ uid: 51 })],
     fleets: [fleet({}), fleet({ buildingId: '2远征船' }), fleet({ buildingId: '3远征船' })],
-  }), { config });
+  }), ALL);
   assert.equal(planTreasure(poor, {}).actions[0].body.fleetBuildingIds.length, 2, '汽油只够 2 支就只派 2 支');
   assert.ok(planTreasure(poor, {}).notes.some((note) => note.includes('汽油')), '要说清楚是汽油不够');
 
@@ -2800,7 +3001,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
       treasure({ uid: 61, itemScore: 950, resourceScore: 65 }),
     ],
     fleets: [fleet({})],
-  }), { config });
+  }), ALL);
   assert.equal(planTreasure(gold, {}).actions[0].body.uid, 61, '物品多的优先，金币数量大不顶用');
 
   // 编码层：uid 是 field 1（tag 0x08），必须真的进帧 —— 少了服务端会当 uid=0 处理。
@@ -2847,4 +3048,4 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 日志脱敏与回包归档）`);
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 日志脱敏与回包归档）`);

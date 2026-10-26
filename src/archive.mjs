@@ -2,20 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './accounts.mjs';
 
-// 协议数据的落盘层，分两套，各管一件事：
+// 协议数据的落盘层，分三套，各管一件事：
 //
 //   data/protocol.log                  按时序的取证流水：一轮里「先发什么、后回什么」看它。
 //                                      一行一眼能看完，所以 body 仍然截断、心跳类噪音不写、按大小轮转。
 //   data/responses/<日期>/<消息名>.jsonl  原始回包档案：全量、不截断、按接口分文件。
 //                                      重建背包/海面/任务快照这类离线分析从这里读。
+//   data/console/<日期>.log             网页「运行记录」：屏幕上那些人话日志（哪轮做了什么、
+//                                      哪一步失败、钻石变了多少）。协议层看不出「为什么跳过」，
+//                                      只能靠它；以前只在内存里留 400 条，刷新/重启就没了。
 //
-// 两边都是**同步写**（openSync + writeSync，不留异步缓冲）：CLI 里 `state` 这种命令
+// 三边都是**同步写**（openSync + writeSync，不留异步缓冲）：CLI 里 `state` 这种命令
 // 连一次、打几条就退出，用 createWriteStream 会丢掉尾巴上那几条 —— 而那几条往往正是
 // 你最想看的那条回包。
 
 export const DATA_DIR_RESOLVED = DATA_DIR;
 export const ARCHIVE_ROOT = path.join(DATA_DIR, 'responses');
 export const PROTOCOL_LOG = path.join(DATA_DIR, 'protocol.log');
+export const CONSOLE_ROOT = path.join(DATA_DIR, 'console');
 
 // 心跳与序号确认：量大、无业务信息。既不该刷 protocol.log，也没有归档价值。
 export const NOISE_FRAMES = new Set(['PingRequest', 'PingResponse', 'Ack', 'Nack']);
@@ -181,6 +185,31 @@ export function traceLine(tag, line, { t = Date.now() } = {}) {
   appendLine(PROTOCOL_LOG, text);
 }
 
+// ---- 网页运行记录（人话日志）-----------------------------------------------
+// 按**本地日期**切文件，不按大小轮转：一天几千条、几 MB，日期本身就把体积管住了，
+// 清旧记录就是删一个 .log。extra 截 300 —— 它是给人看的补充信息，不该让一条推送撑爆一行。
+
+const CONSOLE_EXTRA_CHARS = 300;
+
+export function consoleLogPath(ms = Date.now()) {
+  return path.join(CONSOLE_ROOT, `${dayOf(ms)}.log`);
+}
+
+// 一条日志 = 磁盘上的一行。换行一律折成「 ⏎ 」：多行摘要（比如一轮挂机的汇总）
+// 落盘后如果真占多行，tail / grep 出来的东西会被切碎，事后根本没法按轮对齐。
+export function formatConsoleLine({ t = Date.now(), level = 'info', message = '', account = null, extra = null } = {}) {
+  const tag = account ? ` [${String(account).slice(0, 8)}]` : '';
+  const text = String(message ?? '').replace(/\r?\n/g, ' ⏎ ').trim();
+  const tail = clipBody(extra, CONSOLE_EXTRA_CHARS);
+  return `${stamp(t)}${tag} [${level}]${text ? ` ${text}` : ''}${tail ? ` ${tail}` : ''}`;
+}
+
+// 页面日志落盘。file 只给自检用（写临时文件），运行时一律按日期挑。
+export function appendConsole(entry = {}, { file = null } = {}) {
+  if (!archiveEnabled()) return false;
+  return appendLine(file ?? consoleLogPath(entry.t ?? Date.now()), `${formatConsoleLine(entry)}\n`);
+}
+
 // 把一份连接挂到归档上：出站帧、入站回包都落盘，心跳噪音跳过。
 // 幂等 —— server 先挂（带 session 前缀），client.connect 里再挂一次也不会重复记。
 export function attach(client, { tag = null, log = true } = {}) {
@@ -251,4 +280,17 @@ export function summarizeDay(root = ARCHIVE_ROOT, day = dayOf()) {
       return { name: file.replace(/\.jsonl$/, ''), file: full, size, lines, inbound, outbound: lines - inbound };
     })
     .sort((a, b) => b.size - a.size);
+}
+
+// 页面运行记录按天一个 .log，跟 responses/<日期>/ 的日期口径一致（都用 dayOf 的本地日期）。
+export function listConsoleDays(root = CONSOLE_ROOT) {
+  try {
+    return fs
+      .readdirSync(root)
+      .filter((file) => /^\d{4}-\d{2}-\d{2}\.log$/.test(file))
+      .map((file) => file.replace(/\.log$/, ''))
+      .sort();
+  } catch {
+    return [];
+  }
 }

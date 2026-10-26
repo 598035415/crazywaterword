@@ -28,11 +28,16 @@
 // - 奖励**没有领取请求**：进度满 100% 由服务端结算（战报进邮件，邮件由 idle 模块一键领）。
 //   所以本模块只做一件写操作 —— 派舰队。
 //
-// 只抢「无人占领」的货轮（ownerGuildIdx === 0），这是刻意的：
+// 抢哪些等级由用户多选（`colors`，协议 color 3/4/5），**默认只抢万吨**（`DEFAULT_COLORS = [5]`）。
+// 万吨全服 1 艘、奖励最厚，先把它占住最划算；小型/中型要不要是用户的取舍，页面上勾。
+//
+// 有人占领也照样派（2026-10-26 按用户要求改的，原来只抢 ownerGuildIdx === 0）：
 //   抢别人占着的要先打赢守军，而 battlePoint.rightFighter 里**没有战力字段**
 //   （只有 name / avatar / isNpc / guildIdx / skinId），拿不到对手战力就无法判断能不能赢，
-//   赌输要掉舰船耐久（维修 6 汽油/点）。己方联盟已经在打的也不用加 —— 舰队数已经够了。
-//   代价是刷新后被别人先占的货轮抢不到；换来的是"派出去就一定能占上"。
+//   赌输要掉舰船耐久（维修 6 汽油/点）。但"占着"里有一半是我们自己联盟（协议只给联盟编号，
+//   拿不到自己的 guildIdx），一眼看不出敌我；而且整点刷新后几十秒就可能被别人全占走，
+//   干等着等于当天空手。所以现在全都派，同一等级里无人占领的排在前面先挑（见 rank），
+//   输赢交给战报（进邮件，由 idle 模块一键领）。
 
 import { normalize } from './worlds.mjs';
 import { rowsOf, assetCount } from './world.mjs';
@@ -53,16 +58,43 @@ export const SEASON_CLOSE_GUARD_SECONDS = 3600;
 const SEASON_CACHE_MS = 3600 * 1000;
 const seasonCache = new Map();
 
+// 可抢的货轮等级（协议 color 枚举）：3 蓝(小型) / 4 紫(中型) / 5 橙(万吨)。
+// 页面上的多选框就是这三个；配置表改名不用动这里（名字仍走 qualityOf 读 TreasureLootCfg）。
+export const TREASURE_LEVELS = [3, 4, 5];
+
+// 默认只抢万吨货轮（用户口里的「大货轮」）：
+// 每天只有 3 次奖励、一天 14 次刷新，稀缺的是「次数」不是「船」，万吨奖励最厚（橙装材料自选包）。
+// 想顺手把中型/小型也扫掉，在页面「抢哪些」里勾上就行（多选题）。
+export const DEFAULT_COLORS = [5];
+
+// 把外部输入（页面多选 / JSON payload / CLI --colors）归一成升序去重的 color 数组。
+// - 不给（null/undefined）→ 默认值（只抢万吨）
+// - 显式空数组 → 空数组（页面上「全不勾」= 一个都不抢，不要偷偷回退成默认值）
+// - 只认 >= 3 的整数（3 蓝 / 4 紫 / 5 橙），脏值直接丢掉
+export function colorsOf(value) {
+  if (value == null) return [...DEFAULT_COLORS];
+  const raw = Array.isArray(value) ? value : [value];
+  const seen = new Set();
+  for (const entry of raw) {
+    const color = Math.floor(Number(entry));
+    if (Number.isFinite(color) && color >= 3) seen.add(color);
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+// 日志/页面共用一份「抢哪些」文案：`万吨货轮` / `中型货轮、万吨货轮` / `未选等级`。
+export function colorsText(config, colors) {
+  const list = colorsOf(colors);
+  if (list.length === 0) return '未选等级';
+  return list.map((color) => qualityOf(config, color).name).join('、');
+}
+
 // 同联盟最多 10 支舰队占同一个货轮（游戏内「世界宝藏 / 舰队数量限制」）。
 export const MAX_GUILD_FLEETS = 10;
 
 // 一次最多派几支舰队。默认 3：两三条就够把一个小型货轮推到结算，
 // 再多会把船全压在货轮上，情报事件/资源田就没船可用（船是全局共享的）。
 export const DEFAULT_MAX_FLEETS = 3;
-
-// 最低品质：3 = 蓝(小型) 也抢。理由是每天只有 3 次奖励、8~22 点共 14 次刷新，
-// 只等万吨大概率凑不满名额；先拿满次数比挑品质划算。想只抢高级的把 minColor 提到 4/5。
-export const DEFAULT_MIN_COLOR = 3;
 
 const FLEET_STATE_TEXT = { 1: '空闲', 2: '航行中', 3: '战斗中', 4: '修理中', 5: '排队中' };
 
@@ -316,7 +348,7 @@ export async function surveyTreasure(client, protocol, {
 // 视图：每个货轮标「能不能抢」，加上舰队/次数/汽油的现状。
 export function viewTreasure(survey, {
   config = null,
-  minColor = DEFAULT_MIN_COLOR,
+  colors,
   maxFleets = DEFAULT_MAX_FLEETS,
 } = {}) {
   const config_ = config ?? survey.config ?? null;
@@ -326,6 +358,10 @@ export function viewTreasure(survey, {
   const remainingRewards = today == null ? null : Math.max(0, limit - today);
   const petrolCost = Number(survey.petrolCost) || FALLBACK_PETROL_COST;
   const petrol = Number(survey.petrol) || 0;
+  // 用户勾的等级（默认只抢万吨）。空数组 = 一个都不抢，日志里会说清楚。
+  const wanted = colorsOf(colors);
+  const wantedSet = new Set(wanted);
+  const colorText = colorsText(config_, wanted);
 
   // 活动有效期：stopAt 是「真能派船的最后时刻」（已减去新赛季前 1 小时的封盘）。
   // unknown = 两个来源都算不出来 —— 这时**不能停**（算不出来不代表活动结束了），只提示。
@@ -355,21 +391,32 @@ export function viewTreasure(survey, {
 
   const treasures = (survey.treasures ?? []).map((treasure) => {
     const free = treasure.ownerGuildIdx === 0;
+    const ourFleets = ourFleetsByUid.get(treasure.uid) ?? 0;
+    // 名额只能按**我方**舰队数算：`ownerFleetNum` 是占领方联盟的船数，可能是别人的 ——
+    // 拿 10 - ownerFleetNum 当自己的余量，会在「别人占满 10 支」时把自己算成 0 支，永远不派。
+    const slotsLeft = Math.max(0, MAX_GUILD_FLEETS - ourFleets);
+    const levelOk = wantedSet.has(treasure.color);
     return {
       ...treasure,
       free,
-      ourFleets: ourFleetsByUid.get(treasure.uid) ?? 0,
-      // 名额：无人占领时 ownerFleetNum 恒为 0，这里仍然按公式算，将来放行「加入己方联盟」时不用改。
-      slotsLeft: Math.max(0, MAX_GUILD_FLEETS - treasure.ownerFleetNum),
-      claimable: free && treasure.color >= Number(minColor) && treasure.progress < 100,
+      ourFleets,
+      slotsLeft,
+      levelOk,
+      // 有人占领也派（打赢守军就换我们占）。等级要勾了、进度没满、我方还没占满才有意义。
+      claimable: levelOk && treasure.progress < 100 && slotsLeft > 0,
+      // 优先级：等级高的先派（万吨 > 中型 > 小型），同等级里 无人占领(0) → 我方在推(1) → 别人占着(2)。
+      // 等级排在「有没有人占」前面是刻意的：用户要的是「被占了也要派」，如果让"无人占领的中型"
+      // 盖过"被占的万吨"，就变成宁愿捡小的也不去抢大的 —— 与需求相反。
+      rank: free ? 0 : (ourFleets > 0 ? 1 : 2),
     };
   });
 
-  // 候选按「品质 → 物品件数 → 资源件数 → uid」排。同品质里物品多的更值钱，
+  // 候选按「等级 → 能不能白捡 → 物品件数 → 资源件数 → uid」排。同等级里无人占领的先派；
   // 物品一样多才看资源（金币/红宝石）—— 见 rewardScore 的说明。
   const targets = treasures
     .filter((treasure) => treasure.claimable)
     .sort((a, b) => (b.color - a.color)
+      || (a.rank - b.rank)
       || (b.itemScore - a.itemScore)
       || (b.resourceScore - a.resourceScore)
       || (a.uid - b.uid));
@@ -388,12 +435,18 @@ export function viewTreasure(survey, {
   } else if (dailyFull) {
     notes.push(`今日货轮奖励已满 ${today}/${limit}，明天 0 点重置`);
   }
-  if (!activity.expired && survey.treasures.length > 0 && targets.length === 0 && !dailyFull) {
-    const busy = treasures.filter((treasure) => !treasure.free).length;
-    const lowColor = treasures.filter((treasure) => treasure.free && treasure.color < Number(minColor)).length;
-    notes.push(`没有可抢的货轮：${busy} 个已被别的联盟占着`
-      + (lowColor > 0 ? `、${lowColor} 个品质低于 ${minColor}` : '')
-      + '（只抢无人占领的，抢别人的要先打赢守军）');
+  if (wanted.length === 0) {
+    // 页面上把三个等级全取消勾选 = 明确表示"不抢"。不能悄悄回退成默认值。
+    notes.push('一个货轮等级都没勾（页面「抢哪些」），不会派船');
+  } else if (!activity.expired && survey.treasures.length > 0 && targets.length === 0 && !dailyFull) {
+    const offLevel = treasures.filter((treasure) => !treasure.levelOk && treasure.progress < 100).length;
+    const done = treasures.filter((treasure) => treasure.progress >= 100).length;
+    const filled = treasures.filter((treasure) => treasure.levelOk && treasure.progress < 100 && treasure.slotsLeft <= 0).length;
+    const reasons = [];
+    if (offLevel > 0) reasons.push(`${offLevel} 个不是勾选的等级（只抢 ${colorText}）`);
+    if (done > 0) reasons.push(`${done} 个已结算`);
+    if (filled > 0) reasons.push(`${filled} 个我方已占满 ${MAX_GUILD_FLEETS} 支`);
+    notes.push(`没有可抢的货轮${reasons.length > 0 ? `：${reasons.join('、')}` : ''}`);
   }
 
   return {
@@ -408,7 +461,8 @@ export function viewTreasure(survey, {
     counts: survey.counts,
     petrol,
     petrolCost,
-    minColor,
+    colors: wanted,
+    colorText,
     maxFleets: Number(maxFleets) || DEFAULT_MAX_FLEETS,
     treasures,
     targets,
@@ -421,14 +475,13 @@ export function viewTreasure(survey, {
   };
 }
 
-// 计划：一次只抢**一个**货轮（品质最高的那个），把空闲舰队压上去把进度推快。
+// 计划：一次只抢**一个**货轮（勾选等级里最值的那个），把空闲舰队压上去把进度推快。
 //
 // 为什么不分兵：同联盟最多 10 支占同一个货轮，进度是"所有占领者同速推进"，船越多越快结算；
 // 而每天只有 3 次奖励，一天 14 次刷新，分散到多个货轮只是把每场都拖慢 ——
 // 拖慢就更容易被人抢走（对方一赢守军就换人）。
 export function planTreasure(view, {
   maxFleets = DEFAULT_MAX_FLEETS,
-  minColor = DEFAULT_MIN_COLOR,
 } = {}) {
   const actions = [];
   const notes = [...(view.notes ?? [])];
@@ -437,6 +490,8 @@ export function planTreasure(view, {
   // 说明文字已经在 view.notes 里（第一行），这里不再重复。
   if (view.activity?.expired) return { actions, notes };
   if (!view.statsAvailable || view.dailyFull) return { actions, notes };
+  // 一个等级都没勾 = 用户明确不想抢（view.notes 里已经说明了），别再往下算。
+  if (Array.isArray(view.colors) && view.colors.length === 0) return { actions, notes };
 
   const idle = (view.idleFleets ?? []).slice().sort((a, b) => b.power - a.power);
   if (idle.length === 0) {
@@ -460,7 +515,7 @@ export function planTreasure(view, {
       const left = Number(view.nextRefreshTime) - Math.floor(Date.now() / 1000);
       if (left > 0) notes.push(`下次整点刷新还有 ${Math.round(left / 60)} 分钟`);
     } else if (!view.dailyFull && view.statsAvailable) {
-      notes.push('现在没有无人占领的货轮，等整点刷新');
+      notes.push(`现在没有勾选等级的货轮（${view.colorText}），等整点刷新`);
     }
     return { actions, notes };
   }
@@ -496,6 +551,7 @@ export function planTreasure(view, {
     key: `treasureDispatch:${target.uid}`,
     transient: true,
     label: `派 ${picks.map((fleet) => fleet.buildingId).join('、')} 抢「${target.name}」`
+      + (target.free ? '' : `（要先打赢联盟 ${target.ownerGuildIdx} 的守军，${target.ownerFleetNum} 支）`)
       + `（uid ${target.uid}，${target.progress}% → 100%）`
       + `，奖励 ${target.rewardText}`,
   });
@@ -512,7 +568,7 @@ export function planTreasure(view, {
   return { actions, notes };
 }
 
-// 一行概览：可领 1/3 · 货轮 8 个（无人 6） · 空闲舰队 0/2 · 22:00 刷新 · 有效至 11-12 23:59
+// 一行概览：可领 1/3 · 货轮 8 个（无人 6） · 抢 万吨货轮 · 空闲舰队 0/2 · 22:00 刷新 · 有效至 11-12 23:59
 export function formatTreasureSummary(view) {
   const activity = view.activity ?? null;
   // 活动结束就只印这一句 —— 后面的次数/舰队/刷新全是废话，日志里也更容易一眼看到。
@@ -530,6 +586,8 @@ export function formatTreasureSummary(view) {
   }
   const free = (view.treasures ?? []).filter((treasure) => treasure.free && treasure.progress < 100).length;
   parts.push(`货轮 ${(view.treasures ?? []).length} 个（无人 ${free}）`);
+  // 「抢哪些」每轮都印：等级是多选的，日志里要能一眼确认当前配置（默认只抢万吨）。
+  parts.push(view.colors?.length ? `抢 ${view.colorText}` : '未勾等级（不派船）');
   parts.push(`空闲舰队 ${(view.idleFleets ?? []).length}/${(view.fleets ?? []).length}`);
   const ourFleetCount = (view.treasures ?? []).reduce((sum, treasure) => sum + (treasure.ourFleets ?? 0), 0);
   if (ourFleetCount > 0) parts.push(`我方 ${ourFleetCount} 支在抢`);
@@ -568,6 +626,7 @@ export function formatTreasurePlan(view, plan) {
   const refreshLeft = Number(view.nextRefreshTime) > 0
     ? Number(view.nextRefreshTime) - Math.floor(Date.now() / 1000) : 0;
   lines.push(`每天 ${view.dailyLimit} 次奖励（已领 ${view.todayRewardTimes ?? '?'}）`
+    + ` · ${view.colors?.length ? `抢 ${view.colorText}` : '未勾等级（不派船）'}`
     + ` · 汽油 ${view.petrol}（${view.petrolCost}/支）`
     + ` · 舰队 ${view.fleets.length} 艘（空闲 ${view.idleFleets.length}）`
     + (refreshLeft > 0 ? ` · 下次刷新 ${human(refreshLeft)}后` : ''));
@@ -578,11 +637,13 @@ export function formatTreasurePlan(view, plan) {
     // 「我方在途 / 在占」必须排在「被联盟 N 占」前面：协议只给联盟**编号**，
     // 我们拿不到自己的 guildIdx，所以自家在推的货轮也会是 ownerGuildIdx != 0。
     // 用舰队上的 treasureLootUid 反查才能认出「这是自己人」。
+    // 「要打守军」是 2026-10-26 起的新行为：有人占着也派，只是排在无人占领的后面。
     const state = treasure.progress >= 100 ? '已结算'
-      : treasure.claimable ? (treasure.ourFleets > 0 ? '我方在途' : '可抢')
-        : treasure.ourFleets > 0 ? '我方在占'
-          : treasure.ownerGuildIdx !== 0 ? `被联盟 ${treasure.ownerGuildIdx} 占（${treasure.ownerFleetNum} 支）`
-            : `品质低于 ${view.minColor}`;
+      : !treasure.levelOk ? (view.colors?.length ? `等级没勾（只抢 ${view.colorText}）` : '等级没勾（一个都没勾）')
+        : treasure.slotsLeft <= 0 ? `我方已占满 ${MAX_GUILD_FLEETS} 支`
+          : treasure.ourFleets > 0 ? (treasure.free ? '我方在途' : '我方在占')
+            : treasure.free ? '可抢（无人占领）'
+              : `可抢（要先打赢联盟 ${treasure.ownerGuildIdx} 的 ${treasure.ownerFleetNum} 支守军）`;
     const ours = treasure.ourFleets > 0 ? ` · 我方 ${treasure.ourFleets} 支在抢` : '';
     lines.push(`  [${state}] ${treasure.name}（uid ${treasure.uid}）  进度 ${treasure.progress}%${ours}  ${treasure.rewardText}`);
   }

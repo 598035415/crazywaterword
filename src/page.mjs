@@ -152,13 +152,23 @@ export const PAGE = `<!doctype html>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
     </div>
-    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 锻造」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
+    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 锻造 → 海兽培育」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
 这里只放自动化：要手动点一次的「任务奖励」「海面」「联盟情报」都在「日常」页。</pre>
 
     <h2>搁浅的货轮（世界宝藏）</h2>
     <div class="bar">
-      <label class="dim" title="整点刷新的货轮，派舰队占领到 100% 结算奖励。这里只抢「没人占」的，不跟人抢打">
+      <label class="dim" title="整点刷新的货轮，派舰队占领到 100% 结算奖励。已经有人占着的也派（打赢守军就换我们占）">
         <input type="checkbox" id="treasure-on" checked> 自动抢货轮
+      </label>
+      <span class="k">抢哪些</span>
+      <label class="dim" title="小型货轮（蓝）：进度推得快，奖励是蓝装材料自选包">
+        <input type="checkbox" id="treasure-color-3"> 小型
+      </label>
+      <label class="dim" title="中型货轮（紫）：奖励是紫装材料自选包">
+        <input type="checkbox" id="treasure-color-4"> 中型
+      </label>
+      <label class="dim" title="万吨货轮（橙）：全服 1 艘，奖励最厚（默认只抢这个）">
+        <input type="checkbox" id="treasure-color-5" checked> 万吨
       </label>
       <label class="dim">时间间隔 <input id="treasure-every" value="60" style="width:64px"> 秒</label>
       <button id="treasure-run">立刻抢一次</button>
@@ -167,8 +177,12 @@ export const PAGE = `<!doctype html>
     <pre id="treasure-view">货轮每天 8:00~22:00 的**每个整点**刷新（万吨 1 艘、中型、小型各若干），派舰队占领到 100% 就结算奖励，
 每人每天最多拿 3 次（TreasureLootParamCfg「每日宝藏奖励次数」）。抢的是刷新后那几十秒，所以默认 60 秒看一次 ——
 与情报同节奏，但**排在情报前面**：两边抢的是同一批空闲舰队，情报事件挂 6 小时还在，货轮错过就没了。
-只抢「无人占领」（ownerGuildIdx = 0）的：抢别人占着的要先打赢守军，而协议里拿不到对手战力，赌输要掉耐久。
-一次只打一个货轮（品质最高、奖励最多的那个），把空闲船压上去推快 —— 同联盟最多 10 支能占同一个，默认派 3 支。
+**等级是多选的**（协议 color：3 蓝小型 / 4 紫中型 / 5 橙万吨），默认只抢**万吨（大货轮）**；
+想顺手把中型/小型也扫掉就勾上，三个都不勾 = 不派船（日志里会说明）。
+**已经有人占领的也派**：打赢守军就换成我们占（协议里没有守军战力，输赢看战报，进了邮件会一起领）。
+代价是赌输会掉舰船耐久（维修 6 汽油/点）—— 所以无人占领的排在前面优先派，被占着的排后面。
+一次只打一个货轮（优先级：等级高的先派 → 同等级里 无人占领 → 我方在推 → 别人占着；
+同档再按物品件数 → 资源），把空闲船压上去推快 —— 同联盟最多 10 支能占同一个，默认派 3 支。
 单支消耗汽油 500（WorldParamCfg「进攻宝藏消耗汽油」），汽油不够会自动少派。奖励没有领取请求，结算后进邮件，
 由上面的「自动领取」一并收掉。间隔填 0 = 每轮都看。
 **活动有效期**：世界宝藏没有独立的活动时间，边界是**赛季结束** —— 服务端 SeasonRankInfoResponse.endTime
@@ -240,6 +254,30 @@ export const PAGE = `<!doctype html>
 排产按「背包 + 打造中」的件数算：哪个部位少就补哪个（英雄每个部位只能穿一件，三个部位要成套）；件数相同时按 武器 → 防具 → 饰品 轮转。
 部位内先试品质最高的配方，材料或金币不够就自动降级 —— 所以紫材料攒够 160 时会自动改造紫装，不用改设置。
 已穿在英雄身上的不计入（那是「已在用」，不是「可分配」）。**永不动钻石、不加速**（SpeedMakeEquipRequest 需要花钻石）。</pre>
+
+    <h2>海兽培育</h2>
+    <div class="bar">
+      <label class="dim" title="海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满（基因是该物种专属的，攒着没有任何别的用途）">
+        <input type="checkbox" id="pet-on" checked> 自动培育
+      </label>
+      <label class="dim">时间间隔 <input id="pet-every" value="300" style="width:64px"> 秒</label>
+      <label class="dim" title="红配方要 season 2 且 100 万金币，常态打不开；想给金币留余地就往下调">
+        品质上限
+        <select id="pet-quality">
+          <option value="BLUE">蓝</option>
+          <option value="PURPLE">紫</option>
+          <option value="ORANGE" selected>橙</option>
+          <option value="RED">红</option>
+        </select>
+      </label>
+      <button id="pet-run">立刻培育一次</button>
+      <span id="pet-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="pet-view">海兽培育室（BuildingCfg 里叫「宠物培育室」）能排几个以服务端给的 maxQLength 为准，0 表示队列还没开（建筑没建成）。
+成熟的一次领走（GetMaturePetRequest 没有 body，跟客户端一样一下收全部）；队列空着的位子按「品质从高到低、同品质先补编号小的物种」排满。
+材料（基因 + 金币）不够就自动降一级 —— 所以紫基因攒够 400 时会自动从蓝升到紫，不用改设置。
+基因是该物种专属的（「宠物3蓝基因」只用于宠物3），攒着没有别的用途，所以有就排；**永不动钻石**。
+喂食（PetFeedRequest）**不做**：它按队列位消耗 feedRequirements 换时间，材料是什么、值不值还没确认，自动喂等于拿库存去赌。</pre>
 
     <pre class="dim" style="color:#7c8695">潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
   </section>
@@ -757,14 +795,23 @@ function renderLoop(data) {
   syncInterval('farm-every', data.farmEveryMs);
   syncInterval('radar-every', data.radarEveryMs);
   syncInterval('forge-every', data.forgeEveryMs);
+  syncInterval('pet-every', data.petEveryMs);
   syncInterval('idle-every', data.idleEveryMs);
   syncInterval('treasure-every', data.treasureEveryMs);
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked, data.running);
   renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked, data.running);
   renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, $('loop-radar').checked, data.running);
   renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, $('forge-on').checked, data.running);
+  renderGate('pet-state', data.lastPetAt, data.petEveryMs, $('pet-on').checked, data.running);
   renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, $('idle-on').checked, data.running);
   renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, $('treasure-on').checked, data.running);
+  // 运行中把服务端实际生效的「抢哪些」回填到多选框（默认只勾万吨）。
+  if (data.running && Array.isArray(data.treasureColors)) {
+    for (const color of [3, 4, 5]) {
+      const box = $('treasure-color-' + color);
+      if (box) box.checked = data.treasureColors.indexOf(color) >= 0;
+    }
+  }
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
     return;
@@ -802,12 +849,18 @@ $('loop-start').onclick = async () => {
         // 锻造默认开，默认 3 分钟看一眼（一件蓝装约 25 分钟；造好不收等于停产）。
         forge: $('forge-on').checked,
         forgeEverySeconds: Number($('forge-every').value || 0),
+        // 海兽培育默认开，默认 5 分钟看一眼（蓝配方 4 小时、橙 36 小时）。
+        pet: $('pet-on').checked,
+        petEverySeconds: Number($('pet-every').value || 0),
+        petMaxQuality: $('pet-quality').value,
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，默认 5 分钟看一眼。
         idle: $('idle-on').checked,
         idleEverySeconds: Number($('idle-every').value || 0),
         // 搁浅的货轮（世界宝藏）默认开，默认 60 秒看一次（整点刷新，抢的是刷新后那几十秒）。
+        // 等级是多选：默认只勾万吨（3 蓝小型 / 4 紫中型 / 5 橙万吨），全不勾 = 不派船。
         treasure: $('treasure-on').checked,
         treasureEverySeconds: Number($('treasure-every').value || 0),
+        treasureColors: [3, 4, 5].filter((color) => $('treasure-color-' + color).checked),
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -830,6 +883,7 @@ $('world-pick').onchange = refreshLoop;
 $('world-farm').onchange = refreshLoop;
 $('loop-radar').onchange = refreshLoop;
 $('forge-on').onchange = refreshLoop;
+$('pet-on').onchange = refreshLoop;
 $('idle-on').onchange = refreshLoop;
 $('treasure-on').onchange = refreshLoop;
 
@@ -851,11 +905,18 @@ $('idle-run').onclick = async () => {
   }
 };
 
-// 手动「立刻抢一次」：不看间隔，跟挂机里那套完全一样（探测 → 只抢无人占领的货轮）。
+// 手动「立刻抢一次」：不看间隔，跟挂机里那套完全一样（探测 → 按勾选的等级抢货轮，被占着的也派）。
+// 勾选的等级一起带上：服务端会先存进 session.loop，面板与之后启动的挂机看到的是同一份选择。
 $('treasure-run').onclick = async () => {
   $('treasure-state').textContent = '执行中 ...';
   try {
-    const data = await call('/api/treasure/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const data = await call('/api/treasure/run', {
+      method: 'POST',
+      body: JSON.stringify({
+        confirm: true,
+        treasureColors: [3, 4, 5].filter((color) => $('treasure-color-' + color).checked),
+      }),
+    });
     const results = data.results || [];
     const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
     const tail = results.length
@@ -885,6 +946,24 @@ $('forge-run').onclick = async () => {
     refreshLoop();
   } catch (error) {
     $('forge-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻培育一次」：探测 → 收成熟 → 给空位排产，跟挂机里那套完全一样。
+$('pet-run').onclick = async () => {
+  $('pet-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/pet/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : '';
+    $('pet-view').textContent = (data.text || '') + tail;
+    $('pet-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  } catch (error) {
+    $('pet-state').textContent = error.message;
   }
 };
 

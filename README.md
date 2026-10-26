@@ -30,10 +30,11 @@
 | 海面世界 | 收成品、竣工、建造新建筑、交居民订单、给空闲工厂按订单缺口排产（瞬成配方一次排满队列）、收农田并重新播种、余料升级、加速 |
 | 联盟情报 | 读情报事件，按舰队战力筛能打过的，派空闲舰队去打，回来领奖励；循环里默认开启 |
 | 装备厂 / 锻造 | 收取已锻好的装备，收完按「武器/防具/饰品」件数最少的部位排下一件（成套优先）；循环里默认开启 |
+| 海兽培育室 | 收取成熟海兽，队列空位按「材料够的里面品质最高」排满（基因专属该物种，有就排）；循环里默认开启 |
 | 挂机领取 | 邮件附件、挂机本段收益、挂机等级奖励、挂机等级升级（只花「挂机徽章」）；循环里默认开启 |
-| 搁浅的货轮 | 世界宝藏：只抢「无人占领」的货轮，一条请求把空闲舰队压上去推占领进度（一天 3 次奖励）；循环里默认开启 |
+| 搁浅的货轮 | 世界宝藏：按勾选的等级（多选，默认只抢万吨）抢货轮，已经有人占领的也派（打赢守军就换我们占），一条请求把空闲舰队压上去推占领进度（一天 3 次奖励）；循环里默认开启 |
 | 自动循环 | 上面几块按轮执行，可只读探测、可长期挂机 |
-| 回包归档 | 每条请求/推送按接口全量落盘到 `data/responses/<日期>/`，时序流水另存 `data/protocol.log` |
+| 回包归档 | 每条请求/推送按接口全量落盘到 `data/responses/<日期>/`，时序流水另存 `data/protocol.log`，页面日志存 `data/console/<日期>.log` |
 | 网页控制台 | 本地页面，中文业务视图，一键领取 / 一键完成 / 自动循环 / 账号与凭证管理 |
 
 ## 它不是什么
@@ -106,7 +107,7 @@ node src/app.mjs            # 默认就是这个
 - **总览** —— 账号卡、资源与库存（带游戏自己的图标）、一键领取；
 - **挂机** —— 只放自动化：轮数、循环间隔、加速/重刷开关，下面是运行记录；再往下是各自动模块自己的开关与
   **时间间隔**（「自动联盟情报」默认 60s、「搁浅的货轮」默认 60s、「拾荒」默认 300s、「农田」默认 120s、
-  「锻造」默认 180s、「挂机领取」默认 300s）——
+  「锻造」默认 180s、「海兽培育」默认 300s、「挂机领取」默认 300s）——
   自动循环每轮都会看一次，但只有「距上次执行」超过这个间隔才真的发请求，其余轮次直接跳过并说明还差多久
   （状态显示成「上次 3 分钟前 · 还差 1 分 20 秒」）；
 - **英雄** —— 英雄卡片与养成计划；
@@ -161,6 +162,18 @@ node src/app.mjs            # 默认就是这个
   **永不动钻石**：不用 `SpeedMakeEquipRequest`（那是花钻石加速），`universal` 恒发 `false`。
   独立间隔默认 180 秒（一件蓝装约 25 分钟，`--forge-every` 改，0 = 每轮都看）。
 
+- **海兽培育室（默认开，`--no-pet` 关）** —— 成熟的一次领走，队列空位按配方排满。
+  培育室在 `BuildingCfg` 里叫「宠物培育室」（UI 名「海兽培育室」），状态挂在 `DispWaterBuilding.petBreed`
+  = `{ breedQ, maturePets, maxQLength }`，**跟装备厂一样没有 `factory` 字段**，所以不走排产。
+  队列位移几个以服务端给的 `maxQLength` 为准（0 = 建筑没建成，这轮只写原因不发请求）。
+  `GetMaturePetRequest` 是空体请求、一次领走全部成熟海兽，所以整轮只发一条。
+  排产：品质从高到低（蓝 4h / 紫 12h / 橙 36h / 红 72h），同品质按物种编号升序，材料（基因 + 金币）
+  不够就自动降一级；`--pet-max-quality` 可压上限（默认 `ORANGE`，红配方要 season 2 + 100 万金）。
+  基因是该物种专属的（「宠物3蓝基因」只用于宠物3），攒着没别的用途，所以有就排。
+  **不做喂食**（`PetFeedRequest` 按队列位消耗 `feedRequirements` 换时间，没确认它不碰通用材料之前不碰），
+  **永不动钻石**，`universal` 恒发 `false`（不用万能基因补缺口）。
+  独立间隔默认 300 秒（蓝配方也要 4 小时，`--pet-every` 改，0 = 每轮都看）。
+
 - **挂机领取（默认开，`--no-idle` 关）** —— 四件「不发请求就白放着」的免费收益，一次探测一起处理：
   ①**邮件附件**（`QuickGotReadEmailRequest{all:true}`，判据照抄客户端：有 `ES_NEW` 的邮件、或带附件且
   `got=false`）；②**挂机本段收益**（`afkFinishTime` 已过才领，8 小时封顶，不领就一直不涨）；
@@ -177,11 +190,17 @@ node src/app.mjs            # 默认就是这个
 - **搁浅的货轮（世界宝藏，默认开，`--no-treasure` 关）** —— 货轮每天 8:00~22:00 的**每个整点**刷新
   （`SCTreasureLootRefresh` 推送 `nextRefreshTime` = 下一个整点），派舰队占领到 100% 结算奖励，
   每人每天最多 3 次（`TreasureLootParamCfg`「每日宝藏奖励次数」，服务端 `totalRewardTimes` 优先）。
-  判据全部对齐客户端：**只抢 `ownerGuildIdx = 0`（无人占领）的货轮**，舰队必须是
-  `state = IDLE(1)` 且 `treasureLootUid = 0`（没在抢别的货轮）。
-  为什么不抢别人占着的：`TreasureLootInstance.battlePoint` 里**没有战力字段**
-  （只有 name / avatar / isNpc / guildIdx / skinId），判断不了能不能赢，赌输要掉舰船耐久（维修 6 汽油/点）。
-  一次只打一个货轮（品质最高、物品件数最多的那个），一条 `TreasureLootSendFleetsRequest`
+  判据全部对齐客户端：舰队必须是 `state = IDLE(1)` 且 `treasureLootUid = 0`（没在抢别的货轮）。
+  **等级是多选的**（页面「抢哪些」勾 小型/中型/万吨，对应协议 `color` 3/4/5），**默认只抢万吨（大货轮）**；
+  三个都不勾 = 一个都不抢（日志会说明「未勾等级」），不会偷偷回退成默认值。
+  **已经有人占领的也派**：`ownerGuildIdx != 0` 只代表「被某个联盟占着」，协议里拿不到自己的 `guildIdx`，
+  自家联盟在推的也会是这个值；而且整点刷新后几十秒就可能被别人占光，干等等于当天空手。
+  派过去要先打赢守军才算数（`battlePoint.rightFighter` 里**没有战力字段**，输赢看战报 —— 输了掉舰船耐久，
+  维修 6 汽油/点），所以同一等级里无人占领的排在前面先派，被占着的排后面。
+  **优先级：等级（万吨 > 中型 > 小型）→ 同等级里 无人占领 → 我方在推 → 别人占着 → 物品件数 → 资源**。
+  名额按**我方**舰队数算（10 − 自己的船数）：`ownerFleetNum` 是占领方联盟的船数，可能是别人的，
+  拿它算会在「别人占满 10 支」时把自己算成 0 支、永远不派。
+  一次只打一个货轮（按上面的优先级挑第一个），一条 `TreasureLootSendFleetsRequest`
   把选中的空闲舰队全塞进去 —— 同联盟最多 10 支能占同一个，进度是「所有占领者同速推进」，
   船越多越快结算，所以不分兵。默认最多派 3 支，单支消耗汽油 500
   （`WorldParamCfg`「进攻宝藏消耗汽油」），汽油不够会自动少派。
@@ -226,7 +245,7 @@ node src/app.mjs <子命令> [参数]
 | `radar [--dry] [--power-ratio N] [--max N]` | 联盟情报：领奖 + 每艘空闲船各派一个事件（战力余量默认 1.2，`--max` 默认不限） |
 | `forge [--dry]` | 装备厂：收取已锻好的装备 + 按部位均衡排下一件 |
 | `idle [--dry]` | 挂机领取：邮件附件 + 挂机本段收益 + 等级奖励 + 等级升级（只花挂机徽章） |
-| `treasure [--dry] [--max N] [--min-color 3\|4\|5]` | 搁浅的货轮：只抢无人占领的货轮，空闲舰队压上去推占领进度（`--min-color` 4/5 = 只抢中型/万吨） |
+| `treasure [--dry] [--max N] [--colors 3,4,5]` | 搁浅的货轮：按勾选等级抢货轮（无人占领优先，被占着的也派），空闲舰队压上去推占领进度。`--colors` 多选（3 小型 / 4 中型 / 5 万吨，默认只 5）；旧的 `--min-color 4` 仍认，等价于 `--colors 4,5` |
 | `field [gridIdx]` | 资源田报告 / 占田 / 弃田 |
 | `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--no-treasure] [--treasure-every 秒] [--no-forge] [--forge-every 秒] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--pick-every` / `--farm-every` / `--radar-every` / `--treasure-every` / `--forge-every` / `--idle-every` 见下） |
 
@@ -249,13 +268,18 @@ node src/app.mjs <子命令> [参数]
   + `uint8 标志`（0 = 原始，非零 = LZ4）+ protobuf 载荷。
 - 协议定义来自客户端自带的 protobufjs **static module** 产物 —— 它没有任何反射元数据，
   字段号和字段名只能从生成的 `encode` / `decode` 函数体里读回来（`tools/describe.mjs`）。
-- 每条收发都落盘，分两套（`src/archive.mjs`）：
+- 协议层每条收发都落盘，分两套（`src/archive.mjs`）：
   - `data/protocol.log` —— 时序流水，看「这一轮先发什么、后回什么」。一行一眼能看完，所以 body
     截到 400 字符（截断带 `…` 标记），心跳/序号确认（`PingRequest`/`PingResponse`/`Ack`/`Nack`）
     不进、`LoginRequest` 的 body 永不进。单文件超过 32MB 自动轮转成 `protocol.log.1`。
   - `data/responses/<本地日期>/<消息名>.jsonl` —— 原始回包档案，**全量、不截断**，一行一条
     `{"t":…,"dir":"in","seq":…,"acc":"…","body":{…}}`，191 个接口各一个文件。
     重建背包/海面/任务快照这类离线分析从这里读，别再从 47MB 的流水里 grep。
+- 网页上那些人话日志（哪轮做了什么、哪一步失败、钻石变了多少）另有一套：
+  `data/console/<本地日期>.log`，一行一条，格式
+  `时间 [账号前8位] [级别] 消息 [extra]`（多行消息折成一行，用 ` ⏎ ` 分隔）。
+  协议流水答不了「为什么跳过这一步」，只有这行中文能答 —— 内存里本来只留 400 条，
+  刷新页面或重启就没了，所以每条都同步落盘。
 - 想查「这一轮到底排产了哪个产品」，就看
   `-> [StartFactoryProduceRequest] seq=… {"buildingId":"1食品厂","productId":"烤鱼"}` 这一行
   （流水和 `StartFactoryProduceRequest.jsonl` 里都有）。
@@ -273,6 +297,21 @@ node tools/archive.mjs path AllItemResponse     # 文件路径（配合 grep / j
 ```
 
 控制台另有一个只读接口：`GET /api/archive?day=2026-10-23`（不碰网关、不带 `?account`）。
+
+### 运行记录（页面日志）怎么查
+
+页面上的日志窗口刷新就清空，但 `data/console/<日期>.log` 是连续的：
+
+```bash
+node tools/console-log.mjs days                  # 有记录的日期 / 条数 / 体积
+node tools/console-log.mjs tail 60               # 今天最后 60 条
+node tools/console-log.mjs grep 失败             # 今天含「失败」的行（最多 100 条）
+node tools/console-log.mjs grep 钻石 2026-10-25  # 指定日期
+node tools/console-log.mjs path                  # 文件路径（配合 less / rg）
+```
+
+排查顺序：**先看这份**（决策级：为什么跳过、报了什么错），再翻 `protocol.log`
+（动作级：这一帧发了什么、回了什么），最后按需读 `responses/*.jsonl`（原始回包）。
 
 老的 `data/protocol.log` 里入站 body 曾被截到 400 字符，可以回填成结构化档案：
 
@@ -331,7 +370,7 @@ node tools/archive-backfill.mjs --reset  # 忽略断点重导
 src/
   app.mjs        CLI 入口与各子命令
   client.mjs     网关连接、心跳、请求/推送的路由与 prompt 归属
-  archive.mjs    落盘层：protocol.log 流水 + responses/<日期>/<接口>.jsonl 全量回包
+  archive.mjs    落盘层：protocol.log 流水 + responses/<日期>/<接口>.jsonl 全量回包 + console/<日期>.log 运行记录
   codec.mjs      自定义帧 + protobuf 编解码
   proto.mjs      协议表加载
   accounts.mjs   多账号存储（data/accounts.json）
@@ -344,7 +383,8 @@ src/
   factories.mjs  工厂页：制造队列、配方解锁判定、手动排产
   loop.mjs       自动循环
   idle.mjs       挂机领取：邮件 / 本段收益 / 等级奖励 / 等级升级
-  treasure.mjs   搁浅的货轮（世界宝藏）：只抢无人占领的货轮，空闲舰队压上去推进度
+  pet.mjs        海兽培育室：收取成熟海兽 + 队列空位排产
+  treasure.mjs   搁浅的货轮（世界宝藏）：按勾选等级抢货轮（默认只抢万吨），被占着的也派，空闲舰队压上去推进度
   actions.mjs    动作目录（请求名、参数、是否改状态）
   server.mjs     HTTP + SSE，多会话
   page.mjs       控制台页面（单文件：CSS + HTML + 内联 JS）
@@ -364,6 +404,7 @@ tools/
   describe.mjs             从 static module 里读回字段
   build-names.mjs          抠出内联的 id→名字枚举
   archive.mjs              回包归档的查看器（days / list / tail / path）
+  console-log.mjs          运行记录（data/console）的查看器（days / tail / grep / path）
   archive-backfill.mjs     把老的 protocol.log 回填成结构化归档（增量、可 --dry）
   wxapkg.mjs               解密并解包 PC 微信小程序包
   probe-*.mjs              只读探针
@@ -440,11 +481,11 @@ docs/
 node src/selftest.mjs
 ```
 
-48 组离线检查，覆盖协议帧编解码、LZ4、账号仓库（迁移/选中/替换）、配置表与素材索引、
+53 组离线检查，覆盖协议帧编解码、LZ4、账号仓库（迁移/选中/替换）、配置表与素材索引、
 二维码、海面计划器（含建造与竣工互斥）、工厂视图（配方解锁/排队项与队首的区分/材料与存量上限）、
 活跃度宝箱（日/周两套门槛）、每日赠礼、挂机领取（等级上限的主线门槛 / 连升 10-5-1 档 / 升级必须等收益领到）、
-搁浅的货轮（品质枚举偏移 / 每日上限 / 只抢无人占领 / 舰队筛选 / 汽油与条数上限 / 金币不参与排序 /
-赛季有效期与过期停手）、
+搁浅的货轮（品质枚举偏移 / 每日上限 / 等级多选与默认只抢万吨 / 被占着的也派与优先级 / 名额按我方船数算 /
+舰队筛选 / 汽油与条数上限 / 金币不参与排序 / 赛季有效期与过期停手）、
 日志脱敏与回包归档（同步落盘、轮转、噪音过滤、目录切分）。
 工具侧另有 `tools/selftest-mitm.mjs`、`tools/selftest-describe.mjs`、`tools/selftest-registry.mjs`。
 

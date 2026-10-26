@@ -295,6 +295,23 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
       buildStartTime: raw.buildStartTime ?? 0,
       buildFinishTime: raw.buildFinishTime ?? 0,
       auto: raw.auto === true,
+      // 海兽培育室挂在 building.petBreed 上：{breedQ, maturePets, maxQLength}。
+      // 跟装备厂一样**没有 factory 字段**，所以不走排产，培育由 pet.mjs 单独算。
+      // 每个建筑都带这个字段（空的时候 maxQLength=0），只在有内容时才留，省得铺满 null。
+      petBreed: raw.petBreed ? {
+        breedQ: (raw.petBreed.breedQ ?? []).map((job) => ({
+          idx: Number(job.idx ?? 0) || 0,
+          petId: job.petId ?? '',
+          star: Number(job.star ?? 0) || 0,
+          finishTime: Number(job.finishTime ?? 0) || 0,
+          feedRequirements: (job.feedRequirements ?? []).map((need) => ({ id: need.id, num: assetCount(need.num) })),
+        })),
+        maturePets: (raw.petBreed.maturePets ?? []).map((pet) => ({
+          petId: pet.petId ?? '',
+          star: Number(pet.star ?? 0) || 0,
+        })),
+        maxQLength: Number(raw.petBreed.maxQLength ?? 0) || 0,
+      } : null,
       population: sumEffect(current?.effect, '人口增加'),
     });
   }

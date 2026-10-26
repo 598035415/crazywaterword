@@ -15,6 +15,7 @@ import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, l
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyEquip, planEquip, formatEquipPlan, formatEquipSummary } from './equip.mjs';
+import { surveyPet, planPet, formatPetPlan, formatPetSummary, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary, mailClaimable, planAfkClaims } from './idle.mjs';
 import {
   surveyTreasure,
@@ -22,8 +23,10 @@ import {
   planTreasure,
   formatTreasurePlan,
   formatTreasureSummary,
+  colorsOf,
+  colorsText,
   DEFAULT_MAX_FLEETS,
-  DEFAULT_MIN_COLOR,
+  DEFAULT_COLORS,
 } from './treasure.mjs';
 
 const READ_ONLY_PROBES = [
@@ -618,6 +621,47 @@ async function forge({ allowMutate, dryRun }) {
   }
 }
 
+// 海兽培育室：收成熟的 + 队列空位排产。--dry 只列计划；品质上限 --pet-max-quality。
+async function petCli({ allowMutate, dryRun, maxQuality = 'ORANGE' }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  try {
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const survey = await surveyPet(client, protocol, { config });
+    const plan = planPet(survey, { config, maxQuality });
+    console.log(`\n${formatPetPlan(survey, plan)}\n`);
+    console.log(`共 ${plan.actions.length} 个动作`);
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 800,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：队列和成熟海兽都是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyPet(client, protocol, { config });
+    console.log(`\n对照: ${formatPetSummary(after)}`);
+  } finally {
+    client.stop();
+  }
+}
+
 // 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励 + 挂机等级升级。
 // 四样都免费（升级只花「挂机徽章」道具），所以默认就在循环里开跑；--dry 只列计划。
 async function idleCli({ allowMutate, dryRun }) {
@@ -710,8 +754,8 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
   }
 }
 
-// 搁浅的货轮（世界宝藏）：列货轮 → 只挑无人占领的 → 一条请求把空闲舰队全派上去。
-async function treasureCli({ allowMutate, dryRun, maxFleets, minColor }) {
+// 搁浅的货轮（世界宝藏）：按勾选的等级挑货轮（无人占领的优先，被占着的也派）→ 一条请求把空闲舰队压上去。
+async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -720,14 +764,15 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, minColor }) {
 
   const response = await client.connect(login);
   const config = loadConfigSafe();
+  const wanted = colorsOf(colors);
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
-    const view = viewTreasure(survey, { config, minColor, maxFleets });
-    const plan = planTreasure(view, { minColor, maxFleets });
+    const view = viewTreasure(survey, { config, colors: wanted, maxFleets });
+    const plan = planTreasure(view, { maxFleets });
     console.log(`\n${formatTreasureSummary(view)}`);
     console.log(`\n${formatTreasurePlan(view, plan)}\n`);
-    console.log(`共 ${plan.actions.length} 个动作（品质下限 ${minColor}，一次最多 ${maxFleets} 支舰队）`);
+    console.log(`共 ${plan.actions.length} 个动作（抢 ${colorsText(config, wanted)}，一次最多 ${maxFleets} 支舰队）`);
 
     if (dryRun) {
       console.log('--dry：只列计划，未执行');
@@ -747,7 +792,7 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, minColor }) {
     // 只认重新探测的结果：货轮归属和舰队状态都是服务端说了算。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const after = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
-    const afterView = viewTreasure(after, { config, minColor, maxFleets });
+    const afterView = viewTreasure(after, { config, colors: wanted, maxFleets });
     console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
     console.log(`  可抢 ${view.targets.length} -> ${afterView.targets.length}，今日奖励 ${after.todayRewardTimes}/${after.dailyLimit}，汽油 ${after.petrol}`);
   } finally {
@@ -892,6 +937,8 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 // 农田默认开（收成熟作物 + 补种），--no-farm 关；间隔 --farm-every（秒，默认 120）。
 // 联盟情报默认开（领奖 + 派兵），--no-radar 关；间隔 --radar-every（秒，默认 60）。
 // 装备厂默认开（收装备 + 锻造），--no-forge 关；间隔 --forge-every（秒，默认 180）。
+// 海兽培育室默认开（收成熟 + 排空位），--no-pet 关；间隔 --pet-every（秒，默认 300），
+// 品质上限 --pet-max-quality（默认 ORANGE，红配方要 season 2 + 100 万金）。
 // 挂机领取默认开（邮件/本段收益/等级奖励/升级），--no-idle 关；间隔 --idle-every（秒，默认 300）。
 async function loopCli({
   allowMutate,
@@ -910,10 +957,15 @@ async function loopCli({
   radarEverySeconds = 60,
   forgeEnabled = true,
   forgeEverySeconds = 180,
+  petEnabled = true,
+  petEverySeconds = 300,
+  petMaxQuality = 'ORANGE',
   idleEnabled = true,
   idleEverySeconds = 300,
   treasureEnabled = true,
   treasureEverySeconds = 60,
+  // 抢哪些货轮等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）；默认只抢万吨。
+  treasureColors = DEFAULT_COLORS,
   minPowerRatio = 1.2,
 }) {
   const { url, login } = loadCredentials();
@@ -938,8 +990,9 @@ async function loopCli({
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
     console.log(`锻造=${forgeEnabled ? (forgeEverySeconds > 0 ? `开(每 ${forgeEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
+    console.log(`海兽培育=${petEnabled ? (petEverySeconds > 0 ? `开(每 ${petEverySeconds}s 看一眼，品质上限 ${petMaxQuality})` : `开(每轮都看，品质上限 ${petMaxQuality})`) : '关'}`);
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
-    console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：只抢无人占领的，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
+    console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -959,10 +1012,14 @@ async function loopCli({
       radarEveryMs: Math.max(0, Number(radarEverySeconds) || 0) * 1000,
       forgeEnabled,
       forgeEveryMs: Math.max(0, Number(forgeEverySeconds) || 0) * 1000,
+      petEnabled,
+      petEveryMs: Math.max(0, Number(petEverySeconds) || 0) * 1000,
+      petMaxQuality,
       idleEnabled,
       idleEveryMs: Math.max(0, Number(idleEverySeconds) || 0) * 1000,
       treasureEnabled,
       treasureEveryMs: Math.max(0, Number(treasureEverySeconds) || 0) * 1000,
+      treasureColors,
       minPowerRatio,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
@@ -970,7 +1027,7 @@ async function loopCli({
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'forge' || entry.phase === 'idle' || entry.phase === 'treasure') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -1167,10 +1224,18 @@ async function main() {
       radarEverySeconds: at('--radar-every', 60),
       forgeEnabled: !process.argv.includes('--no-forge'),
       forgeEverySeconds: at('--forge-every', 180),
+      petEnabled: !process.argv.includes('--no-pet'),
+      petEverySeconds: at('--pet-every', 300),
+      // --pet-max-quality BLUE|PURPLE|ORANGE|RED；脏值回退默认橙。
+      petMaxQuality: PET_QUALITIES.includes(valueArg('--pet-max-quality')) ? valueArg('--pet-max-quality') : 'ORANGE',
       idleEnabled: !process.argv.includes('--no-idle'),
       idleEverySeconds: at('--idle-every', 300),
       treasureEnabled: !process.argv.includes('--no-treasure'),
       treasureEverySeconds: at('--treasure-every', 60),
+      // --treasure-colors 3,5 = 小型+万吨；不给就是默认（只抢万吨）。
+      treasureColors: valueArg('--treasure-colors')
+        ? colorsOf(valueArg('--treasure-colors').split(/[,，\s]+/))
+        : DEFAULT_COLORS,
       minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
@@ -1225,11 +1290,18 @@ async function main() {
   }
 
   if (mode === 'treasure') {
+    // --colors 3,4,5 是多选（3 蓝小型 / 4 紫中型 / 5 橙万吨）；只给 --min-color 时按「≥ 该等级」换算，
+    // 保留旧用法不报错。两个都不给 = 默认只抢万吨（DEFAULT_COLORS）。
+    const minColor = numericArg('--min-color');
+    const colorsArg = valueArg('--colors');
+    const colors = colorsArg
+      ? colorsOf(colorsArg.split(/[,，\s]+/))
+      : (minColor != null ? colorsOf([3, 4, 5].filter((color) => color >= minColor)) : DEFAULT_COLORS);
     await treasureCli({
       dryRun: process.argv.includes('--dry'),
-      // 一次最多派几支舰队；--min-color 3/4/5 = 只抢蓝/紫/橙及以上。
+      // 一次最多派几支舰队。
       maxFleets: numericArg('--max') ?? DEFAULT_MAX_FLEETS,
-      minColor: numericArg('--min-color') ?? DEFAULT_MIN_COLOR,
+      colors,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -1239,6 +1311,15 @@ async function main() {
     await forge({
       dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'pet') {
+    await petCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      maxQuality: PET_QUALITIES.includes(valueArg('--pet-max-quality')) ? valueArg('--pet-max-quality') : 'ORANGE',
     });
     return;
   }

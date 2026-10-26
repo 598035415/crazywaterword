@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { GameClient } from './client.mjs';
-import { attach, ARCHIVE_ROOT, dayOf, listDays, summarizeDay } from './archive.mjs';
+import { attach, ARCHIVE_ROOT, dayOf, listDays, summarizeDay, appendConsole } from './archive.mjs';
 import { loadProtocol } from './proto.mjs';
 import { PAGE } from './page.mjs';
 import { listWorlds, enterWorld, describeRole } from './worlds.mjs';
@@ -17,8 +17,9 @@ import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, l
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyEquip, planEquip, formatEquipPlan } from './equip.mjs';
+import { surveyPet, planPet, formatPetPlan, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
-import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, DEFAULT_MAX_FLEETS, DEFAULT_MIN_COLOR } from './treasure.mjs';
+import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, DEFAULT_MAX_FLEETS, DEFAULT_COLORS, colorsOf, colorsText } from './treasure.mjs';
 import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -26,8 +27,12 @@ import { startCapture, stopCapture, captureState, DEFAULT_PROXY_PORT } from './c
 import { iconIndex, atlasFile, itemIcon, resourceIcon, materialIcon, heroIcon, heroCard, buildingIcon } from './art.mjs';
 
 const LOG_LIMIT = 400;
+// 新开的页面先回放这么多条：SSE 只推增量，不回放的话刷新一次日志窗口就是空的，
+// 而「刷新前那一分钟发生了什么」往往正是要看的。前端按 t|message 去重，重连不会出双行。
+const LOG_REPLAY = 100;
 // 协议帧不再进界面，但仍然要能事后查：时序流水在 data/protocol.log，
-// 完整回包按接口分文件存在 data/responses/<日期>/ —— 两套都由 archive.mjs 负责。
+// 完整回包按接口分文件存在 data/responses/<日期>/，人话的运行记录在 data/console/<日期>.log
+// —— 三套都由 archive.mjs 负责。
 
 const STATE_TEXT = {
   IDLE: '未连接',
@@ -49,14 +54,21 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     while (list.length > LOG_LIMIT) list.shift();
   };
 
+  // 某个连接该看到哪些条目：不带 account 的全局消息谁都看，带 account 的只看自己那一路。
+  const visible = (entry, account) => !account || entry.account === null || entry.account === account;
+
   function emit(session, level, message, extra) {
-    const entry = { t: Date.now(), level, message, extra, account: session?.id ?? null };
+    const t = Date.now();
+    const entry = { t, level, message, extra, account: session?.id ?? null };
     const list = session ? session.log : globalLog;
     list.push(entry);
     logLimit(list);
+    // 内存只留 400 条、刷新就清空，所以每条都同步落盘一份：
+    // 事后要回看「那一轮为什么跳过这一步」，协议流水答不了，只有这行中文能答。
+    appendConsole({ t, level, message, account: entry.account, extra });
     const payload = `data: ${JSON.stringify(entry)}\n\n`;
     for (const res of streams) {
-      if (res.account && res.account !== entry.account && entry.account !== null) continue;
+      if (!visible(entry, res.account)) continue;
       res.write(payload);
     }
     return entry;
@@ -94,6 +106,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         forgeEnabled: true,
         forgeEveryMs: 180_000,
         lastForgeAt: null,
+        // 海兽培育室：收成熟的 + 队列空位排产。蓝配方 4 小时、橙 36 小时，5 分钟看一次足够。
+        // petMaxQuality 是品质上限（默认橙）：红要 season 2 + 100 万金，常态打不开。
+        petEnabled: true,
+        petEveryMs: 300_000,
+        lastPetAt: null,
+        petMaxQuality: 'ORANGE',
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：收益 8 小时封顶、等级奖励是按级一次，
         // 都是小时级节奏，所以默认 5 分钟看一眼，不必每轮多打 3 个请求。
         idleEnabled: true,
@@ -105,7 +123,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         treasureEveryMs: 60_000,
         lastTreasureAt: null,
         treasureMaxFleets: DEFAULT_MAX_FLEETS,
-        treasureMinColor: DEFAULT_MIN_COLOR,
+        // 抢哪些等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）：默认只抢万吨。
+        treasureColors: [...DEFAULT_COLORS],
         minPowerRatio: DEFAULT_MIN_POWER_RATIO,
         stop: { aborted: false },
         history: [],
@@ -368,6 +387,37 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     };
   }
 
+  // 海兽培育室：读队列 + 库存，算「收哪几只、空位排什么」。只读视图，真正的写走 /api/pet/run。
+  async function pet(session, account) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyPet(instance, protocol, { config });
+    const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality });
+    return {
+      buildings: survey.buildings.map((building) => ({
+        buildingId: building.buildingId,
+        level: building.level,
+        maxQ: building.maxQ,
+        jobs: building.jobs.length,
+        mature: building.mature.length,
+      })),
+      mature: survey.mature.map((entry) => ({ petId: entry.petId, star: entry.star })),
+      jobs: survey.jobs.map((job) => ({
+        buildingId: job.buildingId,
+        idx: job.idx,
+        petId: job.petId,
+        star: job.star,
+        remainSeconds: job.remainSeconds,
+        done: job.done,
+      })),
+      maxQ: survey.maxQ,
+      maxQuality: session.loop.petMaxQuality,
+      actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+      notes: plan.notes,
+      text: formatPetPlan(survey, plan),
+    };
+  }
+
   // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：只读视图，真正的领取走 /api/idle/run。
   async function idle(session, account) {
     const instance = await ensureConnected(session, account);
@@ -388,12 +438,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
 
   // 搁浅的货轮（世界宝藏）：只读视图 + 派兵计划，真正的派兵走 /api/treasure/run。
   // 单独跑（不经过循环）时要自己拉库存 —— 只为了那个汽油数。
+  // 等级选择与派船数都取 session.loop 里的当前配置：页面上勾的等级，
+  // 「立刻抢一次」和面板必须跟挂机里那套完全一致，否则同一份设置有两种行为。
   async function treasure(session, account) {
     const instance = await ensureConnected(session, account);
     const config = loadConfigSafe();
+    const colors = colorsOf(session.loop.treasureColors);
+    const maxFleets = session.loop.treasureMaxFleets;
     const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
-    const view = viewTreasure(survey, { config });
-    const plan = planTreasure(view, {});
+    const view = viewTreasure(survey, { config, colors, maxFleets });
+    const plan = planTreasure(view, { maxFleets });
     return {
       // 活动有效期：页面直接据此显示「还有多久到期 / 已结束」。
       activity: view.activity,
@@ -404,7 +458,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       nextRefreshTime: view.nextRefreshTime,
       petrol: view.petrol,
       petrolCost: view.petrolCost,
-      minColor: view.minColor,
+      colors: view.colors,
+      colorText: view.colorText,
       maxFleets: view.maxFleets,
       treasures: view.treasures.map((one) => ({
         uid: one.uid,
@@ -414,6 +469,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         ownerGuildIdx: one.ownerGuildIdx,
         ownerFleetNum: one.ownerFleetNum,
         ourFleets: one.ourFleets,
+        free: one.free,
+        levelOk: one.levelOk,
+        rank: one.rank,
         claimable: one.claimable,
         gridIdx: one.gridIdx,
         rewardText: one.rewardText,
@@ -545,6 +603,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           connection: 'keep-alive',
         });
         res.account = parsed.searchParams.get('account');
+        // 先回放再登记到 streams：反过来的话，回放期间新冒出来的条目会抢在旧条目前面推送。
+        // 切账号时前端会先 clear，所以这里不必担心串号。
+        const source = res.account ? sessionFor(res.account).log : globalLog;
+        for (const entry of source.filter((item) => visible(item, res.account)).slice(-LOG_REPLAY)) {
+          res.write(`data: ${JSON.stringify(entry)}\n\n`);
+        }
         streams.add(res);
         req.on('close', () => streams.delete(res));
         return;
@@ -777,6 +841,35 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
+      if (route === 'GET /api/pet') {
+        const { account, session } = scoped_(parsed);
+        json(await pet(session, account));
+        return;
+      }
+      // 收取成熟的 + 空位排产：跟锻造一样先探测再计划再执行。
+      if (route === 'POST /api/pet/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const survey = await surveyPet(instance, protocol, { config });
+        const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality });
+        const { results } = await runWorld(instance, protocol, plan, {
+          allowMutate: true,
+          window: 800,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `培育「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `培育 ${entry.step.label}` : `培育 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await pet(session, account)),
+        });
+        return;
+      }
       if (route === 'GET /api/idle') {
         const { account, session } = scoped_(parsed);
         json(await idle(session, account));
@@ -805,16 +898,21 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
-      // 搁浅的货轮：手动「立刻抢一次」，判据与循环里那套完全一样（只抢无人占领的）。
+      // 搁浅的货轮：手动「立刻抢一次」，判据与循环里那套完全一样（等级选择取当前配置）。
       if (route === 'POST /api/treasure/run') {
         const payload = jsonBody();
         needConfirm(payload);
         const { account, session } = scoped_(parsed);
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
+        // 页面「立刻抢一次」会把当前勾选的等级带过来：先落进 session.loop，
+        // 这样面板、手动抢、之后启动的挂机看到的是同一份选择（不会出现「勾了却还是按旧的抢」）。
+        if (payload.treasureColors !== undefined) session.loop.treasureColors = colorsOf(payload.treasureColors);
+        const colors = colorsOf(session.loop.treasureColors);
+        const maxFleets = session.loop.treasureMaxFleets;
         const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
-        const view = viewTreasure(survey, { config });
-        const plan = planTreasure(view, {});
+        const view = viewTreasure(survey, { config, colors, maxFleets });
+        const plan = planTreasure(view, { maxFleets });
         const { results } = await runWorld(instance, protocol, plan, {
           allowMutate: true,
           window: 800,
@@ -1095,21 +1193,25 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.forgeEnabled = payload.forge !== false;
         loop.forgeEveryMs = secondsArg(payload.forgeEverySeconds, 180) * 1000;
         loop.lastForgeAt = null;
+        // 海兽培育室默认开，间隔默认 300 秒（蓝配方 4 小时、橙 36 小时，看太勤没意义）。
+        loop.petEnabled = payload.pet !== false;
+        loop.petEveryMs = secondsArg(payload.petEverySeconds, 300) * 1000;
+        loop.lastPetAt = null;
+        loop.petMaxQuality = PET_QUALITIES.includes(payload.petMaxQuality) ? payload.petMaxQuality : 'ORANGE';
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，间隔默认 300 秒。
         loop.idleEnabled = payload.idle !== false;
         loop.idleEveryMs = secondsArg(payload.idleEverySeconds, 300) * 1000;
         loop.lastIdleAt = null;
         // 搁浅的货轮默认开，间隔默认 60 秒（整点刷新，抢的是刷新后那几十秒）。
-        // 品质下限与单次派船数可调：3=蓝(小型) 4=紫(中型) 5=橙(万吨)。
+        // 等级是多选（3=蓝小型 4=紫中型 5=橙万吨），页面上不传才用默认（只抢万吨）；
+        // 显式传空数组 = 一个都不抢（页面上三个全取消勾选就是这个意思，不能悄悄回退默认）。
         loop.treasureEnabled = payload.treasure !== false;
         loop.treasureEveryMs = secondsArg(payload.treasureEverySeconds, 60) * 1000;
         loop.lastTreasureAt = null;
         loop.treasureMaxFleets = Number.isFinite(Number(payload.treasureMaxFleets)) && Number(payload.treasureMaxFleets) > 0
           ? Math.min(10, Math.floor(Number(payload.treasureMaxFleets)))
           : DEFAULT_MAX_FLEETS;
-        loop.treasureMinColor = Number.isFinite(Number(payload.treasureMinColor)) && Number(payload.treasureMinColor) >= 3
-          ? Math.min(5, Math.floor(Number(payload.treasureMinColor)))
-          : DEFAULT_MIN_COLOR;
+        loop.treasureColors = colorsOf(payload.treasureColors);
         loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
         loop.history = [];
         loop.error = null;
@@ -1124,13 +1226,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const forgeText = loop.forgeEnabled
           ? (loop.forgeEveryMs > 0 ? `锻造每 ${Math.round(loop.forgeEveryMs / 1000)} 秒看一眼` : '锻造每轮都看')
           : '锻造关';
+        const petText = loop.petEnabled
+          ? (loop.petEveryMs > 0 ? `海兽培育每 ${Math.round(loop.petEveryMs / 1000)} 秒看一眼（品质上限 ${loop.petMaxQuality}）` : `海兽培育每轮都看（品质上限 ${loop.petMaxQuality}）`)
+          : '海兽培育关';
         const idleText = loop.idleEnabled
           ? (loop.idleEveryMs > 0 ? `挂机领取每 ${Math.round(loop.idleEveryMs / 1000)} 秒看一眼` : '挂机领取每轮都看')
           : '挂机领取关';
         const treasureText = loop.treasureEnabled
-          ? (loop.treasureEveryMs > 0 ? `货轮每 ${Math.round(loop.treasureEveryMs / 1000)} 秒抢一次` : '货轮每轮都抢')
+          ? (loop.treasureEveryMs > 0
+            ? `货轮每 ${Math.round(loop.treasureEveryMs / 1000)} 秒抢一次（${loop.treasureColors.length > 0 ? `抢 ${colorsText(config, loop.treasureColors)}` : '未勾等级，不会派船'}）`
+            : `货轮每轮都抢（${loop.treasureColors.length > 0 ? `抢 ${colorsText(config, loop.treasureColors)}` : '未勾等级，不会派船'}）`)
           : '货轮关';
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${radarText}；${forgeText}`);
+        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${radarText}；${forgeText}；${petText}`);
         runLoop(instance, protocol, {
           config,
           player: session.player,
@@ -1148,12 +1255,15 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           radarEveryMs: loop.radarEveryMs,
           forgeEnabled: loop.forgeEnabled,
           forgeEveryMs: loop.forgeEveryMs,
+          petEnabled: loop.petEnabled,
+          petEveryMs: loop.petEveryMs,
+          petMaxQuality: loop.petMaxQuality,
           idleEnabled: loop.idleEnabled,
           idleEveryMs: loop.idleEveryMs,
           treasureEnabled: loop.treasureEnabled,
           treasureEveryMs: loop.treasureEveryMs,
           treasureMaxFleets: loop.treasureMaxFleets,
-          treasureMinColor: loop.treasureMinColor,
+          treasureColors: loop.treasureColors,
           minPowerRatio: loop.minPowerRatio,
           stop: loop.stop,
           onRound: (summary) => {
@@ -1162,6 +1272,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastFarmAt = summary.gates?.farm?.lastAt ?? loop.lastFarmAt;
             loop.lastRadarAt = summary.gates?.radar?.lastAt ?? loop.lastRadarAt;
             loop.lastForgeAt = summary.gates?.forge?.lastAt ?? loop.lastForgeAt;
+            loop.lastPetAt = summary.gates?.pet?.lastAt ?? loop.lastPetAt;
             loop.lastIdleAt = summary.gates?.idle?.lastAt ?? loop.lastIdleAt;
             loop.lastTreasureAt = summary.gates?.treasure?.lastAt ?? loop.lastTreasureAt;
             loop.history.push(summary);
@@ -1231,6 +1342,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       forgeEnabled: loop.forgeEnabled,
       forgeEveryMs: loop.forgeEveryMs,
       lastForgeAt: loop.lastForgeAt,
+      petEnabled: loop.petEnabled,
+      petEveryMs: loop.petEveryMs,
+      lastPetAt: loop.lastPetAt,
+      petMaxQuality: loop.petMaxQuality,
       idleEnabled: loop.idleEnabled,
       idleEveryMs: loop.idleEveryMs,
       lastIdleAt: loop.lastIdleAt,
@@ -1238,7 +1353,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       treasureEveryMs: loop.treasureEveryMs,
       lastTreasureAt: loop.lastTreasureAt,
       treasureMaxFleets: loop.treasureMaxFleets,
-      treasureMinColor: loop.treasureMinColor,
+      treasureColors: loop.treasureColors,
       minPowerRatio: loop.minPowerRatio,
       history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
       error: loop.error,
