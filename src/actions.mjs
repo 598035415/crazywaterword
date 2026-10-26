@@ -189,6 +189,17 @@ export const ACTIONS = {
     params: ['buildingId', 'productId'],
     body: ({ buildingId, productId }) => ({ buildingId, productId }),
   },
+  // 礼包码兑换。客户端 GiftCodePop._onBtnGotReward 就是发 `GotGiftCodeRequest{giftCode}`，
+  // 协议表里**没有 GotGiftCodeResponse**（服务端静默，奖励靠推送与红包弹窗），所以走 sendWatch。
+  // 码值不做大小写归一：客户端把输入框原文直接发，服务端是否忽略大小写由它决定。
+  giftCode: {
+    request: 'GotGiftCodeRequest',
+    response: null,
+    mutate: true,
+    desc: '兑换礼包码（公告/补偿码），成功与否看是否推 PromptResponse',
+    params: ['giftCode'],
+    body: ({ giftCode }) => ({ giftCode: String(giftCode).trim() }),
+  },
   selectPack: {
     request: 'SelectPackRequest',
     response: null,

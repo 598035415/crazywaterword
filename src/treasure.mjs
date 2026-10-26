@@ -475,6 +475,53 @@ export function viewTreasure(survey, {
   };
 }
 
+// 「接下来一段时间都不用再探测」的时间点 —— 返回 { until, reason, forever }。
+//
+// 判据必须是**确定要到某个时刻才会变**的状态，其余情况（没空闲船 / 汽油不够 / 船在航行）
+// 都是几分钟内自己会变，静默掉就会漏掉刷新窗口，所以一律不跳过：
+//   1. 活动结束（赛季封盘）→ 本季彻底不用再问；
+//   2. 今日奖励满了 → 明天 0 点重置前，探测也不可能有任何动作；
+//   3. 勾选等级里一个可抢的都没有 → 等到下一个整点刷新为止（进度只会涨、等级不会变、
+//      「我方占满 10 支」也要等结算，这段时间里探测结果稳定）。
+//
+// 3 的等待时长用服务端给的 nextRefreshTime，但**封顶 12 小时**：万一服务端给了一个
+// 脏时间，不能把整段挂机静默掉（22:00 收摊到次日 8:00 是 10 小时，落在上限内）。
+export const SKIP_MAX_MS = 12 * 3600 * 1000;
+
+export function skipUntilOf(view, { now = Date.now() } = {}) {
+  if (view.activity?.expired) {
+    return { until: Number.MAX_SAFE_INTEGER, reason: '活动已结束', forever: true };
+  }
+  if (view.dailyFull) {
+    // 次日 00:00:05：留 5 秒给服务端重置（日志里出现过 0 点后几秒还是满的次数）。
+    const reset = new Date(now);
+    reset.setHours(24, 0, 5, 0);
+    return {
+      until: reset.getTime(),
+      reason: `今日奖励已满 ${view.todayRewardTimes}/${view.dailyLimit}`,
+      forever: false,
+    };
+  }
+  const next = Number(view.nextRefreshTime) * 1000;
+  if ((view.targets?.length ?? 0) === 0 && next > now) {
+    const why = (view.colors?.length ?? 0) === 0
+      ? '未勾选任何货轮等级'
+      : `没有可抢的货轮（只抢 ${view.colorText}）`;
+    return { until: Math.min(next, now + SKIP_MAX_MS), reason: why, forever: false };
+  }
+  return { until: 0, reason: '', forever: false };
+}
+
+// 每日奖励次数的统一口径（日志 / CLI / 页面同一个说法）：
+//   已领 1/3（还能领 2 次） / 已领 3/3（已满，明天 0 点重置） / 已领 ?/3（拿不到次数就不派）
+export function rewardCountText(view) {
+  const limit = Number(view.dailyLimit) || FALLBACK_DAILY_LIMIT;
+  const today = view.todayRewardTimes;
+  if (today == null) return `已领 ?/${limit}（拿不到次数，保守不派）`;
+  if (view.dailyFull) return `已领 ${today}/${limit}（已满，明天 0 点重置）`;
+  return `已领 ${today}/${limit}（还能领 ${Math.max(0, limit - today)} 次）`;
+}
+
 // 计划：一次只抢**一个**货轮（勾选等级里最值的那个），把空闲舰队压上去把进度推快。
 //
 // 为什么不分兵：同联盟最多 10 支占同一个货轮，进度是"所有占领者同速推进"，船越多越快结算；

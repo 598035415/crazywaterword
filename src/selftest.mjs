@@ -4,7 +4,7 @@ import { loadProtocol } from './proto.mjs';
 import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
 import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
-import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap } from './loop.mjs';
+import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap, MIN_LOOP_GAP_MS } from './loop.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -459,6 +459,116 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 主战英雄养成（勋章 + 装备）：上限、预算共享、替换方向都拿合成回包钉住。
+// 这一组要覆盖的是「发出去的请求是不是客户端也会发的」，不是服务端会不会接受。
+{
+  const { surveyHeroGrowth, planHeroGrowth } = await import('./heroGrow.mjs');
+  const config = { tables: {
+    HeroCfg: { data: [{ id: 'A', career: '法师', quality: 'BLUE', qualityIndex: 1 }] },
+    HeroBadgeCfg: { data: [{ id: '蓝法师徽章', career: '法师', quality: 'BLUE', qualityIndex: 1 }] },
+    // 上限只由「徽章 id + 星级」决定：1 星最高 3 级。
+    HeroBadgeAttrCfg: { data: [{ id: '蓝法师徽章', star: 1, maxLevel: 3, exp: 1 }, { id: '蓝法师徽章', star: 2, maxLevel: 4, exp: 1 }] },
+    HeroBadgeLevelCfg: { data: [
+      { level: 1, exp: 0, goldExpRadio: 0 },
+      { level: 2, exp: 10, goldExpRadio: 5 },
+      { level: 3, exp: 10, goldExpRadio: 5 },
+      { level: 4, exp: 10, goldExpRadio: 5 },
+    ] },
+    HeroBadgeStarCfg: { data: [{ star: 1, upBadgeNum: 1, equalBadgeNum: 2, consume: ['GOLD', 100] }] },
+    HeroBadgeUnlockCfg: { data: [{ pos: 1, level: 1 }, { pos: 2, level: 70 }] },
+    EquipCfg: { data: [{ id: '蓝武器1', type: '武器', quality: 'BLUE', qualityIndex: 1 }] },
+    EquipAttrCfg: { data: [{ id: '蓝武器1', star: '0', maxLv: 3, maxRefineLv: 2 }] },
+    EquipUpDecomposeCfg: { data: [{ level: 1, upgradeCost: 0 }, { level: 2, upgradeCost: 100 }, { level: 3, upgradeCost: 100 }] },
+    EquipRefineCfg: { data: [{ level: 1, costItem1: 50, costItem2: 1 }, { level: 2, costItem1: 50, costItem2: 1 }] },
+    EquipUpStarCfg: { data: [{ star: 1, upCosts: [['装备升星石', 1], ['精铁', 10]] }] },
+  } };
+  const responses = {
+    AllHeroResponse: { heroes: [
+      {
+        heroId: 'A', level: 50, star: 1, power: { low: 100, high: 0 }, skillLevels: [],
+        // 身上的勋章是 1 星 1 级，背包装着 2 星 2 级 —— 应当替换，且 downUid=新的那件。
+        badges: [{ pos: 1, uid: 11, badgeId: '蓝法师徽章', level: 1, exp: 0, star: 1 }],
+        equips: [{ uid: 21, equipId: '蓝武器1', level: 1, star: 0, refineLv: 0 }],
+      },
+      {
+        // B 不在出战阵容里：默认计划不该碰它，勾「含未上阵」才轮到。
+        heroId: 'B', level: 50, star: 1, power: { low: 100, high: 0 }, skillLevels: [],
+        badges: [{ pos: 1, uid: 12, badgeId: '蓝法师徽章', level: 1, exp: 0, star: 1 }],
+        equips: [{ uid: 22, equipId: '蓝武器1', level: 1, star: 0, refineLv: 0 }],
+      },
+    ] },
+    // 主战阵容（FormationModule.MAINLINE=1）只有 A。
+    GetFormationResponse: { formation: { heroPositions: [{ heroId: 'A', pos: { x: 1, y: 1 } }], presetId: 11 } },
+    BadgesResponse: { badge: [
+      { uid: 11, badgeId: '蓝法师徽章', level: 1, exp: 0, star: 1 },
+      { uid: 12, badgeId: '蓝法师徽章', level: 1, exp: 0, star: 1 },
+      { uid: 99, badgeId: '蓝法师徽章', level: 2, exp: 0, star: 2 },
+    ] },
+    EquipsResponse: { equip: [] },
+    AllItemResponse: { items: [
+      { itemId: '徽章经验', num: { low: 100, high: 0 } },
+      { itemId: '精铁', num: { low: 300, high: 0 } },
+      { itemId: '精炼石', num: { low: 5, high: 0 } },
+    ] },
+    AllResourceResponse: { list: [{ res: 3, amount: { low: 10000, high: 0 } }] },
+  };
+  const fake = { request: async (name, body, response) => responses[response] };
+  const protocol = Object.fromEntries(Object.keys(responses).map((name) => [name, 1]).concat(['AllHeroRequest', 'BadgesRequest', 'EquipsRequest', 'AllItemRequest', 'AllResourceRequest', 'GetFormationRequest'].map((name) => [name, 1])));
+
+  const survey = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 60 });
+  assert.equal(survey.heroes.length, 2);
+  assert.deepEqual(survey.formation.heroIds, ['A'], 'formation tells which heroes are on the mainline team');
+  assert.equal(survey.heroes.find((hero) => hero.heroId === 'A').front, true);
+  assert.equal(survey.heroes.find((hero) => hero.heroId === 'B').front, false);
+  assert.equal(survey.stock.get('GOLD'), 10000, 'GOLD comes from AllResourceResponse, not AllItemResponse');
+  assert.equal(survey.badgeBag.filter((one) => one.worn).length, 2, 'the worn badges are flagged');
+
+  const plan = planHeroGrowth(survey);
+  // 主战英雄之外的一律不碰：材料优先给出战的那几个。
+  assert.deepEqual(plan.heroes.map((one) => one.heroId), ['A'], 'only the mainline team is groomed by default');
+  const bench = planHeroGrowth(survey, { onlyFront: false });
+  assert.deepEqual(bench.heroes.map((one) => one.heroId).sort(), ['A', 'B'], 'includeBench covers the whole roster');
+
+  const first = plan.actions[0];
+  assert.equal(first.kind, 'badgeReplace', 'replace happens before enhance: the materials should land on the better badge');
+  assert.equal(first.body.downUid, 99, 'downUid is the badge being put on');
+  assert.equal(first.body.upUid, 11, 'upUid is the badge being taken off');
+  assert.equal(first.request, 'BadgeReplaceRequest');
+
+  // 替换后身上是 2 星 2 级（上限 4），强化到 4 级要 2 级 × 10 点经验。
+  const enhance = plan.actions.find((one) => one.kind === 'badgeEnhance');
+  assert.ok(enhance, 'the replaced badge can still be enhanced');
+  assert.equal(enhance.body.uid, 99, 'enhance targets the badge that is now worn');
+  assert.equal(enhance.body.expItemNum, 20, 'two levels at 10 exp each');
+  assert.deepEqual(enhance.body.decomposeUid, [], 'never decompose badges');
+
+  // 装备：升级 1→3 花 200 精铁，剩下 100 够 2 级精炼（50 精铁 + 1 精炼石/级）。
+  const levels = plan.actions.filter((one) => one.kind === 'equipLevel');
+  assert.equal(levels.length, 2, 'one request per equipment level');
+  assert.equal(levels[0].request, 'EnhanceEquipRequest', 'equipment level-up is EnhanceEquipRequest');
+  const refined = plan.actions.filter((one) => one.kind === 'equipRefine');
+  assert.equal(refined.length, 2, 'refine is capped by maxRefineLv, not by material alone');
+  assert.equal(refined[0].request, 'EquipRefineRequest');
+  // 升星要 10 精铁 + 1 装备升星石，材料表里没有升星石 —— 一条都不该排。
+  assert.equal(plan.actions.filter((one) => one.kind === 'equipStar').length, 0, 'missing star stone blocks equipment star-up');
+
+  // 预算共享：精铁只够一件装备升一级时，第二个英雄不该再排升级（不能各自按满库存算）。
+  const thin = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 60 });
+  thin.stock.set('精铁', 100);
+  thin.heroes = [
+    { ...survey.heroes[0], heroId: 'A', front: true, equips: [] },
+    { ...survey.heroes[0], heroId: 'B', front: false, equips: [] },
+  ];
+  thin.equipBag = [{ ...describeThinEquip(), uid: 31 }, { ...describeThinEquip(), uid: 32 }];
+  const thinPlan = planHeroGrowth(thin, { onlyFront: false, switches: { badgeReplace: false, badgeEnhance: false, equipRefine: false, equipStar: false, equipReplace: true } });
+  assert.equal(thinPlan.actions.filter((one) => one.kind === 'equipLevel').length, 1, 'a shared iron budget is spent once, not per hero');
+
+  function describeThinEquip() {
+    return { uid: 0, equipId: '蓝武器1', type: '武器', quality: 'BLUE', qualityName: '蓝', qualityIndex: 1, level: 1, star: 0, refineLv: 0, score: 10000 };
+  }
+  checked += 1;
+}
+
 // 日常驱动：免费/付费点金的分支、以及地图没野怪时不给动作。
 {
   const { DAILY_DRIVERS, TASK_TITLES } = await import('./dailies.mjs');
@@ -491,6 +601,20 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const noPirates = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 0, targetProgress: 5 }, probe: () => ({ pirates: [] }), items: new Map(), ruby: 0, now: 0, config });
   assert.equal(noPirates.status, 'blocked', 'an empty pirate map plans nothing');
   assert.equal(noPirates.actions, undefined);
+
+  // sweepTimes 是免战扫荡的剩余次数，跟 pirates 一起下发。为 0 还发 PirateSweepRequest，
+  // 服务端只会回 PromptResponse「cannot sweep」——归档里进度卡在 1/5 的账号每 60 秒撞一次。
+  const pirateProbe = (uids, sweepTimes) => () => ({ pirates: uids.map((uid) => ({ uid, cityId: 9 })), sweepTimes });
+  const outOfSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2], 0), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(outOfSweeps.status, 'blocked', '扫荡次数为 0 时不能再发 PirateSweepRequest');
+  assert.equal(outOfSweeps.actions, undefined);
+  assert.ok(outOfSweeps.reason.includes('扫荡次数已用完'), `原因要说清是次数用完，实际：${outOfSweeps.reason}`);
+
+  const fewSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 2), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(fewSweeps.actions.length, 2, '剩余次数不够时只发这么多次，剩下的留到下次');
+
+  const enoughSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 3, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 9), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(enoughSweeps.actions.length, 2, '次数够时按「还差几次」发，不把地图上的海盗全扫一遍');
 
   const stage = DAILY_DRIVERS[1003].evaluate({ task: { id: 1003, progress: 0, targetProgress: 1 }, probe: () => null, items: new Map(), ruby: 0, now: 0, config, player: { mainlineStage: 41, level: 11 } });
   assert.equal(stage.actions[0].body.stage, 41, 'mainline battle targets PlayerInfo.mainlineStage');
@@ -1395,8 +1519,10 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 // 海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满。
 // 三条判据都照客户端 PetBreedView._onBtnBreed：队列位为空 + 基因够 + 金币够。
 {
-  const { planPet, pickRecipes, breedBuildingsOf, recipesOf } = await import('./pet.mjs');
+  const { planPet, pickRecipes, breedBuildingsOf, recipesOf, petSpeedSeconds } = await import('./pet.mjs');
   const config = { tables: {
+    // 材料加速一次减多少秒：客户端 PetUtil.breedSpeedSeconds() 读的就是这一行。
+    PetParamCfg: { data: [{ paramName: '投喂减少培育时间', paramValue: 14400 }] },
     PetSpeciesCfg: { data: [{ spId: 1, name: '声波海豚' }, { spId: 2, name: '铁炮鲨鱼' }] },
     PetBreedCfg: { data: [
       { petId: '蓝宠物1', spId: 1, quality: 'BLUE', qualityIndex: 1, breedTime: 14400, season: 1, cost: [['宠物1蓝基因', 80], ['GOLD', 4000]] },
@@ -1488,6 +1614,64 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(picked.length, 1, '只挑培育室');
   assert.equal(picked[0].maxQ, 3, 'maxQLength 以服务端给的为准，不按等级猜');
   assert.deepEqual(picked[0].mature, [{ petId: '蓝宠物1', star: 1 }]);
+
+  // 材料加速（投喂，2026-10-26 新增，页面勾选默认开）：
+  // `PetFeedRequest{jobIdx}` 消耗该队列位的 feedRequirements，把剩余时间往前推
+  // PetParamCfg「投喂减少培育时间」（本服 14400 = 4 小时）。判据照客户端 `_onBtnFood`。
+  assert.equal(petSpeedSeconds(config), 14400, '加速秒数从 PetParamCfg 读');
+  assert.equal(petSpeedSeconds({ tables: {} }), 14400, '配置缺失时回兜底的 4 小时');
+  const feeding = (over = {}) => ({
+    idx: 1, petId: '蓝宠物1', star: 0, finishTime: 9000, remainSeconds: 8000, done: false,
+    feed: [{ id: '烤鱼', num: 40 }, { id: '粗铁', num: 4 }],
+    ...over,
+  });
+  const feedSurvey = (job, extra = {}) => surveyFor({
+    buildings: [building({ maxQ: 3, jobs: [job] })],
+    jobs: [{ ...job, buildingId: '1宠物培育室' }],
+    maxQ: 3,
+    stock: new Map([['烤鱼', 100], ['粗铁', 100], ['宠物1蓝基因', 800], ['GOLD', 100_000]]),
+    ...extra,
+  });
+  const feedActions = (plan) => plan.actions.filter((action) => action.kind === 'petFeed');
+  const fed = planPet(feedSurvey(feeding()), { config });
+  const feedAction = feedActions(fed)[0];
+  assert.ok(feedAction, '默认就带材料加速（勾选默认开）');
+  assert.equal(feedAction.request, 'PetFeedRequest');
+  assert.equal(feedAction.response, null, '投喂没有配套回包，走 sendWatch');
+  assert.deepEqual(feedAction.body, { jobIdx: 1 }, '按队列位 idx 投喂');
+  assert.equal(feedAction.transient, true, '投喂失败多是瞬时状态，不能记进 rejected 永远跳过');
+  // 剩余比一次的减免还短 → 一次就完工（别写成「减 4 小时」让人以为多扣了）。
+  assert.ok(feedAction.label.includes('一次就完工'), `剩 8000 秒（<4 小时）应写「一次就完工」，实际：${feedAction.label}`);
+  const longJob = feedActions(planPet(feedSurvey(feeding({ remainSeconds: 40000, finishTime: 41000 })), { config }))[0];
+  assert.ok(longJob.label.includes('减 4.0 小时'), `剩 11 小时时要写清减多少，实际：${longJob.label}`);
+  // key 必须随 finishTime 变，否则同一个队列位喂第二次会被上一次的失败记录挡住。
+  const fedAgain = feedActions(planPet(feedSurvey(feeding({ finishTime: 7000 })), { config }))[0];
+  assert.notEqual(fedAgain.key, feedAction.key, 'key 带 finishTime，喂完再来一次是新 key');
+  // 勾掉就一个投喂动作都没有（页面「材料加速」不勾的情况）。
+  assert.equal(feedActions(planPet(feedSurvey(feeding()), { config, allowFeed: false })).length, 0,
+    '关掉材料加速就不投喂');
+  // 材料不齐：跳过并说明缺什么（客户端那里会弹「购买补齐」，我们不买）。
+  const poor = planPet(feedSurvey(feeding(), {
+    stock: new Map([['烤鱼', 10], ['粗铁', 4], ['宠物1蓝基因', 800], ['GOLD', 100_000]]),
+  }), { config });
+  assert.equal(feedActions(poor).length, 0, '材料不够不投喂');
+  assert.ok(poor.notes.some((note) => note.includes('材料不够加速') && note.includes('烤鱼×30')),
+    `要说清缺什么，实际：${poor.notes.join(' / ')}`);
+  // 剩不到 5 分钟不喂：材料是真花掉的，下一轮本来就收了。
+  assert.equal(feedActions(planPet(feedSurvey(feeding({ remainSeconds: 120 })), { config })).length, 0,
+    '剩 2 分钟不喂');
+  // 已经到点的先收，不喂。
+  assert.equal(feedActions(planPet(feedSurvey(feeding({ remainSeconds: 0, done: true, finishTime: 999 })), { config })).length, 0,
+    '到点了不喂，等 GetMaturePet 收');
+  // 余额跨队列位共享：两个位各要 40 烤鱼但只有 40 → 只喂一个，不能各算一遍。
+  const twoJobs = [feeding({ idx: 1 }), feeding({ idx: 2, finishTime: 9500 })];
+  const shared = planPet(surveyFor({
+    buildings: [building({ maxQ: 3, jobs: twoJobs })],
+    jobs: twoJobs.map((job) => ({ ...job, buildingId: '1宠物培育室' })),
+    maxQ: 3,
+    stock: new Map([['烤鱼', 40], ['粗铁', 8], ['宠物1蓝基因', 800], ['GOLD', 100_000]]),
+  }), { config });
+  assert.equal(feedActions(shared).length, 1, '同一批材料不能给两个队列位各算一遍');
   checked += 1;
 }
 
@@ -1594,6 +1778,90 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     stepKey({ kind: 'selectPack', body: { selectItemId: '木材' } }),
     stepKey({ kind: 'selectPack', body: { selectItemId: '玻璃' } }),
   );
+  checked += 1;
+}
+
+// 排产也要能用自选包补料。以前兜底只接在建造 / 交单 / 升级三处，
+// 工厂缺料就整座空转（实测：切鱼厂 鱼油 要 鱼×50，仓库只有 7，而原料自选包有 25 万个）。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '切鱼厂' }] },
+    BuildingProduceCfg: { data: [
+      { buildType: '切鱼厂', itemId: '鱼油', produceTime: 1380, unlockLevel: 3, costItem: [['鱼', 50], ['玻璃', 30]] },
+      { buildType: '切鱼厂', itemId: '鱼皮', produceTime: 2700, unlockLevel: 4, costItem: [['鱼', 120], ['布匹', 80]] },
+    ] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [
+      { itemId: '原料自选包', selectItemId: '鱼', type: '道具', num: 1, season: 1 },
+      { itemId: '原料自选包', selectItemId: '玻璃', type: '道具', num: 1, season: 1 },
+      { itemId: '蓝装材料自选包', selectItemId: '布匹', type: '道具', num: 1, season: 1 },
+    ] },
+  } };
+  const surveyFor = ({ stock = {}, level = 3 } = {}) => {
+    const map = new Map(Object.entries(stock));
+    const factory = {
+      buildingId: '1切鱼厂', type: '切鱼厂', level, product: [],
+      factory: { factoryQ: [], finishedProducts: [], autoProductId: '' },
+    };
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock: map, have: (id) => map.get(id) ?? 0, stockCap: 9999, factorySlots: 6,
+      buildings: [factory], factories: [factory], orders: [],
+      produce: { reduce: 0, instant: [], source: 'none' },
+    };
+  };
+  const packsOf = (plan) => plan.actions.filter((a) => a.kind === 'selectPack');
+  const producesOf = (plan) => plan.actions.filter((a) => a.kind === 'startProduce');
+  const rich = { 鱼: 7, 玻璃: 1886, 原料自选包: 253_516 };
+
+  // 额度不够一轮补满（缺口 43 > 每轮 20）：只兑 20、本轮不排，但**必须落账**（下轮接着补）。
+  // 不落账的话 43 的缺口永远兑不出，鱼油这条配方就再也排不上了。
+  const partial = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 20 });
+  assert.equal(packsOf(partial).length, 1, '缺口能兑时排产会先兑料');
+  assert.equal(packsOf(partial)[0].body.selectItemId, '鱼', '兑的是缺的那个材料');
+  assert.equal(packsOf(partial)[0].body.num, 20, '每轮额度 20 卡住，不会一次兑 43');
+  assert.equal(producesOf(partial).length, 0, '料还没凑齐就先不排');
+  assert.ok(partial.notes.some((n) => n.includes('下一轮继续')), '要说明这是分轮补，不是不干了');
+
+  // 额度够 → 兑 43 补齐再排，且兑换排在排产前面（数组顺序即执行顺序）。
+  const full = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 100 });
+  assert.equal(packsOf(full)[0].body.num, 43, '缺 43 就兑 43');
+  assert.ok(full.actions.findIndex((a) => a.kind === 'selectPack') < full.actions.findIndex((a) => a.kind === 'startProduce'),
+    '兑换必须排在排产之前');
+  assert.equal(producesOf(full)[0].body.productId, '鱼油', '补齐后排的就是这条配方');
+  assert.ok(full.notes.some((n) => n.includes('用自选包补齐后开排')), '日志要说清料是兑出来的');
+
+  // 分轮累积的最后一轮：只剩 3 个缺口 → 兑 3 个就能排。
+  const nearly = planWorld(surveyFor({ stock: { ...rich, 鱼: 47 } }), { config, maxPackPerRound: 20 });
+  assert.equal(packsOf(nearly)[0].body.num, 3, '只补剩下的缺口');
+  assert.equal(producesOf(nearly).length, 1, '这一轮就能排上了');
+
+  // 关掉开关：一个包都不碰，只写原因。
+  const off = planWorld(surveyFor({ stock: rich }), { config, useSelectPack: false });
+  assert.equal(packsOf(off).length, 0, '--no-pack 时排产也不许烧包');
+  assert.equal(producesOf(off).length, 0, '否则不该排');
+  assert.ok(off.notes.some((n) => n.includes('料不够')), '要写清为什么空着');
+
+  // 有缺口换不出来（布匹只存在稀有的蓝装材料包里）：连别的料也不兑，直接空着。
+  // 否则会白兑 20 个鱼，配方照样排不上。
+  const blockedConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '鱼皮', produceTime: 2700, unlockLevel: 1, costItem: [['鱼', 120], ['布匹', 80]] },
+  ] } } };
+  const blocked = planWorld(surveyFor({ stock: { 鱼: 7, 布匹: 0, 原料自选包: 253_516 } }), { config: blockedConfig });
+  assert.equal(packsOf(blocked).length, 0, '有换不出来的材料就不兑（免得白烧包）');
+  assert.equal(producesOf(blocked).length, 0, '也不排');
+  assert.ok(blocked.notes.some((n) => n.includes('自选包也补不上')), '原因要写清楚');
+
+  // 料够的配方优先，不为高档配方烧包：鱼 7 够生鱼片(6) 时不该动 50 的鱼油。
+  const cheapFirst = planWorld(surveyFor({ stock: rich, level: 3 }), {
+    config: { tables: { ...config.tables, BuildingProduceCfg: { data: [
+      { buildType: '切鱼厂', itemId: '鱼油', produceTime: 1380, unlockLevel: 1, costItem: [['鱼', 50], ['玻璃', 30]] },
+      { buildType: '切鱼厂', itemId: '生鱼片', produceTime: 90, unlockLevel: 1, costItem: [['鱼', 6]] },
+    ] } } },
+  });
+  assert.equal(packsOf(cheapFirst).length, 0, '能免费排的配方先排，不为它兑料');
+  assert.equal(producesOf(cheapFirst)[0].body.productId, '生鱼片', '优先排料够的那条');
   checked += 1;
 }
 
@@ -1980,6 +2248,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     'DenyOrderRequest', 'SpeedUpFactoryProduceRequest', 'SetBuildingAutoWorkRequest',
     'QuickGotReadEmailRequest', 'DrawDailyRewardRequest', 'DrawWeeklyRewardRequest', 'MonthCardDailyRewardRequest',
     'ChallengeResFieldRequest', 'GiveUpResFieldRequest', 'SelectPackRequest',
+    'GotGiftCodeRequest',
   ]);
   const sent = [];
   const client = {
@@ -1996,7 +2265,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     }
     if (!action.mutate) continue;
     sent.length = 0;
-    await runAction(client, protocol, id, { buildingId: 'x', productId: 'y', taskId: 1, index: 1, gridIdx: 1, useNum: 1, level: 1, isOn: true, id: 1, itemId: '原料自选包', selectItemId: '木材', num: 1, floaterId: 'f1' }, { allowMutate: true });
+    await runAction(client, protocol, id, { buildingId: 'x', productId: 'y', taskId: 1, index: 1, gridIdx: 1, useNum: 1, level: 1, isOn: true, id: 1, itemId: '原料自选包', selectItemId: '木材', num: 1, floaterId: 'f1', giftCode: 'VIP666' }, { allowMutate: true });
     assert.equal(sent.length, 1, `${id} sends exactly one message`);
     assert.equal(sent[0].via, action.response ? 'request' : 'watch', `${id} must go through ${action.response ? 'request' : 'watch'}`);
   }
@@ -2280,8 +2549,13 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 {
   const every = 5 * 60_000;
   assert.equal(gateDue(0, every, 1_000_000), true, '没执行过（lastAt=0）时首次立刻执行');
-  assert.equal(gateDue(1_000_000, every, 1_000_000 + every - 1), false, '差 1ms 到间隔就还是不发');
+  // 容差：轮首时刻与「真的执行时刻」天然差几秒，所以差 1ms 也算到点（否则间隔=轮间隔的
+  // 模块会永远差那几秒，变成两轮才跑一次）。容差是 every 的 10%，最多 2 秒。
+  assert.equal(gateDue(1_000_000, every, 1_000_000 + every - 1), true, '差 1ms 到间隔时算已到（容差内）');
   assert.equal(gateDue(1_000_000, every, 1_000_000 + every), true, '刚好到间隔就该发');
+  assert.equal(gateDue(1_000_000, every, 1_000_000 + every - 2001), false, '离间隔还差 2 秒以上仍然不发');
+  assert.equal(gateDue(1_000_000, 60_000, 1_000_000 + 59_000), true, '60 秒的间隔容差 2 秒，59 秒时就可以跑');
+  assert.equal(gateDue(1_000_000, 60_000, 1_000_000 + 57_000), false, '57 秒还没到，别提前打');
   assert.equal(gateDue(1_000_000, 0, 1_000_001), true, '间隔 0 = 不限制，每轮都试');
   assert.equal(gateDue(1_000_000, -5000, 1_000_001), true, '负数间隔也按不限制处理');
 
@@ -2298,8 +2572,96 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(loopTotal(-1), Infinity, '负数仍然是「一直跑」');
   assert.equal(loopGap('abc'), 60_000, '非法间隔回退 60 秒，不能退化成 1ms');
   assert.equal(loopGap(-5), 60_000, '负数间隔回退 60 秒');
-  assert.equal(loopGap(0), 0, '0 仍然是「不节流」');
-  assert.equal(loopGap(1500), 1500, '正常间隔原样透传');
+  // 主循环的 0 和别的 gate 不一样：别的填 0 是「每轮最多一次」，主循环填 0 是「上一轮结束立刻
+  // 开下一轮」—— 一小时几千次探测。所以给一个下限，不能退化成不等待。
+  assert.equal(loopGap(0), MIN_LOOP_GAP_MS, '主循环间隔填 0 必须钳到下限，否则高频轰炸网关');
+  assert.equal(loopGap(1500), MIN_LOOP_GAP_MS, '小于下限的间隔同样钳到下限');
+  assert.equal(loopGap(1500), 5000, '下限就是 5 秒');
+  assert.equal(loopGap(60_000), 60_000, '正常间隔原样透传');
+  checked += 1;
+}
+
+// 自动循环的三个「手感」问题（2026-10-26 修）：
+//   ① 改完设置必须停掉重开 —— 现在 live() 每轮重读，下一轮就生效；
+//   ② 点停止要等整轮跑完 —— 现在段级检查，当前这一段结束就退出；
+//   ③ 周期 = 间隔 + 本轮耗时（越跑越漂）—— 现在按「轮首 + 间隔」对齐。
+{
+  const { runLoop } = await import('./loop.mjs');
+  // 所有探测都失败：每段各自 catch，正好让一轮又短又稳定，方便断言等待时长。
+  const client = {
+    connected: true,
+    request: async () => { throw new Error('mock 探测失败'); },
+    sendWatch: async () => { throw new Error('mock 探测失败'); },
+  };
+  // 虚拟时钟：sleep 直接把时间推过去，不用真的等一分钟。
+  let clockA = 1_000_000;
+  const waitsA = [];
+  const sleepA = async (ms) => { waitsA.push(ms); clockA += ms; };
+
+  // ① 间隔按「轮首 → 下一轮轮首」对齐：live 恒定 60 秒 → 两轮之间正好等 60 秒
+  //    （旧实现是「本轮结束再等 60 秒」，所以总周期一定大于 60 秒）。
+  const flat = { everyMs: 60_000 };
+  const a = await runLoop(client, {}, {
+    rounds: 2, everyMs: 60_000, allowMutate: true,
+    now: () => clockA, sleep: sleepA, live: () => flat,
+  });
+  assert.ok(waitsA.every((ms) => ms <= 1_000),
+    `等待必须分段（每段 ≤ 1 秒），否则点停止/改间隔都要等满整个间隔，实际 ${waitsA.slice(0, 3)}`);
+  assert.equal(waitsA.reduce((sum, ms) => sum + ms, 0), 60_000, '等待 = 间隔（本轮几乎瞬间），不是「间隔 + 耗时」');
+  assert.equal(a.history[0].everyMs, 60_000, '第 1 轮用启动时的间隔');
+  assert.equal(a.history[0].elapsedMs, 0, '每轮要记耗时，页面据此显示「上一轮耗时」');
+
+  // ② 热更新：第 1 轮执行期间把间隔改成 30 秒 —— 这一轮的等待立刻缩短，下一轮也用新值。
+  const live2 = { everyMs: 60_000 };
+  let clockB = 1_000_000;
+  const waitsB = [];
+  const hotClient = {
+    connected: true,
+    request: async () => { live2.everyMs = 30_000; throw new Error('mock'); },
+    sendWatch: async () => { throw new Error('mock'); },
+  };
+  const b = await runLoop(hotClient, {}, {
+    rounds: 2, everyMs: 60_000, allowMutate: true,
+    now: () => clockB, sleep: async (ms) => { waitsB.push(ms); clockB += ms; }, live: () => live2,
+  });
+  assert.equal(waitsB.reduce((sum, ms) => sum + ms, 0), 30_000, '间隔被改小后不用等旧的 60 秒');
+  assert.equal(b.history[0].everyMs, 60_000, '改之前的那一轮仍按旧值');
+  assert.equal(b.history[1].everyMs, 30_000, 'live 改过之后下一轮立刻生效，不用停掉重开');
+
+  // 段级停止：第 1 段发出请求时就点停止，后面 7 段一律不开。
+  let clock2 = 1_000_000;
+  const stop = { aborted: false };
+  let calls = 0;
+  const stopClient = {
+    connected: true,
+    request: async () => { calls += 1; stop.aborted = true; throw new Error('mock'); },
+    sendWatch: async () => { throw new Error('mock'); },
+  };
+  const stopped = await runLoop(stopClient, {}, {
+    rounds: 3, everyMs: 60_000, allowMutate: true, stop,
+    now: () => clock2, sleep: async (ms) => { clock2 += ms; },
+  });
+  assert.equal(stopped.history.length, 1, '停止后不再进入下一轮');
+  assert.equal(stopped.history[0].stopped, true, '这一轮要标成「被停止打断」');
+  assert.equal(calls, 1, '只发了第 1 段的 1 个请求，剩下的段落没再发');
+  assert.ok(formatLoopRound(stopped.history[0]).includes('已按要求停止'),
+    `日志要说清是主动停止，不是故障，实际：\n${formatLoopRound(stopped.history[0])}`);
+  // 停止时 summary 的各段必须都在（缺段会让格式化函数撞 null）。
+  for (const key of ['tasks', 'dailies', 'world', 'idle', 'treasure', 'radar', 'forge', 'pet']) {
+    assert.ok(stopped.history[0][key], `停止的那一轮也要有 ${key} 段，不能是 null`);
+  }
+
+  // 轮间等待时点停止：立刻退出，不用等满整个间隔（分段等待的意义）。
+  let clock3 = 1_000_000;
+  const midStop = { aborted: false };
+  const midWaits = [];
+  const mid = await runLoop(client, {}, {
+    rounds: 3, everyMs: 60_000, allowMutate: true, stop: midStop,
+    now: () => clock3,
+    sleep: async (ms) => { midWaits.push(ms); clock3 += ms; midStop.aborted = true; },
+  });
+  assert.equal(midWaits.length, 1, '第一段等待里就收到停止 → 不再继续等');
+  assert.equal(mid.history.length, 1, '等待期间被停止，也不会再开下一轮');
   checked += 1;
 }
 
@@ -2317,6 +2679,15 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   };
   const text = formatLoopRound(summary);
   assert.ok(text.includes('拾荒 间隔未到，还差 3 分 20 秒（每 5 分一次）'), `应显示拾荒节流提示，实际：\n${text}`);
+
+  // 断线整轮跳过的那一轮必须有一句人话，否则「计划 0 / 0 / 0」看起来像所有模块都挂了。
+  const offline = formatLoopRound({
+    ...summary,
+    link: '连接已断开，重连失败：login rejected: result=3；本轮跳过',
+    gates: undefined,
+  });
+  assert.ok(offline.includes('重连失败：login rejected: result=3'), `断线轮次要带原因，实际：\n${offline}`);
+  assert.ok(!offline.includes('undefined'), `占位字段不能漏成 undefined，实际：\n${offline}`);
 
   // 情报同样受间隔约束（默认 60 秒）：被挡住的那轮要说清楚还差多久。
   const radarGated = formatLoopRound({
@@ -2406,7 +2777,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 // 工厂页：读出队列倒计时与「这个等级能造什么」。判定只看 BuildingProduceCfg，
 // 所以用合成配置就能跑，不依赖 CDN 快照。
 {
-  const { factoryRecipes, viewFactories } = await import('./factories.mjs');
+  const { factoryRecipes, viewFactories, packCoverPlan } = await import('./factories.mjs');
   const config = {
     tables: {
       BuildingProduceCfg: { data: [
@@ -2507,6 +2878,51 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     factories: [{ ...survey.factories[0], queue: [], finished: [] }],
   }, { config });
   assert.equal(stockFull.factories[0].recipes.find((row) => row.itemId === '烤鱼').capKind, 'stock', '仓库满 50 → capKind=stock');
+
+  // 缺料时页面要能说清「差多少、花几个包」。配置里没有自选包表 → 换不出来，packable 必须是 false，
+  // 否则页面会给出一个点了必然失败的「兑料并制造」按钮。
+  const noLib = main.recipes.find((row) => row.itemId === '烤鱼');
+  assert.equal(noLib.packable, false, '没有自选包表就补不了');
+  assert.deepEqual(noLib.unpackable, ['木材'], '要指名哪个材料换不出来');
+
+  // 有原料自选包：缺口能被补齐 → packable + 明确的消耗文案（一包换一个单位）。
+  const packConfig = { tables: { ...config.tables, SelectPackLibCfg: { data: [
+    { itemId: '原料自选包', selectItemId: '木材', type: '道具', num: 1, season: 1 },
+    { itemId: '原料自选包', selectItemId: '鱼', type: '道具', num: 1, season: 1 },
+  ] } } };
+  const withPacks = viewFactories(
+    { ...survey, stock: new Map([['鱼', 9], ['木材', 3], ['原料自选包', 20]]) },
+    { config: packConfig },
+  );
+  const payByPack = withPacks.factories[0].recipes.find((row) => row.itemId === '烤鱼');
+  assert.equal(payByPack.enough, false, 'enough 只反映库存，不因为能兑就变成 true');
+  assert.equal(payByPack.packable, true, '原料自选包够 → 可以兑料补齐');
+  assert.equal(payByPack.packText, '原料自选包×2', '缺 2 个木材 = 2 个包，文案要写明花几个');
+  assert.deepEqual(payByPack.packNeeds, [{ pack: '原料自选包', num: 2 }], '按包合并成一份消耗');
+
+  // 包不够补齐 → 不许给按钮（点了也白点）。
+  const poorPacks = viewFactories(
+    { ...survey, stock: new Map([['鱼', 9], ['木材', 3], ['原料自选包', 1]]) },
+    { config: packConfig },
+  );
+  assert.equal(poorPacks.factories[0].recipes.find((row) => row.itemId === '烤鱼').packable, false,
+    '只有 1 个包，补不齐 2 个木材');
+
+  // 一包换多个单位时按 ceil(缺口 / per) 算，不能一律当成一包一个。
+  const bulkConfig = { tables: { ...config.tables, SelectPackLibCfg: { data: [
+    { itemId: '原料自选包', selectItemId: '木材', type: '道具', num: 5, season: 1 },
+  ] } } };
+  const bulk = packCoverPlan(bulkConfig, { costs: [{ id: '木材', num: 12 }], stock: new Map([['木材', 2], ['原料自选包', 9]]) });
+  assert.equal(bulk.ok, true, '缺 10 个、一包给 5 个 → 2 个包够了');
+  assert.equal(bulk.needs[0].num, 2, 'ceil(10 / 5) = 2 个包');
+
+  // 稀有包不参与：「布匹」只存在蓝装材料包里，工厂页绝不能提议烧它。
+  const rareConfig = { tables: { ...config.tables, SelectPackLibCfg: { data: [
+    { itemId: '蓝装材料自选包', selectItemId: '木材', type: '道具', num: 1, season: 1 },
+  ] } } };
+  const rare = packCoverPlan(rareConfig, { costs: [{ id: '木材', num: 5 }], stock: new Map([['木材', 0], ['蓝装材料自选包', 99]]) });
+  assert.equal(rare.ok, false, '稀有包不算「能补」');
+  assert.deepEqual(rare.unpackable.map((gap) => gap.id), ['木材'], '并且指名换不出来');
   checked += 1;
 }
 
@@ -2731,7 +3147,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const {
     viewTreasure, planTreasure, qualityOf, dailyLimitOf, formatTreasureSummary,
     seasonWindowOf, seasonDaysOf, MAX_GUILD_FLEETS, SEASON_CLOSE_GUARD_SECONDS,
-    DEFAULT_COLORS, colorsOf, colorsText,
+    DEFAULT_COLORS, colorsOf, colorsText, skipUntilOf, rewardCountText, SKIP_MAX_MS,
   } = await import('./treasure.mjs');
   const config = { tables: {
     TreasureLootCfg: { data: [
@@ -2964,6 +3380,49 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(unknownSeason.activity.unknown, true, '算不出有效期');
   assert.equal(planTreasure(unknownSeason, {}).actions.length, 1, '算不出有效期时照常派（不能因此停功能）');
   assert.ok(planTreasure(unknownSeason, {}).notes.some((note) => note.includes('算不出活动有效期')), '要把未知说出来');
+
+  // 每日奖励次数的显示口径：页面、CLI、日志都用这一句话，别各写一套。
+  assert.equal(rewardCountText(full), '已领 3/3（已满，明天 0 点重置）', '满了要说满并交代重置时间');
+  const partly = viewTreasure(surveyFor({ todayRewardTimes: 1, treasures: [treasure({ uid: 32 })], fleets: [fleet({})] }), ALL);
+  assert.equal(rewardCountText(partly), '已领 1/3（还能领 2 次）', '没满要说还能领几次');
+  assert.ok(rewardCountText(noStats).includes('拿不到次数'), '读不到次数也要能显示，不能写成 0');
+
+  // 「今日没机会了」→ 给一个静默窗，循环里连探测都不发（省掉 Stats + List + MyFleets + 赛季四个请求）。
+  // 用固定时刻算，才能断言到「次日 0 点」这个具体时间。
+  const at1000 = new Date(2026, 9, 26, 10, 0, 0).getTime();
+  const fullSkip = skipUntilOf(full, { now: at1000 });
+  assert.equal(fullSkip.forever, false, '奖励满了只是等到明天，不是永久停');
+  assert.equal(new Date(fullSkip.until).getHours(), 0, '静默到次日 0 点');
+  assert.equal(new Date(fullSkip.until).getDate(), 27, '要跨到第二天');
+  assert.ok(new Date(fullSkip.until).getTime() > at1000, '静默窗必须在未来');
+  assert.ok(fullSkip.reason.includes('今日奖励已满'), `原因要说清是次数满了，实际：${fullSkip.reason}`);
+  // 活动结束 → 本季都不用再问。
+  assert.equal(skipUntilOf(expired, { now: at1000 }).forever, true, '活动结束是永久静默（不再发探测）');
+
+  // 勾选等级里一个可抢的都没有 → 静默到服务端给的下一个整点刷新。
+  const nothingWanted = viewTreasure(surveyFor({
+    nextRefreshTime: Math.floor(at1000 / 1000) + 1800,
+    treasures: [treasure({ uid: 33, color: 3, name: '小型货轮' })],
+    fleets: [fleet({})],
+  }), { config });
+  assert.equal(nothingWanted.targets.length, 0, '只抢万吨时小型不在候选里');
+  assert.equal(skipUntilOf(nothingWanted, { now: at1000 }).until, (Math.floor(at1000 / 1000) + 1800) * 1000,
+    '静默到下一个整点刷新');
+  // 服务端给了个离谱的刷新时间也不能把挂机静默掉太久。
+  const farRefresh = viewTreasure(surveyFor({
+    nextRefreshTime: Math.floor(at1000 / 1000) + 40 * 3600,
+    treasures: [], fleets: [fleet({})],
+  }), { config });
+  assert.ok(skipUntilOf(farRefresh, { now: at1000 }).until <= at1000 + SKIP_MAX_MS, '静默窗封顶 12 小时');
+  // 只是没空闲船 / 船还在航行：几分钟内自己会变，绝不能静默（否则回来也不派）。
+  const noIdle = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 34 })],
+    fleets: [fleet({ state: 2 })],
+  }), { config });
+  assert.equal(skipUntilOf(noIdle, { now: at1000 }).until, 0, '没空闲船不静默（船会回来）');
+  assert.equal(skipUntilOf(live, { now: at1000 }).until, 0, '有可抢的货轮就不静默');
+  // 读不到次数（statsAvailable false）→ 下一轮还要重试，不能静默。
+  assert.equal(skipUntilOf(noStats, { now: at1000 }).until, 0, '读不到次数时不静默，下一轮重试');
 
   // 舰队筛选：只有 IDLE(1) 且 treasureLootUid = 0 才能派（客户端同款判据）。
   const busy = viewTreasure(surveyFor({

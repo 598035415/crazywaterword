@@ -14,8 +14,66 @@
 import { normalize } from './worlds.mjs';
 import {
   rowsOf, paramOf, assetCount, makeTypeResolver, RESOURCE_NAMES, SLOTS_PARAM, STOCK_PARAM,
-  appointProduceReduce, observedInstantRecipes, produceFinalTime, produceReduceOf,
+  appointProduceReduce, observedInstantRecipes, produceFinalTime, produceReduceOf, packIndex,
 } from './world.mjs';
+
+// 成本里缺的材料能不能用白名单自选包（原料 / 工事材料）换出来。
+// 三处共用一个口径：工厂页的「兑料并制造」提示、手动排产的预检、挂机排产。
+// 一包换 num 个单位（SelectPackLibCfg.num，实测原料包是 1），所以要 ceil(缺口 / per) 个包。
+// 返回的 ok = 缺口**全部**都能换出来且包够 —— 只补一部分对排产没意义（配方要整份料）。
+// `packs` 可以传入已经建好的反查表（工厂页一次 view 要算几十条配方，别每条都重建）。
+export function packCoverPlan(config, { costs = [], stock, packs = null } = {}) {
+  const index = packs ?? packIndex(config);
+  const have = (id) => stock?.get?.(id) ?? 0;
+  const gaps = [];
+  for (const cost of costs) {
+    const need = Number(cost.num ?? 0) - have(cost.id);
+    if (need <= 0) continue;
+    const entry = index.get(cost.id);
+    gaps.push({
+      id: cost.id,
+      num: Number(cost.num ?? 0),
+      have: have(cost.id),
+      gap: need,
+      // 没有对应的包 = 只能等生产/采集，页面要如实说「换不出来」。
+      pack: entry?.pack ?? null,
+      per: entry?.per ?? 0,
+      packs: entry ? Math.ceil(need / (entry.per || 1)) : 0,
+      packHave: entry ? have(entry.pack) : 0,
+    });
+  }
+  const unpackable = gaps.filter((gap) => !gap.pack);
+  const shortOnPacks = gaps.filter((gap) => gap.pack && gap.packHave < gap.packs);
+  // 同一批缺口可能都靠同一个包补，按包合并成「原料自选包×43」。
+  const byPack = new Map();
+  for (const gap of gaps) if (gap.pack) byPack.set(gap.pack, (byPack.get(gap.pack) ?? 0) + gap.packs);
+  const needs = [...byPack].map(([pack, num]) => ({ pack, num }));
+  return {
+    gaps,
+    unpackable,
+    shortOnPacks,
+    needs,
+    // 真正要发出去的兑换清单：一个材料一条（num = 缺口，协议里 num 是「要换到的数量」）。
+    // needs 只用于显示（按包合并），执行必须用 orders，否则一个包换两种材料时会漏发。
+    orders: gaps.filter((gap) => gap.pack).map((gap) => ({ pack: gap.pack, itemId: gap.id, num: gap.gap })),
+    ok: gaps.length > 0 && unpackable.length === 0 && shortOnPacks.length === 0,
+    text: needs.map((entry) => `${entry.pack}×${entry.num}`).join(' + '),
+  };
+}
+
+// 显式授权（页面「兑料并制造」/ 接口带 usePack:true）才走这里：把缺的材料兑出来。
+// 一包换一个单位，是真的花包 —— 所以绝不自动触发，只在用户点了按钮之后调。
+// 没有配套 Response，走 sendWatch 守 prompt；被拒会抛错，调用方据此中止排产。
+export async function exchangePacks(client, orders, { window = 500, gap = 200 } = {}) {
+  const sent = [];
+  for (const order of orders ?? []) {
+    if (!(Number(order.num) > 0)) continue;
+    await client.sendWatch('SelectPackRequest', { itemId: order.pack, selectItemId: order.itemId, num: Number(order.num) }, { window });
+    sent.push({ ...order, num: Number(order.num) });
+    if (gap) await new Promise((resolve) => setTimeout(resolve, gap));
+  }
+  return sent;
+}
 
 // 只读探测：海面（工厂挂在 building 上）+ 库存（算材料够不够），不多拉资源田与舰队。
 // AppointInfo / AllHero 只为算「生产时间减少」—— 页面上要标出哪些配方已经瞬成。
@@ -117,6 +175,8 @@ export function viewFactories(survey, { config = null } = {}) {
   const have = (id) => stock.get(id) ?? 0;
   // 生产时间减免：774s 减免下 300s 的配方就是 0 秒，排下去立刻能收。
   const reduce = produceReduceOf(survey);
+  // 自选包反查表整页只建一次：每条缺料配方都要查「能不能兑」，逐条重建太浪费。
+  const packMap = packIndex(config);
 
   // 整张配方表只扫一遍，按 buildType 分组；「已排队的配方要显示多久」也从这里取 produceTime。
   const byType = new Map();
@@ -174,6 +234,12 @@ export function viewFactories(survey, { config = null } = {}) {
             have: have(cost.id),
             enough: have(cost.id) >= cost.num,
           }));
+          // 缺料时算一下「能不能用自选包补齐」：页面靠它决定要不要给「兑料并制造」，
+          // 手动排产接口靠同一套数在报错里写清楚要花几个包。
+          // 只在缺料时算 —— 料齐的配方不需要知道包里有多少（也省掉每次 view 的重复计算）。
+          const cover = costs.some((cost) => !cost.enough)
+            ? packCoverPlan(config, { costs, stock, packs: packMap })
+            : null;
           // 产品本身的持有量要算三处：仓库里 + 这个工厂待收的 + 队列里还排着的。
           // 服务端的 storage full 就是按「这个产品有多少」判的，只算仓库会漏掉待收的
           // （实测：淡水仓库 23 个时仍被回 storage full，说明上限的口径比 AllItem 宽）。
@@ -195,6 +261,13 @@ export function viewFactories(survey, { config = null } = {}) {
             limitType: recipe.limitType,
             costs,
             enough: costs.every((cost) => cost.enough),
+            // 缺料时能不能靠自选包补齐：packable 决定页面是否给「兑料并制造」，
+            // packText 是给用户看的消耗（原料自选包×43），packNeeds 是真正要发的兑换清单。
+            packable: Boolean(cover?.ok),
+            packText: cover?.text ?? '',
+            packNeeds: cover?.needs ?? [],
+            // 换不出来的材料（比如布匹只存在稀有的蓝装材料包里）：页面要说明「只能等生产」。
+            unpackable: (cover?.unpackable ?? []).map((gap) => gap.id),
             unlocked: factory.level >= recipe.unlockLevel,
             queuedCount: queuedCount.get(recipe.itemId) ?? 0,
             inStock,

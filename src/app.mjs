@@ -23,6 +23,7 @@ import {
   planTreasure,
   formatTreasurePlan,
   formatTreasureSummary,
+  rewardCountText,
   colorsOf,
   colorsText,
   DEFAULT_MAX_FLEETS,
@@ -621,8 +622,9 @@ async function forge({ allowMutate, dryRun }) {
   }
 }
 
-// 海兽培育室：收成熟的 + 队列空位排产。--dry 只列计划；品质上限 --pet-max-quality。
-async function petCli({ allowMutate, dryRun, maxQuality = 'ORANGE' }) {
+// 海兽培育室：收成熟的 + 材料加速 + 队列空位排产。--dry 只列计划；品质上限 --pet-max-quality；
+// 材料加速默认开，--no-pet-feed 关。
+async function petCli({ allowMutate, dryRun, maxQuality = 'ORANGE', allowFeed = true }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -634,9 +636,9 @@ async function petCli({ allowMutate, dryRun, maxQuality = 'ORANGE' }) {
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyPet(client, protocol, { config });
-    const plan = planPet(survey, { config, maxQuality });
+    const plan = planPet(survey, { config, maxQuality, allowFeed });
     console.log(`\n${formatPetPlan(survey, plan)}\n`);
-    console.log(`共 ${plan.actions.length} 个动作`);
+    console.log(`共 ${plan.actions.length} 个动作（品质上限 ${maxQuality}，材料加速 ${allowFeed ? '开' : '关'}）`);
 
     if (dryRun) {
       console.log('--dry：只列计划，未执行');
@@ -794,7 +796,7 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
     const after = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
     const afterView = viewTreasure(after, { config, colors: wanted, maxFleets });
     console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
-    console.log(`  可抢 ${view.targets.length} -> ${afterView.targets.length}，今日奖励 ${after.todayRewardTimes}/${after.dailyLimit}，汽油 ${after.petrol}`);
+    console.log(`  可抢 ${view.targets.length} -> ${afterView.targets.length}，${rewardCountText(afterView)}，汽油 ${after.petrol}`);
   } finally {
     client.stop();
   }
@@ -960,6 +962,8 @@ async function loopCli({
   petEnabled = true,
   petEverySeconds = 300,
   petMaxQuality = 'ORANGE',
+  // 材料加速（投喂）：默认开，--no-pet-feed 关。
+  petFeed = true,
   idleEnabled = true,
   idleEverySeconds = 300,
   treasureEnabled = true,
@@ -984,13 +988,13 @@ async function loopCli({
     const response = await client.connect(login);
     const config = loadConfigSafe();
     const player = response.playerInfo;
-    console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}，${rounds > 0 ? `共 ${rounds} 轮` : '一直跑（Ctrl-C 停）'}，间隔 ${everySeconds}s`);
+    console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}，${rounds > 0 ? `共 ${rounds} 轮` : '一直跑（Ctrl-C 停）'}，间隔 ${Math.max(5, everySeconds)}s`);
     console.log(`开关: 加速=${allowSpeedUp ? '开(只花' + SPEED_UP_ITEM + ')' : '关'} 拒绝重刷=${allowReroll ? '开' : '关'}`);
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
     console.log(`锻造=${forgeEnabled ? (forgeEverySeconds > 0 ? `开(每 ${forgeEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
-    console.log(`海兽培育=${petEnabled ? (petEverySeconds > 0 ? `开(每 ${petEverySeconds}s 看一眼，品质上限 ${petMaxQuality})` : `开(每轮都看，品质上限 ${petMaxQuality})`) : '关'}`);
+    console.log(`海兽培育=${petEnabled ? (petEverySeconds > 0 ? `开(每 ${petEverySeconds}s 看一眼，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})` : `开(每轮都看，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})`) : '关'}`);
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     await runLoop(client, protocol, {
@@ -1015,6 +1019,7 @@ async function loopCli({
       petEnabled,
       petEveryMs: Math.max(0, Number(petEverySeconds) || 0) * 1000,
       petMaxQuality,
+      petFeed,
       idleEnabled,
       idleEveryMs: Math.max(0, Number(idleEverySeconds) || 0) * 1000,
       treasureEnabled,
@@ -1228,6 +1233,8 @@ async function main() {
       petEverySeconds: at('--pet-every', 300),
       // --pet-max-quality BLUE|PURPLE|ORANGE|RED；脏值回退默认橙。
       petMaxQuality: PET_QUALITIES.includes(valueArg('--pet-max-quality')) ? valueArg('--pet-max-quality') : 'ORANGE',
+      // 材料加速（投喂）默认开，--no-pet-feed 关。
+      petFeed: !process.argv.includes('--no-pet-feed'),
       idleEnabled: !process.argv.includes('--no-idle'),
       idleEverySeconds: at('--idle-every', 300),
       treasureEnabled: !process.argv.includes('--no-treasure'),
@@ -1320,6 +1327,8 @@ async function main() {
       dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
       maxQuality: PET_QUALITIES.includes(valueArg('--pet-max-quality')) ? valueArg('--pet-max-quality') : 'ORANGE',
+      // 材料加速默认开，--no-pet-feed 关。
+      allowFeed: !process.argv.includes('--no-pet-feed'),
     });
     return;
   }

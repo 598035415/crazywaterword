@@ -85,6 +85,22 @@ export function rowsOf(config, name) {
   return config?.tables?.[name]?.data ?? [];
 }
 
+// 材料 → 「用哪个自选包换 + 一包换几个」。挂机计划器、工厂页、手动排产共用一个口径，
+// 免得出现「挂机会兑、页面却说没有包」的两套说法。
+// 只收白名单里的包：SelectPackLibCfg 里另外 18 种（装备材料包、宠物基因包、英雄碎片…）
+// 更稀有，绝不能因为「缺某个材料」被顺手烧掉。
+export function packIndex(config, { allowPacks = null } = {}) {
+  const allowed = new Set(allowPacks ?? AUTO_PACK_ALLOWLIST);
+  const map = new Map();
+  for (const row of rowsOf(config, 'SelectPackLibCfg')) {
+    if (!row?.itemId || !row?.selectItemId) continue;
+    if (!allowed.has(row.itemId)) continue;
+    if (map.has(row.selectItemId)) continue; // 同一材料有多个包时取表里第一条
+    map.set(row.selectItemId, { pack: row.itemId, per: Number(row.num) || 1 });
+  }
+  return map;
+}
+
 // 这些常量散在几张 param 表里（人口/存量在 GameParamCfg，制造位在 BuildingProduceParamCfg），
 // 名字不重复，所以统一按名字查。
 export function paramOf(config, name) {
@@ -435,70 +451,90 @@ export function planWorld(survey, {
   // 只有表里列出的材料才兑得到 —— 缺「布匹」这种不在任何原料包里的东西时，这里查不到就直接跳过。
   // 一包只顶一个单位，所以它只能补零头（比如订单差 3 个木材），补不了「玻璃差 500」这种大缺口，
   // 因此每轮消耗上限由 maxPackPerRound 卡住，默认 20。
-  const allowedPacks = new Set(allowPacks ?? AUTO_PACK_ALLOWLIST);
-  const packForItem = new Map();
-  const packRate = new Map();
-  for (const row of rowsOf(config, 'SelectPackLibCfg')) {
-    if (!row?.itemId || !row?.selectItemId) continue;
-    if (!allowedPacks.has(row.itemId)) continue; // 稀有的装备/基因/碎片包不参与自动兜底
-    if (packForItem.has(row.selectItemId)) continue; // 同一材料有多个包时取表里第一条
-    packForItem.set(row.selectItemId, row.itemId);
-    packRate.set(row.selectItemId, Number(row.num) || 1);
-  }
+  const packs = packIndex(config, { allowPacks });
+  const packForItem = new Map([...packs].map(([itemId, entry]) => [itemId, entry.pack]));
+  const packRate = new Map([...packs].map(([itemId, entry]) => [itemId, entry.per]));
   const covered = new Map();  // 靠包补到的量，乐观计入库存（兑换动作排在使用它的动作之前）
   const packLeft = new Map(); // 各包本轮还能用几个
   let packQuota = Math.max(0, Number(maxPackPerRound) || 0);
+  const packBudgetPerRound = packQuota;
 
   // 可用量 = 库存 + 靠包补到的 - 已预留
   const free = (id) => have(id) + (covered.get(id) ?? 0) - (reserved.get(id) ?? 0);
 
-  // 材料够了返回 true；不够就尽量用包补，补完够也返回 true。
-  const cover = (needs, label) => {
+  // 兑换**试算**：只算「缺什么、用哪个包、兑多少」，一律不改账本。
+  // 排产要用它先试算 —— 试算失败的配方不该留下任何兑换动作，
+  // 否则会出现「为了排 A 兑了料、A 最终没排、料白兑」的情况。
+  const planPacks = (needs, label) => {
     const gaps = needs
       .map((n) => ({ id: n.id, num: Number(n.num ?? 0) }))
       .filter((n) => n.num > 0 && free(n.id) < n.num)
       .map((n) => ({ id: n.id, gap: n.num - free(n.id) }));
-    if (gaps.length === 0) return true;
-    if (!useSelectPack || packQuota <= 0) return false;
+    const plan = { ok: true, blocked: false, entries: [], notes: [], gaps };
+    if (gaps.length === 0) return plan;
+    // 关掉开关 / 额度用完：保持沉默（调用方自己会写「材料不足」），别每轮刷一句废话。
+    if (!useSelectPack || packQuota <= 0) return { ...plan, ok: false };
 
-    let enough = true;
+    // 额度与包余额用**副本**推进：一个计划里可能两个缺口抢同一个包。
+    let quota = packQuota;
+    const left = new Map();
     for (const g of gaps) {
       const pack = packForItem.get(g.id);
       if (!pack) {
-        notes.push(`${label} 缺 ${g.id}，但没有能换它的自选包`);
-        enough = false;
+        plan.notes.push(`${label} 缺 ${g.id}，但没有能换它的自选包`);
+        plan.ok = false;
+        plan.blocked = true;
         continue;
       }
-      if (!packLeft.has(pack)) packLeft.set(pack, Number(have(pack)));
-      const budget = Math.min(packLeft.get(pack), packQuota);
+      if (!left.has(pack)) left.set(pack, Number(have(pack)));
+      const budget = Math.min(left.get(pack), quota);
       if (budget <= 0) {
-        notes.push(`${label} 缺 ${g.id}，但 ${pack} 数量不够（库存 ${have(pack)}，本轮额度已用完）`);
-        enough = false;
+        plan.notes.push(`${label} 缺 ${g.id}，但 ${pack} 数量不够（库存 ${have(pack)}，本轮额度已用完）`);
+        plan.ok = false;
         continue;
       }
 
       const per = packRate.get(g.id) ?? 1;
-      const packs = Math.min(Math.ceil(g.gap / per), budget);
-      const gain = Math.min(packs * per, g.gap);
+      const usePacks = Math.min(Math.ceil(g.gap / per), budget);
+      const gain = Math.min(usePacks * per, g.gap);
       if (gain <= 0) {
-        enough = false;
+        plan.ok = false;
         continue;
       }
 
+      plan.entries.push({ pack, itemId: g.id, gain, packs: usePacks });
+      left.set(pack, left.get(pack) - usePacks);
+      quota -= usePacks;
+      if (gain < g.gap) plan.ok = false;
+    }
+    return plan;
+  };
+
+  // 把试算结果落成动作 + 记账，返回是否补齐。
+  const applyPacks = (plan, label) => {
+    for (const entry of plan.entries) {
       actions.push({
         kind: 'selectPack',
         request: 'SelectPackRequest',
         response: null,
-        body: { itemId: pack, selectItemId: g.id, num: gain },
-        label: `兑材料 ${g.id} ×${gain}（${label}，消耗${pack} ${packs} 个）`,
+        body: { itemId: entry.pack, selectItemId: entry.itemId, num: entry.gain },
+        // transient：兑换失败几乎都是瞬时/数据过期（包数记错了、这个材料突然不能换了），
+        // 记进 rejected 会让同一个材料整场挂机都不再兑。
+        transient: true,
+        label: `兑材料 ${entry.itemId} ×${entry.gain}（${label}，消耗${entry.pack} ${entry.packs} 个）`,
       });
-      covered.set(g.id, (covered.get(g.id) ?? 0) + gain);
-      packLeft.set(pack, packLeft.get(pack) - packs);
-      packQuota -= packs;
-      if (gain < g.gap) enough = false;
+      covered.set(entry.itemId, (covered.get(entry.itemId) ?? 0) + entry.gain);
+      packLeft.set(entry.pack, (packLeft.get(entry.pack) ?? Number(have(entry.pack))) - entry.packs);
+      packQuota -= entry.packs;
     }
-    return enough;
+    for (const note of plan.notes) notes.push(note);
+    return plan.ok;
   };
+
+  // 材料够了返回 true；不够就尽量用包补，补完够也返回 true。
+  // 注意：补不上时**已经兑的那部分仍会落账** —— 建造/交单/升级的调用方会自己判够不够，
+  // 兑出来的料留着下一轮用，不会白烧（包换出来的材料不会退）。
+  const cover = (needs, label) => applyPacks(planPacks(needs, label), label);
 
   // 0. 拾荒：海面上的漂浮物一次提交就能全捡 —— PickUpFloaterRequest.floaterId 是
   //    **repeated string**（客户端 encode 里是 `for (r < e.floaterId.length) uint32(18).string(...)`），
@@ -679,7 +715,11 @@ export function planWorld(survey, {
   //    也容易把用户在游戏里手动排的队顶掉）。空闲时才从「第一个能造的产品」开始排：
   //    订单缺口优先、其余按生产时间短的先排；已到存量上限 / 料不够 / 等级没到的会被过滤，
   //    所以「排到哪个」天然就是「第一个还没满的产品」。
-  //    当这座工厂下所有产品都满了（cand 为空）→ 就让它空着，这是正常状态。
+  //    当这座工厂下所有产品都满了（pool 为空）→ 就让它空着，这是正常状态。
+  //
+  //    料不够时先试「自选包能不能补齐」，只补**挑中的那一条**配方（见下面的 planPacks），
+  //    补得齐才落兑换动作；补不齐就整座空着，并在 notes 里写清缺哪个材料。
+  //    每轮能烧几个包仍由 maxPackPerRound 卡（默认 20，与建造/订单/升级共用同一份额度）。
   //
   //    生产时间是**减免后**的（produceFinalTime 先减 reduce 再提速）：减免 840 秒时
   //    300 秒的鱼/淡水/布匹就是 0 秒，这类「瞬成」配方一次占满制造位，不然低级物品
@@ -711,17 +751,58 @@ export function planWorld(survey, {
         .filter((asset) => asset.id === itemId)
         .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
       + queue.filter((job) => job.productId === itemId).length;
-    const cand = produceRows
+    // pool = 等级够 + 未到存量上限的配方，**不看料**，按优先级排好。
+    // 之后再分成两条路：料够的直接排（老行为）；一条都不够时，按优先级逐条试算「自选包能不能补齐」，
+    // 只给**真正要排的那一条**兑料 —— 不能给整池子都兑，那会把包烧在没有意义的配方上。
+    const pool = produceRows
       .filter((row) => row.buildType === b.type && row.unlockLevel <= b.level)
       .filter((row) => (survey.stockCap > 0 ? heldOf(row.itemId) < survey.stockCap : true))
-      .filter((row) => (row.costItem ?? []).every(([id, n]) => free(id) >= n))
       .sort((a, b2) => scoreOf(b2) - scoreOf(a));
-    if (cand.length === 0) {
-      // 空闲是正常状态：要么这个等级的产品都排满了，要么料不够。
-      notes.push(`${b.buildingId} 空闲：没有能排的配方（产品到存量上限 ${survey.stockCap} / 缺材料 / 等级不够）`);
+    const costOf = (row) => (row.costItem ?? []).map(([id, n]) => ({ id, num: Number(n) || 0 }));
+    const affordable = (row) => costOf(row).every((cost) => free(cost.id) >= cost.num);
+
+    let best = pool.find((row) => affordable(row)) ?? null;
+    let packPlanUsed = null;
+    let packTarget = null;
+    if (!best && useSelectPack && pool.length > 0) {
+      // 一条都排不了：按优先级找第一条「缺口全部有包可换」的配方，只给它补料。
+      // 额度不够一轮补满时**也要落账** —— 兑出来的料不会退，留着下一轮接着补。
+      // 不落账的话，43 的缺口撞上每轮 20 的额度会永远停在「一个都兑不出」，鱼油这类配方再也排不上。
+      for (const row of pool) {
+        const plan = planPacks(costOf(row), `排产 ${b.buildingId} ${row.itemId}`);
+        // blocked = 有缺口根本没有包能换（比如布匹），给它兑别的料是白烧，直接跳过这条配方。
+        if (plan.blocked || plan.entries.length === 0) continue;
+        packTarget = row;
+        packPlanUsed = plan;
+        break;
+      }
+    }
+    if (packPlanUsed) {
+      applyPacks(packPlanUsed, `排产 ${b.buildingId} ${packTarget.itemId}`);
+      const gained = packPlanUsed.entries.map((entry) => `${entry.itemId}×${entry.gain}`).join('、');
+      if (packPlanUsed.ok) {
+        best = packTarget;
+        notes.push(`${b.buildingId} ${best.itemId} 缺料，用自选包补齐后开排（${gained}）`);
+      } else {
+        notes.push(`${b.buildingId} ${packTarget.itemId} 缺料，本轮先用自选包补 ${gained}`
+          + `，还不够，下一轮继续（每轮上限 ${packBudgetPerRound} 个包）`);
+      }
+    }
+    if (!best) {
+      // 空闲是正常状态，但原因要分开写：全到上限 / 料不够补不上 —— 否则用户看不出该做什么。
+      if (pool.length === 0) {
+        notes.push(`${b.buildingId} 空闲：没有能排的配方（产品到存量上限 ${survey.stockCap} / 等级不够）`);
+      } else {
+        const short = pool
+          .map((row) => costOf(row).filter((cost) => free(cost.id) < cost.num)
+            .map((cost) => `${cost.id} ${free(cost.id)}/${cost.num}`).join(' ')
+            .trim())
+          .find(Boolean) ?? '未知';
+        notes.push(`${b.buildingId} 空闲：料不够（${short}），自选包也补不上`);
+      }
       continue;
     }
-    const best = cand[0];
+    // 兑换动作已在上面的 applyPacks 里推进 actions，位置就在排产动作之前（数组顺序即执行顺序）。
     const need = demand.get(best.itemId) ?? 0;
     // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
     // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
@@ -731,7 +812,7 @@ export function planWorld(survey, {
       hint: instantHints.has(`${b.type}\u0000${best.itemId}`),
     });
     const wanted = fillInstantQueue && instant ? slots : 1;
-    // 这条配方的持有量（仓库 + 待收 + 队列）。cand 已经按同一个 heldOf 过滤过上限，
+    // 这条配方的持有量（仓库 + 待收 + 队列）。pool 已经按同一个 heldOf 过滤过上限，
     // 这里只是把它取出来给循环里的「瞬成排满」再逐份卡上限用。
     const held = heldOf(best.itemId);
     // label 里带上配方消耗：排产最常出问题的地方就是「挑了哪条配方、这条配方吃什么」。

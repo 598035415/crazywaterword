@@ -103,6 +103,13 @@ export const PAGE = `<!doctype html>
   .recipe .sub { font-size: 11px; color: #7c8695; display: block; line-height: 1.3; }
   .recipe .sub .miss { color: #f08a8a; }
   .pick { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #262a31; }
+  /* 英雄养成：勋章/装备一格里可能有好几条，压成定高两行 + 「另 N 项」，
+     不然一条「换装备 武器：蓝武器2 lv1 4星 → 蓝武器1 lv1 3星」就能把整张表撑乱。 */
+  #hero-table td { vertical-align: top; }
+  .grow-lines { max-width: 320px; }
+  .grow-line { font-size: 12px; color: #b9c2ce; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .grow-more { font-size: 11px; color: #7c8695; }
+  .hero-stock { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -153,6 +160,9 @@ export const PAGE = `<!doctype html>
       <span id="loop-hint" class="warn"></span>
     </div>
     <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 锻造 → 海兽培育」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
+运行中改完设置**不用停掉重开**：按钮会变成「应用设置」，点一下下一轮就生效（轮数除外，那个要重开）。
+间隔按「本轮开始 → 下一轮开始」算，不会因为某一轮跑得久就整体往后漂；填 0（或小于 5 秒）会按 5 秒处理。
+点「停止」后不会硬中断：当前这一段跑完就退出，所以状态会先显示「正在停止」。
 这里只放自动化：要手动点一次的「任务奖励」「海面」「联盟情报」都在「日常」页。</pre>
 
     <h2>搁浅的货轮（世界宝藏）</h2>
@@ -171,6 +181,8 @@ export const PAGE = `<!doctype html>
         <input type="checkbox" id="treasure-color-5" checked> 万吨
       </label>
       <label class="dim">时间间隔 <input id="treasure-every" value="60" style="width:64px"> 秒</label>
+      <span class="k" title="每日上限来自 TreasureLootParamCfg「每日宝藏奖励次数」，已领次数来自 TreasureLootStatsResponse。满了挂机就不再发探测请求">每日宝藏奖励</span>
+      <span id="treasure-count" class="dim">还没探测过</span>
       <button id="treasure-run">立刻抢一次</button>
       <span id="treasure-state" class="dim">还没跑过</span>
     </div>
@@ -185,6 +197,11 @@ export const PAGE = `<!doctype html>
 同档再按物品件数 → 资源），把空闲船压上去推快 —— 同联盟最多 10 支能占同一个，默认派 3 支。
 单支消耗汽油 500（WorldParamCfg「进攻宝藏消耗汽油」），汽油不够会自动少派。奖励没有领取请求，结算后进邮件，
 由上面的「自动领取」一并收掉。间隔填 0 = 每轮都看。
+**每日奖励次数**：上面那行「已领 x/N」就是今天的进度（N 来自 TreasureLootParamCfg「每日宝藏奖励次数」，默认 3），
+挂机探测一次就更新一次，手动「立刻抢一次」也会更新 —— 不用为了看个数字多发请求。
+**今日没机会了就暂停探测**：奖励次数满了（到明天 0 点重置）或勾选等级里一个可抢的都没有（等到下一个整点刷新），
+挂机连探测请求都不发，日志里只每 30 分钟提一句「暂停探测：…，x 后再试」。
+其余情况（没空闲船、汽油不够、船还在航行）都是几分钟内自己会变，不会暂停。
 **活动有效期**：世界宝藏没有独立的活动时间，边界是**赛季结束** —— 服务端 SeasonRankInfoResponse.endTime
 （拿不到就按 worldOpenTime + SeasonTaskCfg 的赛季天数复算，两者实测完全相等）。赛季结束前 1 小时连船都派不了
 （游戏内「合服计划」说明），所以真正的截止是 endTime − 1 小时。到点后本模块**自动停手**，日志与这里都会打印
@@ -270,6 +287,9 @@ export const PAGE = `<!doctype html>
           <option value="RED">红</option>
         </select>
       </label>
+      <label class="dim" title="投喂该队列位要求的材料（鱼肠线/粗铁/烤鱼这类），每次把剩余时间往前推 4 小时（PetParamCfg「投喂减少培育时间」）。不花钻石、不用加速器、不看广告；材料不够就跳过，不会去买">
+        <input type="checkbox" id="pet-feed" checked> 材料加速
+      </label>
       <button id="pet-run">立刻培育一次</button>
       <span id="pet-state" class="dim">还没跑过</span>
     </div>
@@ -277,18 +297,31 @@ export const PAGE = `<!doctype html>
 成熟的一次领走（GetMaturePetRequest 没有 body，跟客户端一样一下收全部）；队列空着的位子按「品质从高到低、同品质先补编号小的物种」排满。
 材料（基因 + 金币）不够就自动降一级 —— 所以紫基因攒够 400 时会自动从蓝升到紫，不用改设置。
 基因是该物种专属的（「宠物3蓝基因」只用于宠物3），攒着没有别的用途，所以有就排；**永不动钻石**。
-喂食（PetFeedRequest）**不做**：它按队列位消耗 feedRequirements 换时间，材料是什么、值不值还没确认，自动喂等于拿库存去赌。</pre>
+**材料加速（投喂）默认开**：PetFeedRequest{jobIdx} 消耗该队列位 feedRequirements 里的材料
+（实测「鱼肠线×12 + 粗铁×4 + 烤鱼×40」），每次把剩余时间往前推 PetParamCfg「投喂减少培育时间」= 4 小时。
+判据与客户端 _onBtnFood 一致：材料够才喂，不够就跳过（客户端那里会弹「购买补齐」，我们不买）。
+一轮每个队列位只喂一次 —— 喂完由服务端刷新 finishTime，下一轮按新状态再判断；剩不到 5 分钟不喂（材料白花）。
+不碰钻石、不用加速器、不看广告。</pre>
 
     <pre class="dim" style="color:#7c8695">潜水与打捞**没有做，也不会做**：它们的请求体要求上报「这一局你在水下/海里实际捡到了什么」，纯协议只能伪造战利品，属于谎报。详见 README「安全边界」。</pre>
   </section>
 
   <section id="tab-heroes" class="hidden">
     <div class="bar">
-      <button id="hero-plan">计算计划</button>
-      <button id="hero-run" class="primary">执行养成</button>
+      <button id="hero-plan">探测</button>
+      <button id="hero-grow" class="primary">全部养成</button>
+      <label class="dim"><input type="checkbox" id="hero-bench"> 含未上阵英雄</label>
       <span id="hero-hint" class="warn"></span>
+      <span id="hero-stock" class="dim hero-stock"></span>
     </div>
-    <pre id="hero-view">升级、升星、升技能的条件取自游戏客户端的红点逻辑；执行前会先算一遍计划。</pre>
+    <div class="bar" id="hero-switches"><span class="k">执行范围</span></div>
+    <pre id="hero-view">默认只列主战英雄 —— 当前主线出战阵容（GetFormationResponse 的 5 个位置）里的那几个，材料也只给他们。
+勾上「含未上阵英雄」才把整本英雄册摊开（未上阵的一般只做「戴上闲置装备/勋章」这类不花材料的动作）。
+
+每个英雄能看到现在能提升什么：等级、升星、技能，以及勋章的强化/替换和装备的升级/精炼/升星/替换。
+每一项都按客户端自己的公式算（上限、材料、金币都逐条核对），材料不够的不会出现在计划里。
+「养成」= 只对这一个英雄执行，「全部养成」= 按战力从高到低吃材料；执行前会重新探测一遍，不看这份旧快照。
+恒定边界：不花钻石、不分解任何勋章（只用「徽章经验」道具）、不看广告、不用加速器。</pre>
     <div id="hero-table"></div>
   </section>
 
@@ -379,6 +412,7 @@ export const PAGE = `<!doctype html>
     <pre id="factory-view">队列的倒计时是服务端给的完成时间，本地每秒自己走，不额外发请求。
 制造：点一下配方选中，再点「制造」就直接排产（不二次确认）。
 配方上的「满」= 这个产品的持有量（仓库 + 工厂待收/在造）到上限了；「缺料」= 配方材料不够。造不了时点「制造」不会发请求，而是把卡在哪写在上面那行（红字）。
+缺料且能用「原料自选包 / 工事材料自选包」补齐时，按钮会变成「兑料并制造」——点它才会真的花包（一包换一个单位，按钮上写着要花几个），不点就一个包都不动。
 一键收成：把每座工厂囤积的成品一次收完（逐座发 GainFactoryProduceRequest，收益按产品名合并显示）。
 非工厂建筑（民居、指标楼）的产物不在这里收，那些走「挂机 → 执行一轮」。</pre>
     <div id="factory-list"><span class="dim">还没读。点「刷新工厂」，或先在右上角「连接」。</span></div>
@@ -777,17 +811,105 @@ function renderGate(nodeId, lastAt, everyMs, enabled, running = true) {
     node.textContent = base + ' · 未在挂机，不会执行';
     return;
   }
-  const left = Math.max(0, Math.ceil((lastAt * 1000 + (everyMs || 0) - Date.now()) / 1000));
+  // 跟服务端 gateDue 用同一套容差（间隔的 10%，最多 2 秒，最少 200ms）：
+  // 轮首时刻与「真的执行时刻」天然差几秒，不扣容差页面会一直显示「还差 2 秒」，
+  // 而服务端其实已经在跑了 —— 两边显示对不上就会被当成 bug。
+  const slackMs = everyMs > 0 ? Math.min(2_000, Math.max(200, everyMs * 0.1)) : 0;
+  const left = Math.max(0, Math.ceil((lastAt * 1000 + (everyMs || 0) - slackMs - Date.now()) / 1000));
   node.textContent = !(everyMs > 0) ? base + '（不限间隔，每轮都试）'
     : base + ' · ' + (left > 0 ? '还差 ' + dur(left) : '已到间隔');
 }
 
+// 每日宝藏奖励次数：数值来自服务端最近一次探测（挂机每轮更新，手动「立刻抢一次」也更新），
+// 所以页面只显示缓存值，绝不为了「看个数字」在轮询里多发请求。
+// 暂停探测（奖满 / 活动结束 / 没有可抢的）也标在这一行 —— 否则「已领 3/3」配着「上次 30 秒前」
+// 会让人以为挂机还在傻跑探测。
+function treasureCountOf(stats, gate) {
+  if (!stats) return { text: '还没探测过', title: '还没探测过：点「立刻抢一次」或开始挂机就会读到次数' };
+  const tail = gate && gate.skipped
+    ? (gate.skipForever ? ' · 已暂停探测' : ' · 暂停探测，' + dur(gate.skipLeftSeconds) + '后再试')
+    : '';
+  return {
+    text: (stats.text || '—') + (stats.at ? '（' + clock(stats.at) + ' 探测）' : '') + tail,
+    title: '每日上限 ' + stats.dailyLimit + ' 次（TreasureLootParamCfg「每日宝藏奖励次数」），已领 '
+      + (stats.todayRewardTimes == null ? '?' : stats.todayRewardTimes) + ' 次'
+      + (stats.dailyFull ? '，今日已满，明天 0 点重置' : '')
+      + (gate && gate.skipped ? '；挂机暂停探测：' + gate.skipReason : ''),
+  };
+}
+
+function renderTreasureCount(data, lastRound) {
+  const node = $('treasure-count');
+  const view = treasureCountOf(data && data.treasureStats, lastRound && lastRound.gates && lastRound.gates.treasure);
+  node.textContent = view.text;
+  node.title = view.title;
+}
+
+// 页面刚打开、挂机也没跑过时，服务端一个数字都没有 —— 补一次，
+// 之后都靠 /api/loop 里带回来的缓存，不在 3 秒轮询里重复问。
+// 失败（没选账号 / 没连上）不写死：每分钟最多再试一次，不会有请求风暴。
+// 按「天」记：以前成功一次就永久不再取，页面挂到第二天还显示昨天的「已领 3/3」。
+let treasureCountDay = '';
+let treasureCountAt = 0;
+async function fetchTreasureCountOnce() {
+  const today = new Date().toDateString();
+  if (treasureCountDay === today) return;
+  if (Date.now() - treasureCountAt < 60_000) return;
+  treasureCountAt = Date.now();
+  try {
+    const data = await call('/api/treasure');
+    treasureCountDay = today;
+    renderTreasureCount({
+      treasureStats: {
+        at: Math.floor(Date.now() / 1000),
+        text: data.rewardText,
+        dailyLimit: data.dailyLimit,
+        todayRewardTimes: data.todayRewardTimes,
+        dailyFull: data.dailyFull,
+      },
+    }, null);
+  } catch {
+    /* 没选账号 / 没连上：保持「还没探测过」，下一分钟再试 */
+  }
+}
+
+// 挂机表单的「用户改过」标记。3 秒轮询会把服务端值回填到控件上（为了切账号/刷新后对齐），
+// 但用户刚改的那一项被回填回去就永远改不动了 —— 运行中把间隔从 60 改成 300，
+// 松手 3 秒后又变回 60，用户只会以为「这破页面改不了」。
+// 所以：改动即标脏，标脏的项不再回填；点「应用设置」成功后清空（那时服务端已经是新值）。
+const loopDirty = new Set();
+const LOOP_FIELDS = [
+  'loop-rounds', 'loop-every', 'world-speedup', 'world-reroll',
+  'world-pick', 'pick-every', 'world-farm', 'farm-every',
+  'loop-radar', 'radar-every', 'radar-ratio',
+  'forge-on', 'forge-every', 'pet-on', 'pet-every', 'pet-quality', 'pet-feed',
+  'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
+  'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
+];
+for (const id of LOOP_FIELDS) {
+  const node = $(id);
+  if (!node) continue;
+  const mark = () => {
+    loopDirty.add(id);
+    refreshLoop();
+  };
+  node.addEventListener('input', mark);
+  node.addEventListener('change', mark);
+}
+
 function renderLoop(data) {
-  $('loop-start').disabled = data.running;
+  // 运行中按钮变成「应用设置」：服务端支持热更新（下一轮生效），不用停掉重开。
+  $('loop-start').disabled = false;
+  $('loop-start').textContent = data.running ? '应用设置' : '开始挂机';
   $('loop-stop').disabled = !data.running;
-  $('loop-hint').textContent = (data.running ? '挂机中，已完成 ' : '未在挂机，累计 ') + data.completed + ' 轮' + (data.error ? '，中止: ' + data.error : '');
-  // 运行中把服务端实际生效的间隔回填到输入框（用户正在改的那个不动）。
+  const last = data.history && data.history.length ? data.history[data.history.length - 1] : null;
+  const spent = last && last.elapsedMs ? '，上一轮耗时 ' + dur(Math.round(last.elapsedMs / 1000)) : '';
+  const state = data.stopping ? '正在停止（这一段跑完就退）' : data.running ? '挂机中' : '未在挂机';
+  $('loop-hint').textContent = state + '，' + (data.running ? '已完成 ' : '累计 ') + data.completed + ' 轮'
+    + spent + (data.error ? '，中止: ' + data.error : '');
+  // 运行中把服务端实际生效的间隔回填到输入框（标脏的项 = 用户刚改过，不回填）。
   const syncInterval = (id, everyMs) => {
+    if (loopDirty.has(id)) return;
     const input = $(id);
     if (data.running && document.activeElement !== input) input.value = String(Math.round((everyMs || 0) / 1000));
   };
@@ -798,19 +920,32 @@ function renderLoop(data) {
   syncInterval('pet-every', data.petEveryMs);
   syncInterval('idle-every', data.idleEveryMs);
   syncInterval('treasure-every', data.treasureEveryMs);
-  renderGate('pick-state', data.lastPickAt, data.pickEveryMs, $('world-pick').checked, data.running);
-  renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, $('world-farm').checked, data.running);
-  renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, $('loop-radar').checked, data.running);
-  renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, $('forge-on').checked, data.running);
-  renderGate('pet-state', data.lastPetAt, data.petEveryMs, $('pet-on').checked, data.running);
-  renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, $('idle-on').checked, data.running);
-  renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, $('treasure-on').checked, data.running);
-  // 运行中把服务端实际生效的「抢哪些」回填到多选框（默认只勾万吨）。
+  // 状态行一律按**服务端实际生效**的开关算（未挂机时才看页面勾选）——
+  // 页面勾着但服务端关着时，写「还差 20 秒」会误导。
+  const gateOn = (id, serverValue) => (data.running && typeof serverValue === 'boolean' ? serverValue : $(id).checked);
+  renderGate('pick-state', data.lastPickAt, data.pickEveryMs, gateOn('world-pick', data.pickEnabled), data.running);
+  renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, gateOn('world-farm', data.farmEnabled), data.running);
+  renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, gateOn('loop-radar', data.radarEnabled), data.running);
+  renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, gateOn('forge-on', data.forgeEnabled), data.running);
+  renderGate('pet-state', data.lastPetAt, data.petEveryMs, gateOn('pet-on', data.petEnabled), data.running);
+  // 运行中把服务端实际生效的「材料加速」回填（默认开），标脏的不动。
+  if (data.running && typeof data.petFeed === 'boolean' && !loopDirty.has('pet-feed')) $('pet-feed').checked = data.petFeed;
+  renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, gateOn('idle-on', data.idleEnabled), data.running);
+  renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, gateOn('treasure-on', data.treasureEnabled), data.running);
+  renderTreasureCount(data, data.history[data.history.length - 1]);
+  if (!data.treasureStats) fetchTreasureCountOnce();
+  // 运行中把「抢哪些」回填到多选框（默认只勾万吨），标脏的不动。
   if (data.running && Array.isArray(data.treasureColors)) {
     for (const color of [3, 4, 5]) {
-      const box = $('treasure-color-' + color);
-      if (box) box.checked = data.treasureColors.indexOf(color) >= 0;
+      const id = 'treasure-color-' + color;
+      const box = $(id);
+      if (box && !loopDirty.has(id)) box.checked = data.treasureColors.indexOf(color) >= 0;
     }
+  }
+  // 执行范围同理：回填加速器/拒单勾选（标脏的不动）。
+  if (data.running) {
+    if (!loopDirty.has('world-speedup')) $('world-speedup').checked = data.allowSpeedUp === true;
+    if (!loopDirty.has('world-reroll')) $('world-reroll').checked = data.allowReroll === true;
   }
   if (!data.history.length) {
     $('loop-view').textContent = data.running ? '第一轮进行中 ...' : '还没跑过。点「开始挂机」按上面的设置跑起来。';
@@ -830,7 +965,7 @@ async function refreshLoop() {
 
 $('loop-start').onclick = async () => {
   try {
-    await call('/api/loop/start', {
+    const data = await call('/api/loop/start', {
       method: 'POST',
       body: JSON.stringify({
         confirm: true,
@@ -853,6 +988,8 @@ $('loop-start').onclick = async () => {
         pet: $('pet-on').checked,
         petEverySeconds: Number($('pet-every').value || 0),
         petMaxQuality: $('pet-quality').value,
+        // 材料加速（投喂）默认开：只花队列要求的培育材料，每次减 4 小时。
+        petFeed: $('pet-feed').checked,
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，默认 5 分钟看一眼。
         idle: $('idle-on').checked,
         idleEverySeconds: Number($('idle-every').value || 0),
@@ -864,7 +1001,11 @@ $('loop-start').onclick = async () => {
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
+    // 已经挂机时这一下是「应用设置」（服务端热更新，下一轮生效），不是重启。
+    // 设置既然被服务端采纳了，就清掉标脏 —— 之后回填的是刚提交的值，不会再打架。
+    loopDirty.clear();
     refreshLoop();
+    if (data.hot) $('loop-hint').textContent = '设置已应用，下一轮生效';
   } catch (error) {
     $('loop-hint').textContent = error.message;
   }
@@ -872,20 +1013,17 @@ $('loop-start').onclick = async () => {
 $('loop-stop').onclick = async () => {
   try {
     await call('/api/loop/stop', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    // 停了之后页面上的值就是「下次开始」的值，标脏没有意义了。
+    loopDirty.clear();
+    $('loop-hint').textContent = '正在停止（这一段跑完就退出）';
     refreshLoop();
   } catch (error) {
     $('loop-hint').textContent = error.message;
   }
 };
 
-// 勾选一变就把「上次 / 还差多久」重算一遍，不用等下一次 3 秒轮询。
-$('world-pick').onchange = refreshLoop;
-$('world-farm').onchange = refreshLoop;
-$('loop-radar').onchange = refreshLoop;
-$('forge-on').onchange = refreshLoop;
-$('pet-on').onchange = refreshLoop;
-$('idle-on').onchange = refreshLoop;
-$('treasure-on').onchange = refreshLoop;
+// 勾选 / 间隔的变更由上面的 LOOP_FIELDS 统一处理（标脏 + 立刻重画状态），
+// 这里不再逐个绑 onchange —— 两套绑定会让每次改动触发两次 /api/loop。
 
 // 手动「立刻领取一次」：不看间隔，跟挂机里那套完全一样。
 $('idle-run').onclick = async () => {
@@ -949,11 +1087,15 @@ $('forge-run').onclick = async () => {
   }
 };
 
-// 手动「立刻培育一次」：探测 → 收成熟 → 给空位排产，跟挂机里那套完全一样。
+// 手动「立刻培育一次」：探测 → 收成熟 → 材料加速 → 给空位排产，跟挂机里那套完全一样。
+// 「材料加速」勾选一起带上：服务端先存进 session.loop，手动/面板/挂机看到的是同一份设置。
 $('pet-run').onclick = async () => {
   $('pet-state').textContent = '执行中 ...';
   try {
-    const data = await call('/api/pet/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const data = await call('/api/pet/run', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, petFeed: $('pet-feed').checked }),
+    });
     const results = data.results || [];
     const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
     const tail = results.length
@@ -1139,49 +1281,142 @@ $('world-run').onclick = () => {
 };
 
 // ---- 英雄 ------------------------------------------------------------------
-// 技能是一串等级，原始形状是 [1,0,0,0]，直接摆给用户看没意义，只说练了几项。
-function skillText(levels) {
-  const list = levels || [];
-  if (!list.length) return '—';
-  const raised = list.filter((level) => level > 0);
-  return raised.length ? '已升 ' + raised.length + '/' + list.length : '未升级';
+// 「英雄本体」那一列（等级/升星/技能各升多少）由后端算好放进 kpi，
+// 页面只负责摆出来 —— 条件判定留在 heroes.mjs 一处，避免两边漂。
+// 养成开关：勾选状态存在页面变量里，重新探测/切换 tab 都不会把它重置回默认值。
+const heroSwitches = {};
+
+function heroSwitchBody() {
+  const out = {};
+  for (const [key, value] of Object.entries(heroSwitches)) out[key] = value !== false;
+  return out;
+}
+
+function renderHeroSwitches(labels) {
+  const bar = clear($('hero-switches'));
+  bar.appendChild(el('span', 'k', '执行范围'));
+  for (const [key, label] of Object.entries(labels || {})) {
+    if (!(key in heroSwitches)) heroSwitches[key] = true;
+    const wrap = el('label', 'dim');
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = heroSwitches[key] !== false;
+    box.onchange = () => { heroSwitches[key] = box.checked; };
+    wrap.appendChild(box);
+    wrap.appendChild(document.createTextNode(' ' + label));
+    bar.appendChild(wrap);
+  }
+}
+
+// 材料一眼可见：这几样决定了「探测出来的一堆升级到底做不做得动」。
+function renderHeroStock(stock) {
+  if (!stock) return;
+  $('hero-stock').textContent = Object.entries(stock).map(([id, n]) => id + ' ' + fmt(n)).join(' · ');
+}
+
+// 英雄本体三件事各占一行，和右边的勋章/装备列一起对齐，读起来是「这个英雄能升什么」的清单。
+function heroKpiLines(hero) {
+  const out = [];
+  if (hero.kpi?.level) out.push('等级 ' + hero.kpi.level);
+  if (hero.kpi?.star) out.push('升星 ' + hero.kpi.star);
+  if (hero.kpi?.skill) out.push('技能 ' + hero.kpi.skill);
+  return out;
+}
+
+// 一格最多两行，剩下的收成「另 N 项」；完整内容挂在 title 上，鼠标停一下能看全。
+function heroLines(list, limit) {
+  const wrap = el('div', 'grow-lines');
+  if (!list || !list.length) {
+    wrap.appendChild(el('span', 'dim', '—'));
+    return wrap;
+  }
+  const shown = list.slice(0, limit || 2);
+  for (const line of shown) {
+    const row = el('div', 'grow-line', line);
+    row.title = line;
+    wrap.appendChild(row);
+  }
+  if (list.length > shown.length) wrap.appendChild(el('div', 'grow-more', '另 ' + (list.length - shown.length) + ' 项'));
+  return wrap;
+}
+
+// 英雄名 + 「主战」标记：默认只看主战英雄，勾了「含未上阵」时才需要靠这枚标记分辨。
+function heroWhoCell(hero) {
+  const wrap = el('div', 'who-cell');
+  wrap.appendChild(iconEl(hero.head || hero.icon, 26, hero.heroId));
+  wrap.appendChild(el('span', null, hero.heroId));
+  if (hero.front) wrap.appendChild(chip('done', '主战'));
+  return wrap;
 }
 
 function renderHeroes(data) {
-  $('hero-view').textContent = data.text;
+  renderHeroSwitches(data.switchLabels);
+  renderHeroStock(data.stock);
+  const formation = data.formation || {};
+  $('hero-bench').checked = formation.onlyFront === false;
+  // 主战人数直接写进材料行，省得用户自己数：材料只给这几个。
+  const frontInfo = formation.frontCount != null
+    ? '主战 ' + formation.frontCount + '/' + (formation.total ?? '?') + (formation.onlyFront === false ? '（显示全部）' : '')
+    : '';
+  if (frontInfo) $('hero-stock').textContent = frontInfo + ' · ' + ($('hero-stock').textContent || '');
+  // PAGE 是模板字符串，这里的换行转义必须写两个反斜杠，否则会在页面脚本里变成真实换行、直接语法错误。
+  $('hero-view').textContent = [data.text, data.growthText].filter(Boolean).join('\\n');
   const box = clear($('hero-table'));
-  box.appendChild(table(['英雄', '等级', '星级', { label: '战力', num: true }, '技能'], data.heroes.map((hero) => [
-    { cell: { icon: hero.head || hero.icon, id: hero.heroId } },
-    'lv' + hero.level,
-    hero.star + ' 星',
-    { num: true, text: fmt(hero.power) },
-    skillText(hero.skillLevels),
-  ])));
+  const rows = (data.heroes || []).map((hero) => {
+    const btn = el('button', 'tiny primary', '养成');
+    btn.disabled = !hero.actions && !hero.kpi?.level && !hero.kpi?.star && !hero.kpi?.skill;
+    btn.onclick = () => growHeroes({ heroId: hero.heroId, name: hero.name || hero.heroId });
+    return [
+      heroWhoCell(hero),
+      'lv' + hero.level,
+      hero.star + ' 星',
+      { num: true, text: fmt(hero.power) },
+      heroLines(heroKpiLines(hero), 3),
+      heroLines(hero.badgeItems),
+      heroLines(hero.equipItems),
+      btn,
+    ];
+  });
+  box.appendChild(table(['英雄', '等级', '星级', { label: '战力', num: true }, '英雄本体', '勋章', '装备', '操作'], rows));
 }
 
-$('hero-plan').onclick = async () => {
-  $('hero-hint').textContent = '计算中 ...';
-  try {
-    renderHeroes(await call('/api/heroes'));
-    $('hero-hint').textContent = '';
-  } catch (error) {
-    $('hero-hint').textContent = error.message;
-  }
-};
-$('hero-run').onclick = () => {
-  openConfirm('执行英雄养成计划', [
-    el('div', null, '按计算出来的计划升级、升星、升技能，会消耗英雄经验、碎片与技能书。'),
+// 执行：单个英雄 or 全部主战（战力从高到低吃材料，后端按这个顺序算）。
+function growHeroes(target) {
+  const bench = $('hero-bench').checked;
+  const who = target?.heroId
+    ? '「' + (target.name || target.heroId) + '」'
+    : (bench ? '全部英雄' : '全部主战英雄');
+  openConfirm('英雄养成：' + who, [
+    el('div', null, '会对' + who + '执行上方勾选的养成项：勋章强化/替换、装备升级/精炼/升星/替换，以及英雄等级、升星、技能。'),
+    el('div', 'dim', '材料不够的项不会执行；执行前会重新探测一遍。替换类操作会把身上那件换下来（服务端返还材料），不要把「装备替换」「勋章替换」当成只读开关。'),
+    el('div', 'dim', '恒定不做：不花钻石、不分解勋章、不用加速器。'),
   ], async () => {
     $('hero-hint').textContent = '执行中 ...';
     try {
-      const data = await call('/api/heroes/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+      const body = { confirm: true, switches: heroSwitchBody(), includeBench: bench };
+      if (target?.heroId) body.heroId = target.heroId;
+      const data = await call('/api/heroes/grow', { method: 'POST', body: JSON.stringify(body) });
       $('hero-hint').textContent = '发出 ' + data.sent + ' 个请求，失败 ' + data.failed + '，耗时 ' + Math.round(data.ms / 1000) + 's';
       $('hero-plan').onclick();
     } catch (error) {
       $('hero-hint').textContent = error.message;
     }
   });
+}
+
+$('hero-plan').onclick = async () => {
+  $('hero-hint').textContent = '探测中 ...';
+  try {
+    // bench=1 才把未上阵的英雄也读进来（默认只算主战阵容）。
+    renderHeroes(await call('/api/heroes' + ($('hero-bench').checked ? '?bench=1' : '')));
+    $('hero-hint').textContent = '';
+  } catch (error) {
+    $('hero-hint').textContent = error.message;
+  }
 };
+// 切换「含未上阵」直接重读一遍，不用再点探测。
+$('hero-bench').onchange = () => $('hero-plan').onclick();
+$('hero-grow').onclick = () => growHeroes(null);
 
 // ---- 日常 ------------------------------------------------------------------
 const DAILY_LABEL = { ready: '可做', paid: '需付费', partial: '部分可做', waiting: '等待中', done: '已完成', blocked: '不可用', error: '出错', unknown: '未知' };
@@ -1318,6 +1553,9 @@ function blockReason(factory, recipe) {
   if (!recipe.enough) {
     const lack = recipe.costs.filter((c) => !c.enough).map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num);
     parts.push('材料不够：' + lack.join('、'));
+    // 能靠自选包补齐时说清要花几个包；换不出来的材料要说明只能等生产。
+    if (recipe.packable) parts.push('可用 ' + recipe.packText + ' 换出来（点「兑料并制造」）');
+    else if (recipe.unpackable && recipe.unpackable.length) parts.push(recipe.unpackable.join('、') + ' 没有能换它的自选包，只能等生产/采集');
   }
   if (factory.full) parts.push('制造位满了 ' + factory.queue.length + '/' + (slots || '?') + '，等它做完或收掉');
   return '造不了 ' + recipe.itemId + '：' + parts.join('；');
@@ -1413,24 +1651,33 @@ function factoryCard(factory, data) {
     if (!picked.enough) why.push('材料不够');
     if (picked.atCap) why.push('仓库到上限');
     if (factory.full) why.push('制造位满');
+    // 缺料但能用白名单自选包（原料 / 工事材料）补齐 → 给一个明确写着消耗的按钮。
+    // 只缺料能兑：未解锁 / 到上限 / 制造位满这几条兑料也解决不了，仍然挡住。
+    const packPay = !picked.enough && picked.packable;
+    const blockers = why.filter((item) => item !== '材料不够' || !packPay);
     const foot = el('div', 'pick');
+    // 缺口写清楚「差多少、花几个包」：只写「材料不够」等于没说。
+    const lackText = !picked.enough
+      ? ' ｜ 缺 ' + picked.costs.filter((c) => !c.enough).map((c) => c.id + ' ' + fmt(c.have) + '/' + c.num).join('、')
+        + (picked.packable ? '，可用 ' + picked.packText + ' 补' : '')
+      : '';
     foot.appendChild(el('div', 'dim', '已选 ' + picked.itemId + '：' + dur(picked.finalSeconds ?? picked.produceTime)
       + (picked.costs.length ? '，耗 ' + picked.costs.map((c) => c.id + '×' + c.num).join(' ') : '')
-      + (why.length ? '（' + why.join('、') + '）' : '')));
-    const btn = el('button', 'primary tiny', '制造 ' + picked.itemId);
+      + (why.length ? '（' + why.join('、') + '）' : '') + lackText));
+    const btn = el('button', 'primary tiny', (packPay ? '兑料并制造 ' : '制造 ') + picked.itemId);
     // 按钮**不禁用**：灰着一个没反应的按钮，用户不知道卡在哪。
     // 点下去如果造不了，就在提示行把原因说清楚，别发请求。
     btn.onclick = async () => {
-      if (why.length) {
+      if (blockers.length) {
         factoryHint(blockReason(factory, picked), 'bad');
         return;
       }
       btn.disabled = true;
-      factoryHint('正在排产 ' + picked.itemId + ' ...', 'warn');
+      factoryHint((packPay ? '正在用 ' + picked.packText + ' 兑料并排产 ' + picked.itemId + ' ...' : '正在排产 ' + picked.itemId + ' ...'), 'warn');
       try {
         const data = await call('/api/factory/produce', {
           method: 'POST',
-          body: JSON.stringify({ confirm: true, buildingId: factory.buildingId, productId: picked.itemId }),
+          body: JSON.stringify({ confirm: true, buildingId: factory.buildingId, productId: picked.itemId, usePack: packPay }),
         });
         factoryHint(data.note || '', 'ok');
         // 选中状态留着：同一个产品要连排几个时，可以接着点，不用重新选。
@@ -1519,6 +1766,11 @@ setInterval(() => {
 // 单元格可以是字符串、{num}、{chip}、{cell: 图标项}、{cells: [图标项]}
 function putCell(td, spec) {
   if (spec == null) return;
+  // 操作列要放按钮，直接给节点即可（其余分支都是数据描述）。
+  if (typeof spec === 'object' && spec.nodeType === 1) {
+    td.appendChild(spec);
+    return;
+  }
   if (typeof spec !== 'object') {
     td.textContent = spec;
     return;

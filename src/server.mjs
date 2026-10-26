@@ -11,6 +11,7 @@ import { collectState, summarize, formatState } from './game.mjs';
 import { getConfig, APPID } from './config.mjs';
 import { qrSvg } from './vendor/qrcode.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
+import { surveyHeroGrowth, planHeroGrowth, formatHeroGrowth, buildHeroRows, GROW_SWITCHES, SWITCH_LABELS, BADGE_EXP_ITEM, EQUIP_IRON, EQUIP_REFINE_ITEM, EQUIP_STAR_ITEM } from './heroGrow.mjs';
 import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
@@ -19,8 +20,8 @@ import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_R
 import { surveyEquip, planEquip, formatEquipPlan } from './equip.mjs';
 import { surveyPet, planPet, formatPetPlan, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
-import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, DEFAULT_MAX_FLEETS, DEFAULT_COLORS, colorsOf, colorsText } from './treasure.mjs';
-import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts } from './factories.mjs';
+import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, rewardCountText, DEFAULT_MAX_FLEETS, DEFAULT_COLORS, colorsOf, colorsText } from './treasure.mjs';
+import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts, packCoverPlan, exchangePacks } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
 import { startCapture, stopCapture, captureState, DEFAULT_PROXY_PORT } from './capture.mjs';
@@ -83,6 +84,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       client: null,
       player: null,
       busy: null,
+      // 重连失败后的静默截止时间（毫秒时间戳，0 = 不在冷却里）。
+      // 网关对「刚被踢下线」的账号会连着回 result=3，而页面每 3 秒轮询一次 /api/overview，
+      // 每次都触发 ensureConnected 重登 —— 等于我们自己在把冷却期一直踩满。
+      linkCooldownUntil: 0,
+      // 正在进行的重连（Promise）。loop 与页面轮询可能同时要重连，共用这一个，别各建一条连接。
+      linkPending: null,
       log: [],
       loop: {
         running: false,
@@ -112,6 +119,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         petEveryMs: 300_000,
         lastPetAt: null,
         petMaxQuality: 'ORANGE',
+        // 材料加速（投喂）：默认开。消耗队列位要求的材料把剩余时间往前推 4 小时，
+        // 不花钻石/加速器/广告。
+        petFeed: true,
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）：收益 8 小时封顶、等级奖励是按级一次，
         // 都是小时级节奏，所以默认 5 分钟看一眼，不必每轮多打 3 个请求。
         idleEnabled: true,
@@ -125,7 +135,20 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         treasureMaxFleets: DEFAULT_MAX_FLEETS,
         // 抢哪些等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）：默认只抢万吨。
         treasureColors: [...DEFAULT_COLORS],
+        // 最近一次探测到的每日奖励次数（{ at, dailyLimit, todayRewardTimes, remainingRewards,
+        // dailyFull, nextRefreshTime, text }）：页面上「已领 x/N」直接用它，不再为看数字打请求。
+        treasureStats: null,
         minPowerRatio: DEFAULT_MIN_POWER_RATIO,
+        // 运行中可改的执行范围（以前只在 start 时生效，改完必须停掉重开）：
+        // 拾荒开关、材料不齐时用不用自选包、加速器/拒单/付费这些允许项。
+        pickUpFloaters: false,
+        useSelectPack: true,
+        maxPackPerRound: undefined,
+        allowSpeedUp: false,
+        allowReroll: false,
+        allowPaid: false,
+        // 已经点了停止、但循环还在收尾（最多跑完当前这一段）。
+        stopping: false,
         stop: { aborted: false },
         history: [],
         error: null,
@@ -179,10 +202,36 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     return { url: account.url, result: response.result, initSeqNo: response.initSeqNo, playerInfo: session.player };
   }
 
+  // 重连失败后的静默时长：网关在「刚被踢下线」的一两分钟里对重登回 result=3
+  // （2026-10-26 11:45:47 起连撞 40+ 次、每次间隔 3 秒，全是 /api/overview 的轮询触发的）。
+  // 15 秒足够躲开这波高频撞击，又不至于让手动刷新等太久。
+  const RECONNECT_COOLDOWN_MS = 15_000;
+
   async function ensureConnected(session, account) {
     if (session.client?.connected) return session.client;
-    await connect(session, account);
-    return session.client;
+    // 页面每 3 秒轮询 /api/overview、loop 自己也会重连，两边同时撞进来会各建一个 GameClient，
+    // 后到的那个必然被 connect() 的「这个账号已经连上了」拦下，白白把冷却期又踩一次。
+    // 并发期间只登一次，所有人共用同一个 promise。
+    if (session.linkPending) return session.linkPending;
+    if (session.linkCooldownUntil > Date.now()) {
+      // 文案给的是「自动重连」而不是具体秒数：页面每 3 秒刷一次，秒数跳来跳去会晃眼。
+      throw new Error('连接已断开，正在自动重连');
+    }
+    const pending = connect(session, account)
+      .then(() => {
+        session.linkCooldownUntil = 0;
+        return session.client;
+      })
+      .catch((error) => {
+        session.linkCooldownUntil = Date.now() + RECONNECT_COOLDOWN_MS;
+        // 重登被拒的原话（result=3）留着，比一串 socket error 好定位。
+        throw error;
+      })
+      .finally(() => {
+        if (session.linkPending === pending) session.linkPending = null;
+      });
+    session.linkPending = pending;
+    return pending;
   }
 
   // 每个请求都带 ?account=<id>；不给就是当前选中的那个账号。
@@ -392,7 +441,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const instance = await ensureConnected(session, account);
     const config = loadConfigSafe();
     const survey = await surveyPet(instance, protocol, { config });
-    const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality });
+    const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality, allowFeed: session.loop.petFeed });
     return {
       buildings: survey.buildings.map((building) => ({
         buildingId: building.buildingId,
@@ -412,6 +461,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       })),
       maxQ: survey.maxQ,
       maxQuality: session.loop.petMaxQuality,
+      petFeed: session.loop.petFeed !== false,
       actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
       notes: plan.notes,
       text: formatPetPlan(survey, plan),
@@ -448,6 +498,17 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
     const view = viewTreasure(survey, { config, colors, maxFleets });
     const plan = planTreasure(view, { maxFleets });
+    // 顺手把奖励次数记到 session 上：网页的「已领 x/N」读的就是这一份，
+    // 手动抢完立刻就能看到新数字，不用等下一轮挂机。
+    session.loop.treasureStats = {
+      at: Math.floor(Date.now() / 1000),
+      dailyLimit: view.dailyLimit,
+      todayRewardTimes: view.todayRewardTimes,
+      remainingRewards: view.remainingRewards,
+      dailyFull: view.dailyFull,
+      nextRefreshTime: view.nextRefreshTime,
+      text: rewardCountText(view),
+    };
     return {
       // 活动有效期：页面直接据此显示「还有多久到期 / 已结束」。
       activity: view.activity,
@@ -455,6 +516,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       todayRewardTimes: view.todayRewardTimes,
       remainingRewards: view.remainingRewards,
       dailyFull: view.dailyFull,
+      // 「已领 1/3（还能领 2 次）」这种一句话口径，页面与日志共用。
+      rewardText: rewardCountText(view),
       nextRefreshTime: view.nextRefreshTime,
       petrol: view.petrol,
       petrolCost: view.petrolCost,
@@ -483,25 +546,58 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     };
   }
 
-  async function heroes(session, account) {
+  // 英雄页的一次完整探测：英雄本体（等级/升星/技能）+ 勋章 + 装备，全部是只读请求。
+  // 「养成」按钮、页面表格、执行前的复核都走这里，避免页面和执行各算一套。
+  async function heroes(session, account, options = {}) {
     const instance = await ensureConnected(session, account);
-    const heroList = await instance.request('AllHeroRequest', {}, 'AllHeroResponse', 15000);
-    const itemList = await instance.request('AllItemRequest', {}, 'AllItemResponse', 15000);
-    const counts = new Map();
-    for (const item of itemList.items ?? []) {
-      const id = item.itemId ?? item.id;
-      counts.set(id, (counts.get(id) ?? 0) + Number(item.num ?? item.count ?? 0));
-    }
     const config = loadConfigSafe();
     if (!config) throw new Error('没有配置表，算不出英雄养成计划');
-    const plan = planHeroes({ config, heroes: heroList.heroes ?? [], itemNum: (id) => counts.get(id) ?? 0, playerLevel: describeRole(session.player)?.level ?? 1 });
+    const playerLevel = describeRole(session.player)?.level ?? 1;
+    const survey = await surveyHeroGrowth(instance, protocol, { config, playerLevel });
+    const itemNum = (id) => survey.stock.get(id) ?? 0;
+    // 默认只养「主战英雄」（主线出战阵容里的那五个）；页面勾了「含未上阵」才覆盖全英雄册。
+    const onlyFront = options.includeBench !== true;
+    const plan = planHeroes({ config, heroes: survey.heroes, itemNum, playerLevel, heroIds: options.heroIds ?? null });
+    const growth = planHeroGrowth(survey, { switches: options.switches, heroIds: options.heroIds, onlyFront });
+
+    // 页面表格的行由 heroGrow.mjs 统一拼（同一个函数离线也能渲染，自检和截图核对走的就是它），
+    // 这里只补游戏自己的图标。
+    const heroes = buildHeroRows(survey, plan, growth, { onlyFront })
+      .map((row) => ({ ...row, icon: heroCard(row.heroId), head: heroIcon(row.heroId) }));
+
     return {
-      steps: plan.steps,
-      notes: plan.notes,
-      maxLevel: plan.maxLevel,
-      maxStar: plan.maxStar,
-      text: formatHeroPlan(plan),
-      heroes: (heroList.heroes ?? []).map((hero) => ({ ...hero, icon: heroCard(hero.heroId), head: heroIcon(hero.heroId) })),
+      plan,
+      survey,
+      growth,
+      payload: {
+        steps: plan.steps,
+        notes: plan.notes,
+        maxLevel: plan.maxLevel,
+        maxStar: plan.maxStar,
+        text: formatHeroPlan(plan),
+        // 勋章/装备的计划文本与动作数（动作明细不上页面，页面上按英雄分行看）。
+        growthText: formatHeroGrowth(growth),
+        growthNotes: growth.notes,
+        growthActions: growth.actions.length,
+        switches: GROW_SWITCHES,
+        switchLabels: SWITCH_LABELS,
+        // 主战阵容：页面顶部说明「只养这 N 个」靠这几个字段，勾了「含未上阵」才看全册。
+        formation: {
+          presetId: survey.formation?.presetId ?? 0,
+          heroIds: survey.formation?.heroIds ?? [],
+          frontCount: survey.heroes.filter((hero) => hero.front).length,
+          total: survey.heroes.length,
+          onlyFront,
+        },
+        stock: {
+          精铁: survey.stock.get(EQUIP_IRON) ?? 0,
+          徽章经验: survey.stock.get(BADGE_EXP_ITEM) ?? 0,
+          精炼石: survey.stock.get(EQUIP_REFINE_ITEM) ?? 0,
+          装备升星石: survey.stock.get(EQUIP_STAR_ITEM) ?? 0,
+          GOLD: survey.stock.get('GOLD') ?? 0,
+        },
+        heroes,
+      },
     };
   }
 
@@ -753,7 +849,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       }
       if (route === 'GET /api/heroes') {
         const { account, session } = scoped_(parsed);
-        json(await heroes(session, account));
+        const result = await heroes(session, account, { includeBench: parsed.searchParams.get('bench') === '1' });
+        json(result.payload);
         return;
       }
       if (route === 'GET /api/dailies') {
@@ -853,8 +950,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const { account, session } = scoped_(parsed);
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
+        // 页面上「材料加速」的勾选实时带过来（不传就沿用 session 里的值）。
+        if (payload.petFeed !== undefined) session.loop.petFeed = payload.petFeed !== false;
         const survey = await surveyPet(instance, protocol, { config });
-        const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality });
+        const plan = planPet(survey, { config, maxQuality: session.loop.petMaxQuality, allowFeed: session.loop.petFeed });
         const { results } = await runWorld(instance, protocol, plan, {
           allowMutate: true,
           window: 800,
@@ -965,20 +1064,45 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         if (!payload.buildingId || !payload.productId) throw new Error('要指定 buildingId 与 productId');
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
-        const before = await surveyFactories(instance, protocol, { config });
-        const target = before.factories.find((entry) => entry.buildingId === payload.buildingId);
+        // 需要兑料时会在中间重新探测一次，所以这里用 let。
+        let before = await surveyFactories(instance, protocol, { config });
+        let target = before.factories.find((entry) => entry.buildingId === payload.buildingId);
         if (!target) throw new Error(`${payload.buildingId} 不在这个账号的工厂列表里`);
         const recipe = factoryRecipes(config, target.type).find((entry) => entry.itemId === payload.productId);
         if (!recipe) throw new Error(`${target.buildingId}（${target.type ?? '未知类型'}）没有 ${payload.productId} 这条配方`);
         if (target.level < recipe.unlockLevel) throw new Error(`${target.buildingId} 还是 lv${target.level}，${payload.productId} 要 lv${recipe.unlockLevel} 才解锁`);
         if (target.queue.length >= before.factorySlots) throw new Error(`${target.buildingId} 的制造位满了（${target.queue.length}/${before.factorySlots}）`);
+
+        // 「兑料并制造」：缺料时用白名单自选包（原料 / 工事材料）补齐 —— 一包换一个单位，**会真花包**，
+        // 所以只有页面那个按钮（usePack:true）才走，绝不自动。兑完重新探测一次，材料/库存都以新快照为准。
+        let exchanged = [];
+        if (payload.usePack === true && recipe.costItem.length > 0) {
+          const plan = packCoverPlan(config, { costs: recipe.costItem, stock: before.stock });
+          if (plan.gaps.length > 0 && plan.ok) {
+            exchanged = await exchangePacks(instance, plan.orders, { window: 600 });
+            emit(session, 'info', `兑料 ${target.buildingId} ${recipe.itemId}：${plan.text} → 换出 `
+              + `${plan.orders.map((order) => `${order.itemId}×${order.num}`).join('、')}`);
+            // 服务端把兑换后的库存推过来需要一点时间，等一拍再重读，否则会误判成「还是不够」。
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            before = await surveyFactories(instance, protocol, { config });
+            target = before.factories.find((entry) => entry.buildingId === payload.buildingId) ?? target;
+          }
+        }
+
         if (recipe.costItem.length > 0) {
           const lacking = recipe.costItem
             .map((cost) => ({ id: cost.id, num: cost.num, have: before.stock.get(cost.id) ?? 0 }))
             .filter((cost) => cost.have < cost.num);
           if (lacking.length > 0) {
             // 材料不齐时客户端会弹「用钻石补」，本工具永远不用钻石，直接不发。
-            throw new Error(`材料不够：${lacking.map((cost) => `${cost.id} ${cost.have}/${cost.num}`).join('、')}`);
+            const short = lacking.map((cost) => `${cost.id} ${cost.have}/${cost.num}`).join('、');
+            const plan = packCoverPlan(config, { costs: recipe.costItem, stock: before.stock });
+            const hint = plan.ok
+              ? `；可用 ${plan.text} 换出来（页面点「兑料并制造」才会真的兑）`
+              : plan.unpackable.length > 0
+                ? `；${plan.unpackable.join('、')} 没有能换它的自选包，只能等生产/采集`
+                : `；${plan.needs.map((entry) => entry.pack).join('、')} 也不够（${plan.shortOnPacks.map((gap) => `${gap.pack} ${gap.packHave}/${gap.packs}`).join('、')}）`;
+            throw new Error(`材料不够：${short}${hint}`);
           }
         }
         // 持有量 = 仓库 + 这个工厂待收的 + 队列里还排着的。只算仓库会漏掉待收那部分，
@@ -1018,7 +1142,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         emit(session, 'info', `工厂 ${payload.buildingId} 开始制造 ${payload.productId}（${recipe.produceTime}s${costText ? `，耗 ${costText}` : ''}）`);
         // 服务端入队要一小会儿，等它写进 factoryQ 再读回去，页面才不会显示成「没排上」。
         await new Promise((resolve) => setTimeout(resolve, 900));
-        json({ ok: true, note: `${payload.buildingId} 开始制造 ${payload.productId}`, ...(await factory(session, account)) });
+        json({
+          ok: true,
+          note: `${payload.buildingId} 开始制造 ${payload.productId}`
+            + (exchanged.length ? `（先用 ${exchanged.map((entry) => `${entry.pack}×${entry.num}`).join('、')} 兑料补齐）` : ''),
+          exchanged,
+          ...(await factory(session, account)),
+        });
         return;
       }
       if (route === 'GET /api/worlds') {
@@ -1046,7 +1176,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         needConfirm(payload);
         const { account, session } = scoped_(parsed);
         const instance = await ensureConnected(session, account);
-        const plan = await heroes(session, account);
+        const { plan } = await heroes(session, account);
         const started = Date.now();
         const steps = [];
         const results = await runHeroPlan(instance, protocol, plan, {
@@ -1061,6 +1191,62 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         const after = await instance.request('AllHeroRequest', {}, 'AllHeroResponse', 15000);
         json({ sent: results.length, failed: results.filter((r) => !r.ok).length, ms: Date.now() - started, steps, heroes: after.heroes ?? [] });
+        return;
+      }
+      // 英雄养成：勋章/装备（runWorld 执行）+ 英雄本体（runHeroPlan 执行）。
+      // 顺序刻意是「换 → 强化 → 升星/技能」：先换到更好的底子上再花材料，
+      // 升星又会抬技能上限，和 heroes.mjs 里的判定顺序保持一致。
+      if (route === 'POST /api/heroes/grow') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const heroIds = typeof payload.heroId === 'string' && payload.heroId ? [payload.heroId] : null;
+        const switches = payload.switches && typeof payload.switches === 'object' ? payload.switches : {};
+        const includeBench = payload.includeBench === true;
+        // 计划和页面表格用的是同一个函数：执行前会重新探测一遍，不看页面上的旧快照。
+        const before = await heroes(session, account, { switches, heroIds, includeBench });
+        const instance = await ensureConnected(session, account);
+        const started = Date.now();
+        const steps = [];
+        const record = (label, entry) => {
+          steps.push({ label, ok: entry.ok, skipped: Boolean(entry.skipped), error: entry.error });
+          if (entry.skipped) emit(session, 'warn', `英雄「${label}」跳过：${entry.error}`);
+          else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `英雄 ${label}` : `英雄 ${label} 失败：${entry.error}`);
+        };
+
+        const gear = await runWorld(instance, protocol, { actions: before.growth.actions }, {
+          allowMutate: true,
+          window: 700,
+          timeout: 15000,
+          onStep: (entry) => record(entry.step.label ?? entry.step.kind, entry),
+        });
+        const body = await runHeroPlan(instance, protocol, before.plan, {
+          allowMutate: true,
+          timeout: 8000,
+          onStep: (entry) => {
+            const step = entry.step;
+            const label = step.kind === 'level' ? `${step.heroId} 升到 ${step.to} 级`
+              : step.kind === 'star' ? `${step.heroId} 升到 ${step.to} 星`
+                : `${step.heroId} 技能 ${step.slot + 1} 升到 ${step.to}`;
+            record(label, entry);
+          },
+        });
+
+        const gearResults = gear.results ?? [];
+        const failed = gearResults.filter((one) => !one.ok).length + body.filter((one) => !one.ok).length;
+        emit(session, failed ? 'warn' : 'info',
+          `英雄养成完成：勋章/装备 ${gearResults.length} 条（失败 ${gearResults.filter((one) => !one.ok).length}）· 本体 ${body.length} 条（失败 ${body.filter((one) => !one.ok).length}）`);
+        // 让服务端把状态推完再读，否则刚升的等级/星级可能还读不到。
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        const after = await heroes(session, account, { switches, heroIds, includeBench });
+        json({
+          sent: gearResults.length + body.length,
+          failed,
+          ms: Date.now() - started,
+          steps,
+          notes: [...before.growth.notes, ...before.plan.notes],
+          heroes: after.payload.heroes,
+        });
         return;
       }
       if (route === 'POST /api/dailies/run') {
@@ -1163,10 +1349,17 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         needConfirm(payload);
         const { account, session } = scoped_(parsed);
         const loop = session.loop;
-        if (loop.running) throw new Error('这个账号的循环已经在跑了');
-        const instance = await ensureConnected(session, account);
+        // 已经在跑 = **热更新**：只应用能中途改的参数（间隔 / 开关 / 抢哪些等级 / 材料包…），
+        // 不重启循环、不清历史、不动已完成轮数。以前这里直接抛「已经在跑了」，
+        // 用户改完设置必须手动停一次再开，前面跑的轮次白等 —— 而且没人看得懂为什么改了没反应。
+        const hot = loop.running;
         const config = loadConfigSafe();
-        loop.running = true;
+        // 热更新不用重连：连接由正在跑的循环自己维持（断了它自己会 reconnect）。
+        const instance = hot ? null : await ensureConnected(session, account);
+        if (!hot) {
+          loop.running = true;
+          loop.stopping = false;
+        }
         // 参数一律先过有限数校验：`"abc"` 会让 Number() 得到 NaN，
         // rounds 变 NaN 等于「永久挂机」（NaN 不满足 > 0），
         // everySeconds 变 NaN 则让 setTimeout(NaN) 退化成 1ms 间隔的高频轰炸。
@@ -1175,47 +1368,67 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           return Number.isFinite(n) && n >= 0 ? n : fallback;
         };
         const roundsArg = Number(payload.rounds ?? 1);
-        loop.rounds = Number.isFinite(roundsArg) ? roundsArg : 1;
-        loop.completed = 0;
+        // 这些只有「新开一轮挂机」才重置：热更新时重置等于把历史与进度抹掉。
+        if (!hot) {
+          loop.rounds = Number.isFinite(roundsArg) ? roundsArg : 1;
+          loop.completed = 0;
+          loop.history = [];
+          loop.error = null;
+          loop.stop = { aborted: false };
+          // 新一轮从「没有数据」开始：上一轮留下的奖励次数可能已经是昨天 23:59 的，
+          // 直接显示会让人以为「今天已经领满了」。
+          loop.treasureStats = null;
+        }
         loop.everyMs = secondsArg(payload.everySeconds, 60) * 1000;
         // 0 或负数 = 不节流（旧行为）。负数按 0 处理，免得写成 -1 时被当成「永远不做」。
         loop.pickEveryMs = secondsArg(payload.pickEverySeconds, 0) * 1000;
-        loop.lastPickAt = null;
         // 农田默认开，前端取消勾选才关；间隔同样 0 = 不限制。
         loop.farmEnabled = payload.farm !== false;
         loop.farmEveryMs = secondsArg(payload.farmEverySeconds, 120) * 1000;
-        loop.lastFarmAt = null;
         // 情报默认开；powerRatio 前端可调（默认 1.2，越大越保守）；间隔默认 60 秒。
         loop.radarEnabled = payload.radar !== false;
         loop.radarEveryMs = secondsArg(payload.radarEverySeconds, 60) * 1000;
-        loop.lastRadarAt = null;
         // 锻造默认开，间隔默认 180 秒（一件蓝装约 25 分钟，没必要每轮去问）。
         loop.forgeEnabled = payload.forge !== false;
         loop.forgeEveryMs = secondsArg(payload.forgeEverySeconds, 180) * 1000;
-        loop.lastForgeAt = null;
         // 海兽培育室默认开，间隔默认 300 秒（蓝配方 4 小时、橙 36 小时，看太勤没意义）。
         loop.petEnabled = payload.pet !== false;
         loop.petEveryMs = secondsArg(payload.petEverySeconds, 300) * 1000;
-        loop.lastPetAt = null;
         loop.petMaxQuality = PET_QUALITIES.includes(payload.petMaxQuality) ? payload.petMaxQuality : 'ORANGE';
+        // 材料加速（投喂）默认开：只吃队列位要求的培育材料，不花钻石/加速器/广告。
+        loop.petFeed = payload.petFeed !== false;
         // 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级）默认开，间隔默认 300 秒。
         loop.idleEnabled = payload.idle !== false;
         loop.idleEveryMs = secondsArg(payload.idleEverySeconds, 300) * 1000;
-        loop.lastIdleAt = null;
         // 搁浅的货轮默认开，间隔默认 60 秒（整点刷新，抢的是刷新后那几十秒）。
         // 等级是多选（3=蓝小型 4=紫中型 5=橙万吨），页面上不传才用默认（只抢万吨）；
         // 显式传空数组 = 一个都不抢（页面上三个全取消勾选就是这个意思，不能悄悄回退默认）。
         loop.treasureEnabled = payload.treasure !== false;
         loop.treasureEveryMs = secondsArg(payload.treasureEverySeconds, 60) * 1000;
-        loop.lastTreasureAt = null;
         loop.treasureMaxFleets = Number.isFinite(Number(payload.treasureMaxFleets)) && Number(payload.treasureMaxFleets) > 0
           ? Math.min(10, Math.floor(Number(payload.treasureMaxFleets)))
           : DEFAULT_MAX_FLEETS;
         loop.treasureColors = colorsOf(payload.treasureColors);
         loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
-        loop.history = [];
-        loop.error = null;
-        loop.stop = { aborted: false };
+        // 执行范围也存进 loop：运行中改「拾荒 / 自选包 / 加速器 / 拒单」下一轮就能生效。
+        // 注意 allowPaid 只影响日常里的点金/折扣店，热更新同样安全（每段都重新读）。
+        loop.pickUpFloaters = payload.pickFloaters === true;
+        loop.useSelectPack = payload.selectPack !== false;
+        loop.maxPackPerRound = Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined;
+        loop.allowSpeedUp = payload.speedUp === true;
+        loop.allowReroll = payload.reroll === true;
+        loop.allowPaid = payload.paid === true;
+        // 「上次执行时间」只有新开一轮挂机才清零：热更新时清掉会让每一段立刻重跑一次
+        // （本来还差 4 分钟的锻造/情报会因为改了个间隔就全部重新探测一遍）。
+        if (!hot) {
+          loop.lastPickAt = null;
+          loop.lastFarmAt = null;
+          loop.lastRadarAt = null;
+          loop.lastForgeAt = null;
+          loop.lastPetAt = null;
+          loop.lastIdleAt = null;
+          loop.lastTreasureAt = null;
+        }
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
         const farmText = loop.farmEnabled
           ? (loop.farmEveryMs > 0 ? `农田每 ${Math.round(loop.farmEveryMs / 1000)} 秒看一眼` : '农田每轮都看')
@@ -1227,7 +1440,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           ? (loop.forgeEveryMs > 0 ? `锻造每 ${Math.round(loop.forgeEveryMs / 1000)} 秒看一眼` : '锻造每轮都看')
           : '锻造关';
         const petText = loop.petEnabled
-          ? (loop.petEveryMs > 0 ? `海兽培育每 ${Math.round(loop.petEveryMs / 1000)} 秒看一眼（品质上限 ${loop.petMaxQuality}）` : `海兽培育每轮都看（品质上限 ${loop.petMaxQuality}）`)
+          ? (loop.petEveryMs > 0 ? `海兽培育每 ${Math.round(loop.petEveryMs / 1000)} 秒看一眼（品质上限 ${loop.petMaxQuality}，材料加速${loop.petFeed ? '开' : '关'}）` : `海兽培育每轮都看（品质上限 ${loop.petMaxQuality}，材料加速${loop.petFeed ? '开' : '关'}）`)
           : '海兽培育关';
         const idleText = loop.idleEnabled
           ? (loop.idleEveryMs > 0 ? `挂机领取每 ${Math.round(loop.idleEveryMs / 1000)} 秒看一眼` : '挂机领取每轮都看')
@@ -1237,17 +1450,23 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             ? `货轮每 ${Math.round(loop.treasureEveryMs / 1000)} 秒抢一次（${loop.treasureColors.length > 0 ? `抢 ${colorsText(config, loop.treasureColors)}` : '未勾等级，不会派船'}）`
             : `货轮每轮都抢（${loop.treasureColors.length > 0 ? `抢 ${colorsText(config, loop.treasureColors)}` : '未勾等级，不会派船'}）`)
           : '货轮关';
-        emit(session, 'info', `自动挂机开始：${loop.rounds} 轮，每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${radarText}；${forgeText}；${petText}`);
+        const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
+        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${radarText}；${forgeText}；${petText}`);
+        // 热更新到此为止：正在跑的那个 runLoop 会从 live() 读到新值，下一轮自动生效。
+        if (hot) {
+          json({ ok: true, running: true, hot: true, note: '设置已应用，下一轮生效' });
+          return;
+        }
         runLoop(instance, protocol, {
           config,
           player: session.player,
           rounds: loop.rounds,
           everyMs: loop.everyMs,
           allowMutate: true,
-          allowPaid: payload.paid === true,
-          allowSpeedUp: payload.speedUp === true,
-          allowReroll: payload.reroll === true,
-          pickUpFloaters: payload.pickFloaters === true,
+          allowPaid: loop.allowPaid,
+          allowSpeedUp: loop.allowSpeedUp,
+          allowReroll: loop.allowReroll,
+          pickUpFloaters: loop.pickUpFloaters,
           pickEveryMs: loop.pickEveryMs,
           farmEnabled: loop.farmEnabled,
           farmEveryMs: loop.farmEveryMs,
@@ -1258,6 +1477,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           petEnabled: loop.petEnabled,
           petEveryMs: loop.petEveryMs,
           petMaxQuality: loop.petMaxQuality,
+          petFeed: loop.petFeed,
           idleEnabled: loop.idleEnabled,
           idleEveryMs: loop.idleEveryMs,
           treasureEnabled: loop.treasureEnabled,
@@ -1265,6 +1485,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           treasureMaxFleets: loop.treasureMaxFleets,
           treasureColors: loop.treasureColors,
           minPowerRatio: loop.minPowerRatio,
+          useSelectPack: loop.useSelectPack,
+          maxPackPerRound: loop.maxPackPerRound,
+          // 运行中改设置不用停掉重开：runLoop 每轮开头都会调它重读一遍。
+          live: () => loop,
+          // 断线自愈：网关用 code=1000 关掉连接后，server 这边要新建一个 GameClient
+          // （旧实例已经 stop，继续用只会一直 not connected）。不给这个钩子，
+          // loop 里一次「拿不到 OnWaterResponse」就会把整条挂机判死 —— 2026-10-26 11:46 就是这样停的。
+          // 注意 ensureConnected 在冷却期内会抛，loop 会把它记成「重连失败：…」并整轮跳过。
+          reconnect: async () => {
+            await ensureConnected(session, account);
+            return session.client;
+          },
           stop: loop.stop,
           onRound: (summary) => {
             loop.completed = summary.round;
@@ -1275,6 +1507,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastPetAt = summary.gates?.pet?.lastAt ?? loop.lastPetAt;
             loop.lastIdleAt = summary.gates?.idle?.lastAt ?? loop.lastIdleAt;
             loop.lastTreasureAt = summary.gates?.treasure?.lastAt ?? loop.lastTreasureAt;
+            // 奖励次数只有真的探测过才有新值（静默窗里是上一轮的旧值，保留着给页面显示）。
+            loop.treasureStats = summary.gates?.treasure?.stats ?? loop.treasureStats;
             loop.history.push(summary);
             if (loop.history.length > 50) loop.history.shift();
             emit(session, 'info', formatLoopRound(summary));
@@ -1292,6 +1526,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           })
           .finally(() => {
             loop.running = false;
+            loop.stopping = false;
           });
         json({ ok: true, running: true });
         return;
@@ -1300,8 +1535,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const payload = jsonBody();
         needConfirm(payload);
         const { session } = scoped_(parsed);
+        // stopping 只是给页面看的：循环在一段之内是原子的（一段做完才检查停止），
+        // 所以要有个「正在停」的状态，否则点完按钮页面还显示「挂机中」，用户以为没停。
+        if (session.loop.running) session.loop.stopping = true;
         session.loop.stop.aborted = true;
-        json({ ok: true, running: session.loop.running });
+        json({ ok: true, running: session.loop.running, stopping: session.loop.stopping });
         return;
       }
 
@@ -1328,9 +1566,14 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const loop = session.loop;
     return {
       running: loop.running,
+      // 已点停止、正在收尾（当前这一段跑完就退出）。
+      stopping: Boolean(loop.stopping && loop.running),
       rounds: loop.rounds,
       completed: loop.completed,
       everyMs: loop.everyMs,
+      // 拾荒的「开关 + 间隔」都回给页面：运行中改了勾选，状态行要按服务端真实生效的值算，
+      // 否则页面显示「还差 20 秒」而服务端其实已经关掉了这一段。
+      pickEnabled: loop.pickUpFloaters === true,
       pickEveryMs: loop.pickEveryMs,
       lastPickAt: loop.lastPickAt,
       farmEnabled: loop.farmEnabled,
@@ -1346,6 +1589,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       petEveryMs: loop.petEveryMs,
       lastPetAt: loop.lastPetAt,
       petMaxQuality: loop.petMaxQuality,
+      petFeed: loop.petFeed !== false,
       idleEnabled: loop.idleEnabled,
       idleEveryMs: loop.idleEveryMs,
       lastIdleAt: loop.lastIdleAt,
@@ -1354,8 +1598,27 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       lastTreasureAt: loop.lastTreasureAt,
       treasureMaxFleets: loop.treasureMaxFleets,
       treasureColors: loop.treasureColors,
+      // 每日宝藏奖励次数：{ at, dailyLimit, todayRewardTimes, remainingRewards, dailyFull,
+      // nextRefreshTime, text }，null = 还没探测过。
+      treasureStats: loop.treasureStats,
       minPowerRatio: loop.minPowerRatio,
-      history: loop.history.map((summary) => ({ ...summary, text: formatLoopRound(summary) })),
+      // 执行范围也回给页面：运行中回填勾选，避免「页面勾着、服务端其实关着」。
+      useSelectPack: loop.useSelectPack !== false,
+      maxPackPerRound: loop.maxPackPerRound ?? null,
+      allowSpeedUp: loop.allowSpeedUp === true,
+      allowReroll: loop.allowReroll === true,
+      allowPaid: loop.allowPaid === true,
+      // 历史只回「页面真正用得到」的字段：results 里每条动作带着 step.body/label/error，
+      // 50 轮 × 二十几条动作的 body 每 3 秒传一遍纯属浪费（页面只显示 text、读耗时与货轮门控）。
+      history: loop.history.map((summary) => ({
+        round: summary.round,
+        startedAt: summary.startedAt,
+        elapsedMs: summary.elapsedMs,
+        stopped: summary.stopped === true,
+        link: summary.link,
+        gates: summary.gates,
+        text: formatLoopRound(summary),
+      })),
       error: loop.error,
     };
   }

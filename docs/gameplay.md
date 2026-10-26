@@ -440,6 +440,65 @@ node tools/selftest-describe.mjs    # 字段布局还原自检
 其余 7 项阻塞原因：1008 地图上没货轮/世界货物、1009 试炼副本需要玩家等级 14（当前 11）、
 1010 地图上没有海盗、1011-1017 需要联盟身份 / 限时时段 / 功能未开放。
 
+### 11.5 勋章与装备：主战英雄的第二层养成
+
+`src/heroGrow.mjs`（2026-10-26 加）。`heroes.mjs` 只管英雄本体的等级/升星/技能，这一层管
+**勋章（强化、替换）** 与 **装备（升级、精炼、升星、替换）**，网页「英雄」页的表格就是它的输出。
+
+数据在同一个回包里：
+
+- `GetFormationResponse.formation`：`{ heroPositions:[{heroId, pos{x,y}}], presetId, petUid }`，
+  `GetFormationRequest{module}` 的 `FormationModule` **只有 MAINLINE=1** 一个值 ——
+  也就是「主线出战阵容」，页面上说的**主战英雄**就是这 5 个位置上的英雄。
+  拉不到阵型时不报错，退化成「全部英雄」（否则整页一条动作都排不出来）。
+- `AllHeroResponse.heroes[].badges[]`：`{pos 1..4, uid, badgeId, level, star, attr{attr,value,rating}}`
+- `AllHeroResponse.heroes[].equips[]`：`{uid, equipId, level, star, refineLv, attr, rerollAttrs}`
+- `BadgesResponse.badge[]` / `EquipsResponse.equip[]`：背包。**勋章背包里包含已佩戴的那些**
+  （同一个 uid 池，34 条里 19 条在身上），装备背包则只放没穿的 —— 所以判断「闲置」必须按 uid 差集，不能按列表长度。
+
+**徽章等级上限只由「徽章 id + 星级」决定**：`HeroBadgeAttrCfg[id_star].maxLevel`
+（蓝坦克 1 星 40 级、5 星 60 级）。每级消耗 `HeroBadgeLevelCfg[level]`：`exp` 点经验 +
+`exp × goldExpRadio` 金币 —— 两个系数**逐级不同**（1 级 0，2 级 20，3 级 23…），
+所以「还剩多少金币能升几级」只能逐级推进，不能用某一级的单价乘总数。
+
+`EnhanceBadgeRequest{uid, decomposeUid[], expItemNum}`：
+
+- `expItemNum` 是**实际投入的经验点数**（不是道具件数），客户端弹窗里由
+  `calBadgeEnhanceExpAndGoldInLimit(badge, "徽章经验"持有量, GOLD)` 算出来；
+- `decomposeUid` 是「额外分解掉换经验」的闲置徽章。**本模块恒发空数组**：
+  分解不可逆，且没有收益判断依据（随机属性类型不同不可比），只花背包里的「徽章经验」道具。
+- 徽章**升星**（`BadgeStarRequest{uid, decomposeUid[], starItemNum}`）要分解
+  `HeroBadgeStarCfg[star].upBadgeNum` 个徽章（高等级徽章按 `equalBadgeNum` 折算），
+  同样是不可逆操作 —— 只探测、不自动执行。
+
+**替换方向**（实证 `BadgeReplaceRequest` / `EquipReplaceRequest` 的调用点）：
+`downUid` = 要穿上的那件（背包里更好的），`upUid` = 身上被换下的那件。
+空位则是 `PutOnBadgeRequest{uid, heroId, pos}` / `PutOnEquipRequest{uid, heroId}`（都没有 Response）。
+
+装备有三条独立请求，**别把升级写成 EquipLevelUp，那张表里没有这个名字**：
+
+| 操作 | 请求 | 消耗 | 上限 |
+| --- | --- | --- | --- |
+| 升级 level | `EnhanceEquipRequest{uid}` | `EquipUpDecomposeCfg[level+1].upgradeCost` 精铁 | `EquipAttrCfg[id_star].maxLv` |
+| 精炼 refineLv | `EquipRefineRequest{uid}` | `EquipRefineCfg[refineLv+1]`：精铁×costItem1 + 精炼石×costItem2 | `EquipAttrCfg[id_star].maxRefineLv`（多数 0，橙红装 10~60） |
+| 升星 star | `EquipStarUpRequest{uid}` | `EquipUpStarCfg[star+1].upCosts`（装备升星石 + 精铁） | 5 星 |
+
+三者都**没有 Response**（成功静默、被拒推 PromptResponse），所以走 `sendWatch`（见 11.3）。
+
+计划器的两条硬规则：
+
+1. **预算表全局共享**：精铁 / 徽章经验 / 精炼石 / 装备升星石 / GOLD 在英雄之间按战力从高到低分，
+   一件装备升 6 级就拆成 6 条请求、每条各扣一次 —— 不共享的话每个英雄都会按「满库存」算一遍，
+   实际发出去的第 2 个英雄开始就是必被拒的请求。
+2. **替换先于强化**：先把更好的件换上，再花材料，同样的经验/精铁落在更好的底子上。
+   替换的取舍只做三级比较（品质 → 星级 → 等级），且新件等级低于旧件 60% 时挡在候选池外
+   （属性 = baseAttrs + growAttrs × level，紫装 lv1 换下蓝装 lv45 是掉战力）。
+
+接口：`GET /api/heroes` 返回每个英雄的 `kpi`（本体）与 `badgeItems` / `equipItems`（这一层），
+**默认只列主战阵容里的英雄**（`?bench=1` 才带未上阵的，页面上的复选框就是它）；
+`POST /api/heroes/grow {confirm, heroId?, switches?, includeBench?}` 先重新探测再执行；
+`switches` 对应页面上的复选框（勋章强化 / 勋章替换 / 装备升级 / 装备精炼 / 装备升星 / 装备替换）。
+
 ## 12. 任务领取与海面自动化
 
 新增三个模块：`src/tasks.mjs`（任务领取闭环）、`src/world.mjs`（海面探测 / 计划 / 执行 / 资源田）、
@@ -543,6 +602,25 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
   实测拿一个做到一半的 13500 秒配方反推，得到 12500 秒，直接把 780 秒的木板也误判成瞬成。
   观测只能用来抓「队首还剩 0~2 秒」的瞬成证据（`observedInstantRecipes`），不能出数值。
 
+**缺料时用自选包兜底（2026-10-26 加）**：以前 `cover()` 只接在建造 / 交单 / 升级三处，
+排产缺料就整座空转 —— 实测 `1切鱼厂` 的鱼油要 `鱼×50 + 玻璃×30`，仓库只有 `鱼 7`，
+而原料自选包有 25 万个，却一个都不兑。现在排产也接了兜底，规则刻意保守：
+
+- **能免费排的先排**：先按 `score` 找「料够」的配方，有就照平时排，不为高档配方烧包。
+  实测同一座切鱼厂：`鱼 7` 够 `生鱼片`（鱼×6）时，挂机排生鱼片，不会去兑 43 个鱼做鱼油。
+- 一条都排不上时，才按 `score` 顺序找**第一条缺口全部有包可换**的配方给它兑料。
+  只要有一个材料换不出来（比如布匹只存在稀有的蓝装材料包里）→ 整条配方跳过，连别的料也不兑，
+  否则会白兑一堆料去排一条注定排不上的配方。
+- **分轮累积**：缺口大于 `maxPackPerRound`（默认 20）时，本轮只兑到额度上限、**照常落账**，下一轮接着补。
+  不落账的话「缺口 43 / 额度 20」会永远停在兑不出，鱼油这类配方再也排不上。
+  实测：`鱼 7 → 兑 20（不排）→ 兑 20（不排）→ 剩 3 个缺口时兑 3 并开排`。
+- 兑换动作（`selectPack`）排在排产动作之前（`actions` 数组顺序即执行顺序），标 `transient`
+  —— 兑换被拒多半是「包数记错了 / 这个材料突然不能换」，不该被 `rejected` 记一辈子。
+
+工厂页手动排产走另一条路：缺料且能用这两类包补齐时，按钮变成**「兑料并制造」**，
+写明要花几个包（`原料自选包×43`），点它才真的兑 —— 一次补齐全部缺口、不受每轮 20 的限制
+（这是单次显式授权）。不点的话一个包都不动，直接点「制造」只会被告知缺口、不发请求。
+
 实测（制造位是**串行**的，2026-10-23 做工厂页时确认）：`factoryQ` 里**只有队首带 `finishTime`**，
 后面的排队项 `finishTime` 是 `0` —— 实测 `1食品厂` 排了 6 个「刺身拼盘」，只有第 1 项有完成时间，
 `1服装厂` 的 5 项里同样只有队首有。所以：
@@ -610,6 +688,31 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
 `DenyOrder`（拒单消耗订单名额）与加速各有独立开关（`--reroll` / `--speed-up`），默认关闭；
 加速只花「加速器」道具，**不花钻石**；`--rounds 0` 表示一直跑到 Ctrl-C / 网页停止按钮。
 
+#### 12.5.1 循环的节奏：对齐、容差、热更新、段级停止（2026-10-26 修）
+
+这四个都是「跑起来才发现不对」的问题，改之前用户看到的现象写在括号里：
+
+- **间隔按「轮首 → 下一轮轮首」对齐**（现象：设 60 秒，日志时间戳却每次往后漂十几秒）。
+  原来是轮尾 `sleep(间隔)`，而一轮要跑 8 段、耗时几秒到几十秒，于是周期 = 间隔 + 耗时。
+  现在轮尾等的是 `间隔 - 本轮已耗时`，最后一轮不等待（否则 `--rounds 1` 会白等一个间隔才退出）。
+- **主循环间隔下限 5 秒**（现象：把间隔填 0「想让它快点」，结果一小时几千次探测）。
+  其它 gate 的 `everyMs = 0` 意思是「每轮最多做一次」，主循环填 0 却是「上一轮结束立刻开下一轮」，
+  两者语义不同，所以 `loopGap()` 里钳到 `MIN_LOOP_GAP_MS`。
+- **gate 判定留容差**（现象：「货轮/情报也是 60 秒，怎么老是两轮才跑一次」）。
+  `tickAt` 是轮首，`lastAt` 是轮内某段真正执行的时刻，两者天然差几秒；间隔正好等于轮间隔时，
+  每轮都会「差一点点」。容差取间隔的 10%、最多 2 秒（`gateSlack`）。
+- **网页热更新**（现象：改完间隔要点停止再开始，前面跑的轮次白等；更糟的是 3 秒轮询会把刚改的
+  输入框写回旧值，让人以为改不动）。服务端把参数都存在 `session.loop` 上，`runLoop` 收一个
+  `live: () => loop`，**每轮开头重读一次**（间隔、各段开关、抢哪些等级、材料加速、执行范围都算）；
+  `/api/loop/start` 在运行中不再报错，而是把这批参数应用上去并返回 `{hot:true}`。
+  页面侧配合两件事：运行中按钮变「应用设置」；用户改过的控件打「脏」标记，轮询不再回填它。
+- **段级停止**（现象：点「停止」像没反应，因为要等整轮几十个请求跑完）。每段开头检查
+  `stop.aborted`，命中就收尾退出（`summary.stopped = true`，日志写「已按要求停止」）；
+  页面另有 `stopping` 状态显示「正在停止（这一段跑完就退）」。
+
+配套：`summary.elapsedMs` 记每轮耗时（页面显示「上一轮耗时 12 秒」），`finish()` 统一收尾，
+保证断线跳过 / 被停止 / 海面失败 / 正常结束四条路的 summary 字段都齐（缺段会让格式化撞 null）。
+
 ### 12.6 本轮实测结果
 
 - `tasks`：主线 62 领取成功，下一轮立刻出现主线 63，说明成长任务是链式的（领完当前才解锁下一条）。
@@ -622,8 +725,9 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
   训练营 lv2 需要 28 —— 全部被 `BuildingUpgradeCfg` 的等级/人口门槛挡住，计划器已按门槛判定。
 - 网页控制台「自动循环」页签背后的接口全部用 curl 验证过一遍：
   `GET /api/tasks`、`GET /api/world`、`POST /api/tasks/run`、`POST /api/world/run`、
-  `POST /api/loop/start`（重复开启报「循环已经在跑」，缺 `confirm` 报「需要确认才会开自动循环」）、
-  `GET /api/loop`、`POST /api/loop/stop`（停止后 `running` 翻回 false）。
+  `POST /api/loop/start`（缺 `confirm` 报「需要确认才会开自动循环」；运行中重复调用 = 热更新设置，
+  返回 `{hot:true}` 而不是报错，见 12.5.1）、
+  `GET /api/loop`、`POST /api/loop/stop`（停止后 `running` 翻回 false，收尾期间 `stopping:true`）。
 
 ### 12.7 活跃度宝箱、每日赠礼与自动建造
 
@@ -652,6 +756,39 @@ finalSeconds = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
 - 领取用 `GotFreeDailyPackRequest{packId:"赠礼"}`，**协议表里没有配套 Response**，
   所以发完必须重新拉一次 `DailyGiftPackResponse` 确认 `drawnPack` 真的多了它 ——
   「没被 prompt 打回」不等于成功。
+
+**礼包码兑换**（公告/补偿码，如 `VIP666`/`VIP777`/`VIP888`）走设置里的 `GiftCodePop`：
+
+- 请求体只有一个字段：`GotGiftCodeRequest{giftCode:"VIP666"}`（客户端把输入框原文直接发，
+  不做大小写归一）。协议表里**没有 `GotGiftCodeResponse`**，但服务端**不是完全静默**：
+  兑换成功会推 `SCUpdateItem`/`SCUpdateResource` + 一条 `GotRewardResponse`（奖励明细），
+  码无效/已使用时只推 `PromptResponse`。所以失败判据照旧用 `sendWatch` 守窗口，
+  而"真的到账了没有"要看紧接着的 `GotRewardResponse`（`data/responses/<日期>/GotRewardResponse.jsonl`）。
+- CLI：`node src/app.mjs act giftCode giftCode=VIP666 --yes`。
+- 批量兑：`node tools/gift-codes.mjs --file codes.txt --yes`（一条连接顺序发，逐条按回包判结果，
+  结果写 `outputs/gift-codes-<日期>.md`）。服务端拒绝时的 `PromptResponse.args` 是**空的**，
+  只有 `prompt` 枚举值，含义在客户端 `Prompt` 枚举里：63=码已过期、64=码无效、65=已兑换、
+  66=该批次用完、67=已被他人使用、70=操作过频。工具会把数字翻成人话。
+- 2026-10-26 实测（`灭世丶天空6778`）：VIP666 = RUBY100+抽卡券2+加速器100，
+  VIP777 = RUBY100+藏品券2+加速器100，VIP888 = RUBY100+GOLD10000+保险箱钥匙3，三码全部到账。
+  随后把网上汇总的 299 个码跑了一遍（分四批：通用清单 / 9game 大清单 / TapTap 周礼包 / 10.26 微信批次），
+  **89 个到账**，明细在 `outputs/gift-codes-2026-10-26.md`（第三方汇总表里大量码已过期或根本不存在，
+  `prompt=63/64` 占七成，属正常）。经验：**中文口令码**（水世界上线礼 / 水世界琥珀玩家礼 / 益世界关注礼 /
+  小春666-999）和 **`yxz` 前缀码**命中率最高；TapTap 上那些「周礼包码」列表基本全是过期的。
+- **`prompt=63` 和 `prompt=64` 是两种完全不同的东西**（2026-10-26 第二轮 139 个码实测确认，判据记牢）：
+  - `63` = 服务端**有这个码**、但已过兑换期 → 真码，只是来晚了；
+  - `64` = 服务端**根本没有这个码** → 采集站编造、OCR 抄错，或者干脆是别家游戏的码。
+  实测样本：7724 的「抖音小程序官方发布篇 + 明星人名系列」（`WARM888` `WJDR2026F` `朱芳雨666`
+  `吴镇宇888` `呆妹888` …）81 个**全是 64**，因为它搬的是另一款末日 SLG 的码（奖励写「寒晶 /
+  陷阱零件 / 兵营加速卡 / 防寒药剂」，本游戏没有这些道具）；而今日头条历史 CDK 归档里
+  `YXZ*` `MRY*` `dw*` `Mozz*` `zb*` 前缀 39 个是 63 —— 证明这些前缀**确实是真实码池**，只是公开样本全过期了。
+  所以「大批量跑码」时看 63 的比例就能判断这批来源是不是本游戏的：清一色 64 直接换源。
+- **公开渠道已兑干（2026-10-26）**：累计试 438 个码、89 个到账。再想拿新码只有官方公众号周推文
+  （后台回「礼包」）、游戏内公告/补偿邮件两条路，都是限时限量，看到就得兑 —— 有效码的生命周期实测
+  只有几天（10.20–10.25 发的 `SSJGTG83`/`WYHML9O6`/`yxzRNS3T32`/`SJ3SS7` 当天有效，一周后同批全 63）。
+- 游戏内邮件**不带码**：23 封邮件的 `subject` + `content` 全文正则扫过，零命中。别再重复这个思路。
+  邮件结构：`EmailBoxRequest{pageNo}` → `EmailBoxResponse{email[], total}`，单封是 `EmailDetail`
+  （`subject` / `content` / `sender` / `attachment` / `got` / `status`）。
 
 **建造与升级是两个请求。** 客户端 `_toBuildOrUpgradeRequest` 的分支是
 `0 == t.level ? BuildBuildingRequest : UpgradeBuildingRequest`，判据是
@@ -961,7 +1098,45 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 2026-10-26 起状态文案补了三种：`可抢（无人占领）` / `可抢（要先打赢联盟 N 的 M 支守军）` /
 `等级没勾（只抢 …）` / `我方已占满 10 支`，每轮概览多一段 `抢 万吨货轮` 便于核对当前配置。
 
-### 12.12 海兽培育室：收成熟的 + 队列空位排产
+#### 12.11.2 每日奖励次数：页面显示 + 「今日没机会」就不再发请求
+
+需求原话：「① 增加每日宝藏奖励次数/已获取次数显示；② 如果今日没机会了，就不用请求了，避免无效请求」。
+
+**数字从哪来**：`TreasureLootStatsResponse{ todayRewardTimes, totalRewardTimes }`（`totalRewardTimes`
+是**每日上限**而不是累计，实测 3，与 `TreasureLootParamCfg`「每日宝藏奖励次数」一致）。
+一整套探测要打 4 个只读请求（Stats + List + MyFleets + 赛季），只为了看个数字去轮询完全不划算，
+所以：
+
+- 挂机每探测一次就把结果写进 `gates.treasure.stats`，服务端再存到 `session.loop.treasureStats`，
+  `/api/loop` 原样带出来 —— 页面的「已领 x/N」读的就是这份缓存，**3 秒轮询零新增请求**；
+- 手动「立刻抢一次」（`POST /api/treasure/run`）内部会调 `treasure()`，顺手更新同一份缓存；
+- 页面刚打开、挂机没跑过时缓存是 `null`，此时补**一次** `GET /api/treasure`（失败则每分钟最多重试一次），
+  拿到数就停，之后全走缓存。
+- 文案统一由 `rewardCountText()` 生成（`已领 1/3（还能领 2 次）` / `已领 3/3（已满，明天 0 点重置）` /
+  `已领 ?/3（拿不到次数，保守不派）`），页面、CLI、日志同一个说法，避免三处各写一套。
+
+**静默窗（`skipUntilOf()`）** 只认三种「确定要到某个时刻才会变」的状态：
+
+| 状态 | 静默到 | 理由 |
+|---|---|---|
+| 活动已结束（赛季封盘） | 永远（`forever`） | 本季再也没有货轮 |
+| 今日奖励已满 `todayRewardTimes >= 上限` | 次日 `00:00:05` | 期间派船必然白烧 500 汽油/支，探测也不会有动作；留 5 秒避开服务端重置的秒级抖动 |
+| 勾选等级里一个可抢的都没有 | `nextRefreshTime`（封顶 12 小时） | 进度只会涨、等级不会变、「我方占满 10 支」也要等结算 —— 这段时间结果稳定 |
+
+反例（**故意不静默**）：没空闲舰队、船还在航行/修理、汽油不够、拿不到 `Stats`。
+这些都是几分钟内自己会变的，静默掉就会漏掉刷新窗口（整点刷新错过就是当天空手）。
+
+两个实现细节：
+
+- 静默期间**一个请求都不发**（`treasureDue` 直接为 false），日志只每 30 分钟提一句
+  `货轮 暂停探测：今日奖励已满 3/3，9 小时 58 分后再试` —— 否则一夜 600 轮会把日志刷满。
+  页面上这一行同时显示在「每日宝藏奖励 · 已领 3/3（已满，明天 0 点重置）· 暂停探测，… 后再试」里。
+- 「间隔未到」和「暂停探测」是两种原因，`gates.treasure` 用 `throttled` / `skipped` 分开表示，
+  混在一起会看不出为什么一直没请求。
+- 静默窗封顶 12 小时：`nextRefreshTime` 是服务端给的，22:00 收摊到次日 8:00 正好 10 小时落在上限内；
+  万一服务端给了离谱值，也不会把整段挂机静默死。
+
+### 12.12 海兽培育室：收成熟的 + 材料加速 + 队列空位排产
 
 2026-10-26 补的第 8 个自动模块（`src/pet.mjs`，循环里的 `petEnabled` / `petEveryMs`）。
 游戏里 UI 叫「海兽培育室」，**配置表里的 `buildingType` 是「宠物培育室」** —— 按 UI 名去找建筑会一个都匹配不上。
@@ -979,7 +1154,7 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 |---|---|---|---|
 | 培育一只 | `PetBreedRequest { petId, universal }` | **无**，结果靠 `SCUpdateWaterBuilding` 推送 | `_onBtnBreed`：该队列位为空 + 基因够（`_isLackFrag`）+ 金币够（`isAssetsEnough([cost[1]], true)`） |
 | 收成熟 | `GetMaturePetRequest {}` | **无** | `_onBtnReward`：`maturePets.length != 0` 才发，一次全领 |
-| 喂食加速 | `PetFeedRequest { jobIdx }` | **无** | `_onBtnFood`：`feedRequirements` 够就喂 —— **本项目不做**，见下 |
+| 喂食加速（材料加速） | `PetFeedRequest { jobIdx }` | **无**，结果靠 `SCUpdateWaterBuilding` 推送 | `_onBtnFood`：该队列位 `feedRequirements` 够（`isAssetsEnough(_, false)`）才喂；不够会弹「购买补齐」 |
 | 升级培育室 | （走建筑升级那套） | | `_onBtnLevelUp` → `toUpgradeBuilding` —— 不做，跟其它建筑一样需要用户自己决定 |
 
 `universal` 是客户端的 `_isAutoExchange`（缺口用「万能基因」补），跟 `MakeEquipRequest.universal` 同一个意思，
@@ -1000,20 +1175,34 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 **排产策略**（`planPet`）：
 
 1. 有 `maturePets` 先领 —— 整轮只放**一条** `GetMaturePetRequest`（它是空体、一次领全部，不分建筑）；
-2. 每座培育室按 `maxQLength - breedQ.length` 算空位，空几个排几个；
-3. 空位里挑配方：品质从高到低（受 `maxQuality` 上限约束，**默认橙**），同品质按 `spId` 升序；
-4. 选中的配方**就地扣减**共享余额表，跨培育室不会把同一批基因算两遍；同一批里同一个 `petId` 只排一次。
+2. 材料加速（勾选默认开）：逐个队列位判断 `feedRequirements` 够不够，够就排一条 `PetFeedRequest`；
+3. 每座培育室按 `maxQLength - breedQ.length` 算空位，空几个排几个；
+4. 空位里挑配方：品质从高到低（受 `maxQuality` 上限约束，**默认橙**），同品质按 `spId` 升序；
+5. 选中的配方**就地扣减**共享余额表，跨培育室不会把同一批基因算两遍；同一批里同一个 `petId` 只排一次。
 
 `items` 用「品质+物种名」（如「橙声波海豚」）而不是 `petId`，日志里能直接读。
 动作 `key` 带序号（`petBreed:<建筑>:<petId>:<序号>`）—— 一次排满多个空位时，如果不带序号，
 后面几条会被第一条的失败记录整片挡住。
 
-**两条安全边界**：
+**材料加速（投喂，2026-10-26 按用户要求加上，页面「材料加速」勾选默认开）**：
 
-- **不做 `PetFeedRequest`**：它按 `jobIdx` 消耗该队列位的 `feedRequirements` 换时间，材料是什么、
-  值不值，得看真实队列才能判断。在确认它不碰通用材料之前，自动喂食就是拿账号库存去赌。
-  真要做的话，判据照抄 `_onBtnFood` 的 `isAssetsEnough(feedRequirements, false)`。
-- **不加速、不动钻石**：没有对应的免费加速请求。
+界面上它是培育室里的「投喂」按钮，本质就是买时间：
+
+- 请求 `PetFeedRequest{ jobIdx }`，`jobIdx` = `breedQ[].idx`（不是数组下标，是服务端给的队列位编号）。
+- 消耗该队列位 `feedRequirements` 里的材料。抓包实测（`OnWaterResponse` 里蓝宠物3 的那个队列位）：
+  `鱼肠线×12 + 粗铁×4 + 烤鱼×40`。**不是钻石、不是加速器、不是广告**，是培育材料本身。
+- 减多少：`PetUtil.breedSpeedSeconds()` → `PetParamCfg`「投喂减少培育时间」= **14400 秒（4 小时）**/次。
+  所以蓝配方（4 小时）喂一次就完事，紫（12h）要 3 次，橙（36h）要 9 次。
+- 判据照抄 `_onBtnFood`：`isAssetsEnough(feedRequirements, false)` 才发；不够时客户端会弹「购买补齐」，
+  我们**不买**（买东西属于付费决策，交给人），只写一句 `材料不够加速：缺 烤鱼×30`。
+- **一轮每个队列位只喂一次**：喂完服务端会刷新 `finishTime`，下一轮按新状态重算；
+  协议里既没有冷却字段也没有 Response，连点等于赌服务端的频率限制。
+- `step.key` 必须带 `finishTime`（`petFeed:<建筑>:<idx>:<finishTime>`）：喂一次这个值就变，
+  固定 key 的话第一次失败会被 `rejected` 永久跳过，之后再也不加速。
+- 剩不到 `FEED_MIN_REMAIN_SECONDS`（5 分钟）不喂：材料是真花掉的，省最后几分钟不值；
+  已经到点（`done`）的更不喂 —— 那是「收」的阶段。
+
+**另一条安全边界**：`universal` 恒 false、不动钻石、不用加速器、不看广告。
 
 挂机里是第 8 阶段（在锻造之后，复用 `worldSurvey.buildings` / `worldSurvey.stock`，**零额外请求**），
 `petEveryMs` 默认 **300 秒**（蓝配方 4 小时、橙 36 小时，看太勤没意义）。计时语义同情报：

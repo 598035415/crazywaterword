@@ -330,9 +330,19 @@ export const DAILY_DRIVERS = {
     probes: [['AllPirateRequest', {}]],
     evaluate({ task, probe }) {
       if (task.progress >= task.targetProgress) return { status: 'done' };
-      const pirates = probe('AllPirateRequest')?.pirates ?? [];
+      const all = probe('AllPirateRequest');
+      const pirates = all?.pirates ?? [];
       if (!pirates.length) return { status: 'blocked', reason: '世界地图上没有海盗部队可扫荡' };
-      const remaining = task.targetProgress - task.progress;
+      // sweepTimes 跟 pirates 一起下发，是**免战扫荡**的剩余次数。为 0 时发 PirateSweepRequest
+      // 一律被服务端回 PromptResponse「cannot sweep」——这里以前只判断「有没有海盗」，
+      // 于是进度卡在 1/5 的账号每轮都白试一次，日志每 60 秒一行红字。
+      // 次数用完要接着做只能真出战（PirateFightRequest，得算战力和战损），没做自动化，所以直接报 blocked。
+      const sweepTimes = Math.max(0, Math.floor(Number(all?.sweepTimes) || 0));
+      if (sweepTimes === 0) {
+        const left = task.targetProgress - task.progress;
+        return { status: 'blocked', reason: `扫荡次数已用完（0 次），还差 ${left} 次击败野怪，只能手动出战` };
+      }
+      const remaining = Math.min(task.targetProgress - task.progress, sweepTimes);
       const actions = pirates.slice(0, remaining).map((pirate) => ({
         request: 'PirateSweepRequest',
         body: { uid: pirate.uid, cityId: pirate.cityId },
