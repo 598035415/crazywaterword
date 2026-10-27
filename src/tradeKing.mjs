@@ -61,6 +61,8 @@ import { assetCount } from './world.mjs';
 
 // 紧缺货物的价格系数（实盘 1.12~1.13）。保守取 1.10，避免高估利润把资金压死在一次交易上。
 export const DEFAULT_SELL_RATIO = 1.10;
+// 特产价 ≈ 基准 × 0.85~0.88（实盘 0.851 / 0.86 / 0.88）。只用于「没到过那个港口」时的估值。
+export const DEFAULT_BUY_RATIO = 0.88;
 // 目的地未知的货不买 —— 运到一个不挂这件货的港口连卖都卖不掉（TradeSellRequest 会直接被拒）。
 export const TRADE_PASS_TYPE = 3;
 export const SPEED_ITEM = '海商王加速';
@@ -178,15 +180,22 @@ export function buildCityIndex(radar) {
       specGoodsId: spec,
       rareGoodsId: rare,
       reporter: row?.reportName ?? '',
+      // rare === 0 = **今天还没人共享过这个港口**（每天 10 点紧缺货重置，雷达里就清空）。
+      // 这不是「没有紧缺货」，而是「不知道」，两者的处理完全不同。
+      known: rare > 0,
     });
     if (spec) specByCity.set(cityId, spec);
     if (rare) {
       rareByCity.set(cityId, rare);
-      // 同一个货被两个港口当紧缺时，保留先出现的（理论上不会，配平是双射）。
+      // 同一个货被两个港口当紧缺时，保留先出现的（配平是双射，正常不会撞）。
       if (!rareCityOf.has(rare)) rareCityOf.set(rare, cityId);
     }
   }
-  return { cities, specByCity, rareByCity, rareCityOf };
+  // 反向表：货 → 它是哪个港口的特产（特产固定不变，雷达给全 17 个）。
+  const specCityOf = new Map();
+  for (const [cityId, goodsId] of specByCity) if (!specCityOf.has(goodsId)) specCityOf.set(goodsId, cityId);
+  const unknownCities = cities.filter((c) => !c.known).map((c) => c.cityId);
+  return { cities, specByCity, rareByCity, rareCityOf, specCityOf, unknownCities };
 }
 
 // 只读探测。**航行途中不发 TradeCity**（必定被拒，白打一个请求）。
@@ -272,12 +281,21 @@ export function viewTradeKing(survey, { config, now = null, sellRatio = DEFAULT_
   // 本港特产的到货卖点：雷达里把这种货当紧缺货的港口。
   const specSellCity = specGoodsId ? num(index.rareCityOf.get(specGoodsId)) : 0;
 
-  // 已学到的「港口 → 挂哪些货」（只有在那个港口停过才知道）。用来判断第二件货能不能卖得掉。
-  const learned = survey?.learned ?? null;
-  const learnedCities = learned?.cities ?? {};
-  const knowsShelf = (targetCityId, goodsId) => {
-    const list = learnedCities[String(targetCityId)];
-    return Array.isArray(list) && list.includes(goodsId);
+  // 到过的港口会记下整份价目表：{ [cityId]: { [goodsId]: price } }。
+  // 两个用途：① 判断目的地到底挂不挂这件货（不挂就卖不掉，TradeSellRequest 会被拒）；
+  // ② 用真实卖价估利润，比「基准 × 系数」准得多。
+  const learnedCities = survey?.learned?.cities ?? {};
+  const priceIn = (targetCityId, goodsId) => {
+    const row = learnedCities[String(targetCityId)];
+    if (!row) return null;
+    const p = row[String(goodsId)];
+    return p === undefined ? null : Number(p);
+  };
+  // 到过、且价目表里确实没有这件货 → 这个港口不卖它。
+  const carriesGoods = (targetCityId, goodsId) => {
+    const row = learnedCities[String(targetCityId)];
+    if (!row) return true; // 没去过：只能靠雷达（紧缺货 = 该港必挂）
+    return row[String(goodsId)] !== undefined;
   };
 
   // 持仓能在本港卖掉的（cityId 不同才允许卖，且本港货架必须有这件货）。
@@ -307,10 +325,12 @@ export function viewTradeKing(survey, { config, now = null, sellRatio = DEFAULT_
     const destCityId = num(index.rareCityOf.get(row.goodsId));
     // 货物不能在买入港出售 —— 配对港口是本港时，这件货就等于没有卖点（客户端 TradeSellPop 也拦着）。
     const selfDest = Boolean(destCityId) && destCityId === cityId;
-    const expected = Math.round(row.base * sellRatio);
+    // 卖价：到过目的地就用真实价；没到过按「紧缺 = 该港最贵」估。
+    const real = destCityId ? priceIn(destCityId, row.goodsId) : null;
+    const expected = real ?? Math.round(row.base * sellRatio);
     const unitProfit = Math.ceil((expected - row.price) * (1 + ship.marginBp / 10_000));
     if (unitProfit <= 0) continue;
-    // 本港特产 = 该港最便宜的那一件，永远是本港最优买入（也是雷达配对的那一件）。
+    // 本港特产 = 该港最便宜的那一件，通常也是本港最优买入。
     const isSpec = row.goodsId === specGoodsId;
     candidates.push({
       ...row,
@@ -321,10 +341,59 @@ export function viewTradeKing(survey, { config, now = null, sellRatio = DEFAULT_
       perCapacity: row.capacity > 0 ? unitProfit / row.capacity : 0,
       isSpec,
       selfDest,
-      // 卖点确认度：特产 → 雷达配对（100% 卖得掉）；其余只有「到过那个港口见过这件货」才算数。
-      sure: Boolean(destCityId) && !selfDest && (isSpec || knowsShelf(destCityId, row.goodsId)),
+      priceKnown: real !== null,
+      // 卖点确认度：必须「有个港口把它当紧缺货」（雷达已知），而且那个港口确实挂这件货。
+      // 到过该港、价目表里却没有它 → 一定卖不掉，直接排除。
+      sure: Boolean(destCityId) && !selfDest && carriesGoods(destCityId, row.goodsId),
     });
   }
+
+  // 已知航线：每个「今天被共享过的港口」贡献一条「在 specCity(g) 买 g → 到这个港口卖」。
+  // 特产固定不变，所以雷达一给出某港的紧缺 g，这条航线立刻就是确定的（不依赖猜）。
+  const buyRatio = DEFAULT_BUY_RATIO;
+  const routes = [];
+  for (const city of index.cities) {
+    if (!city.known) continue;
+    const g = city.rareGoodsId;
+    const cfg = goods.get(g);
+    const base = cfg?.base ?? 0;
+    if (!cfg || base <= 0) continue;
+    const buyCity = num(index.specCityOf.get(g));
+    if (!buyCity || buyCity === city.cityId) continue;
+    const shelfRow = buyCity === cityId ? shelfByGoods.get(g) : null;
+    const buyPrice = shelfRow?.price ?? Math.round(base * buyRatio);
+    const sellPrice = priceIn(city.cityId, g) ?? Math.round(base * sellRatio);
+    const margin = 1 + ship.marginBp / 10_000;
+    const unitProfit = Math.ceil((sellPrice - buyPrice) * margin);
+    if (unitProfit <= 0) continue;
+    routes.push({
+      goodsId: g,
+      name: cfg.name,
+      base,
+      buyCity,
+      sellCity: city.cityId,
+      buyPrice,
+      sellPrice,
+      unitProfit,
+      roi: buyPrice > 0 ? unitProfit / buyPrice : 0,
+      // 已经到过卖港 → 卖价是真的；否则是估的。
+      priceKnown: priceIn(city.cityId, g) !== null,
+      inBuyCity: buyCity === cityId,
+      inSellCity: city.cityId === cityId,
+    });
+  }
+  // 排序：确定性优先（真实卖价 > 估算），再按单币回报，最后按「一趟能吃下多少资金」。
+  const coinsNow = num(player.coins);
+  const capacityNow = Math.max(0, ship.capacity - usedCapacity);
+  for (const route of routes) {
+    const byCoin = route.buyPrice > 0 ? Math.floor(coinsNow / route.buyPrice) : 0;
+    const byCap = Math.floor(capacityNow / (goods.get(route.goodsId)?.capacity ?? 1));
+    route.tripProfit = Math.max(0, Math.min(byCoin, byCap)) * route.unitProfit;
+  }
+  routes.sort((a, b) => (Number(b.priceKnown) - Number(a.priceKnown))
+    || (b.roi - a.roi)
+    || (b.tripProfit - a.tripProfit));
+  const bestRoute = routes[0] ?? null;
 
   const achievements = (config?.tables?.TradeAchieveRewardCfg?.data ?? [])
     .filter((row) => num(row?.id) === period)
@@ -367,15 +436,29 @@ export function viewTradeKing(survey, { config, now = null, sellRatio = DEFAULT_
     .sort((a, b) => a.reqScore - b.reqScore);
   const passScore = num(player.profit);
 
-  // 下一段航线：手里有货 → 去「把这件货当紧缺」的港口；空舱 → 去本港特产的卖点买下一批。
-  // 手里的货在本港卖不掉（本港不挂这件货 / 亏本留着）时，目的地照样按「这件货的紧缺港口」算，
-  // 否则会一直原地打转。
-  const lead = sellable.slice().sort((a, b) => b.profit - a.profit)[0] ?? null;
-  const leadGoodsId = lead?.goodsId ?? holdings[0]?.goodsId ?? specGoodsId;
-  let targetCityId = num(index.rareCityOf.get(leadGoodsId));
-  if (!targetCityId || targetCityId === cityId) {
-    // 无配对（雷达缺项 / 目的地就是本港）：退化成「任一其他港口」，让船先动起来。
-    targetCityId = index.cities.find((c) => c.cityId !== cityId)?.cityId ?? 0;
+  // 下一段航线，按「有没有货在手上」分两种：
+  //   手上有货 → 去它的**已知买家**（雷达里把它当紧缺的那个港口）；买家不明就先不走。
+  //   空舱     → 沿最好的一条已知航线，去它的**买入港**（到了就买那个特产）。
+  // 一条已知航线都没有（今天还没人共享）→ 去一个「紧缺未知」的港口，靠到港共享把它点亮。
+  const lead = sellable.slice().sort((a, b) => b.profit - a.profit)[0]
+    ?? holdings.slice().sort((a, b) => b.num * b.buyPrice - a.num * a.buyPrice)[0]
+    ?? null;
+  let targetCityId = 0;
+  let targetWhy = '';
+  if (lead) {
+    const buyer = num(index.rareCityOf.get(lead.goodsId));
+    if (buyer && buyer !== cityId) {
+      targetCityId = buyer;
+      targetWhy = `带货去卖（${lead.name}）`;
+    }
+  }
+  if (!targetCityId && bestRoute) {
+    targetCityId = bestRoute.inBuyCity ? bestRoute.sellCity : bestRoute.buyCity;
+    targetWhy = bestRoute.inBuyCity ? `去卖（${bestRoute.name} → 城${bestRoute.sellCity}）` : `去买（${bestRoute.name} 在城${bestRoute.buyCity}）`;
+  }
+  if (!targetCityId && index.unknownCities.length > 0) {
+    targetCityId = index.unknownCities[0];
+    targetWhy = '去探路（这个港口今天还没人共享）';
   }
 
   const speedLeftSeconds = phase === 'sail' ? Math.max(0, moveEnd - nowSec) : 0;
@@ -425,15 +508,26 @@ export function viewTradeKing(survey, { config, now = null, sellRatio = DEFAULT_
     sellable,
     keep,
     candidates,
+    routes,
+    bestRoute,
     targetCityId,
+    targetWhy,
     cities: index.cities,
+    // 今天还没人共享紧缺货的港口（到港后 TradeCityReportRequest 一次就能点亮一个）。
+    unknownCities: index.unknownCities,
+    knownCount: index.cities.filter((c) => c.known).length,
     // 货 → 该卖到哪个港口（当日紧缺表）。挂机里给页面和计划器直接查，不用再摸 Map。
     rareCityOf: Object.fromEntries(index.rareCityOf),
+    specCityOf: Object.fromEntries(index.specCityOf),
     pairs: index.cities.map((c) => ({
       cityId: c.cityId,
       specGoodsId: c.specGoodsId,
       specName: goods.get(c.specGoodsId)?.name ?? '',
+      // 本港特产该卖到哪：只有当「某个港口今天被共享过、且它的紧缺正好是这件特产」时才有值。
       sellCityId: num(index.rareCityOf.get(c.specGoodsId)),
+      rareGoodsId: c.rareGoodsId,
+      rareName: goods.get(c.rareGoodsId)?.name ?? '',
+      known: c.known,
     })),
     rewards: {
       achieve: { next: nextAchieve, got: gotAchieve, claimable: Boolean(nextAchieve && profit > nextAchieve.target) },
@@ -576,6 +670,8 @@ export function planTradeKing(view, {
   const taskId = (rewards.tasks?.claimable ?? [])[0];
   if (taskId) {
     const task = (config?.tables?.TradeGuildTaskCfg?.data ?? []).find((row) => Number(row?.id) === Number(taskId));
+    // 配置里的 desc 是模板串（`联盟成员累计贸易{0}次`），{0} 要换成 tragetCount，否则日志里原样打印占位符。
+    const taskDesc = String(task?.desc ?? '').replace(/\{0\}/g, String(num(task?.tragetCount)));
     actions.push({
       kind: 'tradeTask',
       request: 'TradeGotTaskRequest',
@@ -584,7 +680,7 @@ export function planTradeKing(view, {
       key: `tradeTask:${period}:${taskId}:${new Date(view.now * 1000).toDateString()}`,
       // 被「当天还没解锁」拒掉时不该永久拉黑 —— key 里带上日期，第二天自动重试。
       transient: false,
-      label: `领联盟任务 ${taskId}（${task?.desc ?? ''}）`,
+      label: `领联盟任务 ${taskId}（${taskDesc}）`,
     });
   }
   // 战令免费档：只在「积分（= 累计利润）已经够到第一档」时才发。
@@ -596,8 +692,12 @@ export function planTradeKing(view, {
       request: 'BattlePassGotRewardRequest',
       response: 'BattlePassGotRewardResponse',
       body: { type: TRADE_PASS_TYPE },
-      key: `tradePass:${period}:${new Date(view.now * 1000).toDateString()}`,
-      // 领完所有可达档位后服务端会拒（没有可领的）→ 当天不再重试就是正确行为。
+      // ⚠ key 必须带 `reachable`（当前积分够到的档位数）。
+      // 战令的档位是**一边赚钱一边解锁**的（积分 = 累计利润），所以一天里会反复「够到新档」。
+      // 若 key 只带日期：领完手上这几档后服务端会回 prompt=35（没有可领的），
+      // 这个失败会进跨轮 rejected → **当天后续所有新解锁的档位全领不到**。
+      // 带上 reachable 后，档位数一变就是新 key，自动重试；不变则当天不再重复打请求。
+      key: `tradePass:${period}:${new Date(view.now * 1000).toDateString()}:${num(pass.reachable)}`,
       transient: false,
       group: 'tradePass',
       label: `领海商王战令免费奖励（积分 ${pass.score}，已达 ${pass.reachable}/${pass.tiers} 档）`,
@@ -695,6 +795,8 @@ export function planTradeKing(view, {
       transient: true,
       group: 'tradeBuy',
       items: [[pick.row.name, pick.num]],
+      // 花费只用于日志汇总（「买 21 件/花费 15750」），不参与任何判定。
+      spent: pick.num * pick.row.price,
       label: `买 ${pick.row.name}×${pick.num} @${pick.row.price}（→ 城市 ${pick.row.destCityId} 卖出，预计利润 ${pick.num * pick.row.unitProfit}）`,
     });
   }
@@ -726,7 +828,8 @@ export function planTradeKing(view, {
       key: `tradeSail:${view.cargo.cityId}:${dest}:${view.nextRefreshAt}`,
       transient: true,
       label: `起航 城市${view.cargo.cityId} → 城市${dest}`
-        + (speedForLeg > 0 ? `（随即用 ${speedForLeg} 个指针，约 ${Math.max(0, Math.ceil((view.sailSeconds - speedForLeg * view.speed.secsPerItem) / 60))} 分钟到）` : '（约 2 小时）'),
+        + (view.targetWhy && dest === view.targetCityId ? `（${view.targetWhy}）` : '')
+        + (speedForLeg > 0 ? `，随即用 ${speedForLeg} 个指针，约 ${Math.max(0, Math.ceil((view.sailSeconds - speedForLeg * view.speed.secsPerItem) / 60))} 分钟到` : '，约 2 小时'),
     });
     // 起航后立刻用指针：指针是免费道具（联盟任务/战令产出），留着不用等于少跑好几趟。
     if (speedForLeg > 0) {
@@ -754,6 +857,8 @@ export function formatTradeSummary(view) {
     `利润 ${p.profit ?? 0}`,
     `商会币 ${p.coins ?? 0}/${p.maxCoins ?? 0}`,
     `船 lv${view.cargo?.lv ?? 1}（舱位 ${view.ship?.capacity ?? 0}，+${Math.round((view.ship?.marginBp ?? 0) / 100)}%）`,
+    // 今天已经有人共享过紧缺货的港口有几个 —— 决了多少条航线可用，是「能不能开张」的关键指标。
+    `已知紧缺 ${view.knownCount ?? 0}/${view.cities?.length ?? 0} 港`,
   ];
   if (view.cargo?.phase === 'sail') {
     parts.push(`航行中 城${view.cargo.cityId}→城${view.cargo.moveToCityId} 剩 ${Math.ceil((view.cargo.leftSeconds ?? 0) / 60)} 分钟`);
@@ -761,7 +866,7 @@ export function formatTradeSummary(view) {
     parts.push(`停在城市 ${view.cargo?.cityId ?? '-'}`);
     if (view.holdings?.length) parts.push(`持仓 ${view.holdings.map((h) => `${h.name}×${h.num}`).join('、')}`);
   }
-  if (view.targetCityId) parts.push(`下一站 城市 ${view.targetCityId}`);
+  if (view.targetCityId) parts.push(`下一站 城市 ${view.targetCityId}${view.targetWhy ? `（${view.targetWhy}）` : ''}`);
   return parts.join(' · ');
 }
 
@@ -812,8 +917,14 @@ export function mergeLearned(learned, { period, cityId, shelf }) {
   const base = learned && typeof learned === 'object' ? learned : { cities: {} };
   const cities = { ...(base.cities ?? {}) };
   if (period && cityId && Array.isArray(shelf) && shelf.length > 0) {
-    const ids = shelf.map((row) => Number(row.goodsId)).filter(Boolean).sort((a, b) => a - b);
-    cities[String(cityId)] = ids;
+    // 存整份价目表（不是只存「挂哪些货」）：卖价估算和「这个港到底卖不卖这件货」都要用它。
+    const prices = {};
+    for (const row of shelf) {
+      const id = Number(row.goodsId);
+      const price = Number(row.price);
+      if (id > 0 && Number.isFinite(price) && price > 0) prices[String(id)] = price;
+    }
+    cities[String(cityId)] = prices;
   }
   return { ...base, period, cities };
 }

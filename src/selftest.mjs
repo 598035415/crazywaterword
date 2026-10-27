@@ -4,7 +4,7 @@ import { loadProtocol } from './proto.mjs';
 import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
 import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
-import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap, MIN_LOOP_GAP_MS } from './loop.mjs';
+import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap, MIN_LOOP_GAP_MS, tradeGainedReward } from './loop.mjs';
 import {
   tradeParams,
   tradeWindow,
@@ -1965,7 +1965,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     { config: blockedConfig, cargoDemand: new Map([['鱼皮', 999]]) });
   assert.equal(packsOf(blocked).length, 0, '有换不出来的材料就不兑（免得白烧包）');
   assert.equal(producesOf(blocked).length, 0, '也不排');
-  assert.ok(blocked.notes.some((n) => n.includes('自选包也补不上')), '原因要写清楚');
+  assert.ok(blocked.notes.some((n) => n.includes('没有自选包可换')), '原因要写清楚（缺的是布匹，没有包能换）');
 
   // 料够的配方优先，不为高档配方烧包：鱼 7 够生鱼片(6) 时不该动 50 的鱼油。
   const cheapFirst = planWorld(surveyFor({ stock: rich, level: 3 }), {
@@ -2036,9 +2036,76 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 
   // **没有需求的配方不烧包**（2026-10-27 加）：否则一整夜每轮都往没人要的产品上砸几百个包
   // （实测 1金属厂 为产没人要的铜锭兑 玻璃×60、1服装厂 兑 塑料×30…25 万个包撑不了几十小时）。
+  // 后来这个规则被 packGapMax 开了口子，默认值 = 500（与每轮额度同量级）：缺口在一轮额度内
+  // 兑得齐就放行。所以默认参数下 鱼油（鱼×50 + 玻璃×30 = 80 个包）会兑 —— 真正的刹车是
+  // 「每轮 500 额度 + 只排 1 个 + 产物到上限 50」这三条，不是门槛本身。
   const noWant = planWorld(surveyFor({ stock: { 鱼: 0, 玻璃: 0, 原料自选包: 253_516 } }), { config });
-  assert.equal(packsOf(noWant).length, 0, '没需求的配方不乱兑料');
-  assert.equal(producesOf(noWant).length, 0, '料不够又没需求 → 空着（工厂空转不损失任何东西）');
+  assert.equal(packsOf(noWant).length, 2, '默认 500：缺口 80 个包在一轮额度内 → 破例兑（鱼 50 + 玻璃 30）');
+  assert.equal(producesOf(noWant).length, 1, '破例只排 1 个，不排满');
+
+  // 想收紧就传小值：20 = 只补零头，80 个包的鱼油回到「等需求」。
+  const tight = planWorld(surveyFor({ stock: { 鱼: 0, 玻璃: 0, 原料自选包: 253_516 } }),
+    { config, packGapMax: 20 });
+  assert.equal(packsOf(tight).length, 0, 'packGapMax:20 时缺口 80 个包 > 上限 → 不兑');
+  assert.equal(producesOf(tight).length, 0, '也不排');
+  assert.ok(tight.notes.some((n) => n.includes('小额兜底上限 20')), '要写清「缺口 80 > 上限 20」，别只说补不上');
+
+  // 小额兜底口子（2026-10-27 加，packGapMax）：差一点点就让工厂空一整天太蠢。
+  // 实测场景：1海水厂 lv4 的淡水/海藻泥都到存量上限 50，剩黏土要 玻璃×60、仓库只有 54 —— 差 6 个包，
+  // 而仓库里躺着 26 万个原料自选包，工厂从早空到晚。
+  const seaConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '黏土', produceTime: 1800, unlockLevel: 1, costItem: [['海藻', 60], ['玻璃', 60]] },
+  ] } } };
+  const smallGap = planWorld(surveyFor({ stock: { 海藻: 3131, 玻璃: 54, 原料自选包: 261_600 } }), { config: seaConfig });
+  assert.equal(packsOf(smallGap).length, 1, '无需求但缺口只有 6 个包 → 破例兑');
+  assert.equal(packsOf(smallGap)[0].body.selectItemId, '玻璃', '兑的是缺的那个材料');
+  assert.equal(packsOf(smallGap)[0].body.num, 6, '缺 6 就兑 6，不多兑');
+  assert.equal(producesOf(smallGap).length, 1, '补齐后开排 1 个');
+  assert.ok(smallGap.notes.some((n) => n.includes('小额兜底')), '日志要说明这是破例，不是「有需求」');
+
+  // packGapMax: 0 = 彻底关掉口子，退回「无需求绝不烧包」。
+  const closed = planWorld(surveyFor({ stock: { 海藻: 3131, 玻璃: 54, 原料自选包: 261_600 } }),
+    { config: seaConfig, packGapMax: 0 });
+  assert.equal(packsOf(closed).length, 0, 'packGapMax:0 时一个包都不兑');
+  assert.equal(producesOf(closed).length, 0, '也不排');
+  assert.ok(closed.notes.some((n) => n.includes('小额兜底已关闭')), '关掉后要说清原因');
+
+  // 默认 packGapMax = Infinity（产品策略「无时无刻都在制造」）：缺口再大也兑，
+  // 兑不齐就分轮攒 —— 不靠外部需求驱动，靠「每轮 500 额度 + 只排 1 个 + 产物到上限」刹车。
+  const hugeConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '海藻霉菌', produceTime: 13500, unlockLevel: 1, costItem: [['鱼', 600], ['玻璃', 600]] },
+  ] } } };
+  const hugeSurvey = () => surveyFor({ stock: { 鱼: 0, 玻璃: 0, 原料自选包: 261_600 } });
+  const hugeDefault = planWorld(hugeSurvey(), { config: hugeConfig, maxPackPerRound: 5000 });
+  assert.equal(packsOf(hugeDefault).length, 2, '默认不设门槛：缺口 1200 也兑');
+  assert.equal(producesOf(hugeDefault).length, 1, '兑齐就排 1 个');
+
+  // 收紧到 500 时同样的配方就该等需求（缺口 1200 > 500）。
+  const stillBig = planWorld(hugeSurvey(), { config: hugeConfig, packGapMax: 500, maxPackPerRound: 5000 });
+  assert.equal(packsOf(stillBig).length, 0, 'packGapMax:500 时缺口 1200 > 上限 → 不兑');
+  assert.ok(stillBig.notes.some((n) => n.includes('小额兜底上限 500')), '要写清「缺口 1200 > 上限 500」，别只说补不上');
+
+  // 兑不齐时挑**缺口最小**的那条攒，别让巨无霸每轮吃掉全部额度。
+  // 鱼皮 缺口 120、鱼油 缺口 43，哪条排在前面都该先攒 43 的那条（挑小不挑顺序）。
+  const mixConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '鱼皮', produceTime: 60, unlockLevel: 1, costItem: [['鱼', 120]] },
+    { buildType: '切鱼厂', itemId: '鱼油', produceTime: 1380, unlockLevel: 1, costItem: [['鱼', 43]] },
+  ] } } };
+  const smallest = planWorld(surveyFor({ stock: { 鱼: 0, 原料自选包: 500 } }), { config: mixConfig, maxPackPerRound: 100 });
+  assert.equal(packsOf(smallest).length, 1, '只兑一条配方的料');
+  assert.equal(packsOf(smallest)[0].body.num, 43, '缺口 43 兑 43 就够（额度 100 用不完）');
+  assert.equal(producesOf(smallest).length, 1, '43 的缺口兑齐 → 直接开排，不用等下一轮');
+  assert.equal(producesOf(smallest)[0].body.productId, '鱼油', '挑缺口小的先攒，不是按排序第一的鱼皮（120）');
+
+  // 瞬成配方破例时也不许「排满」：料是拿包换的，排满 = 把包按 N 倍烧。
+  const instantSurvey = surveyFor({ stock: { 鱼: 0, 原料自选包: 500 } });
+  instantSurvey.produce = { reduce: 774, instant: [], source: 'appoint' };
+  const instantConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '生鱼片', produceTime: 90, unlockLevel: 1, costItem: [['鱼', 6]] },
+  ] } } };
+  const instantSmall = planWorld(instantSurvey, { config: instantConfig });
+  assert.equal(packsOf(instantSmall).length, 1, '瞬成配方也只为 1 个兑料');
+  assert.equal(producesOf(instantSmall).length, 1, '小额兜底只排 1 个，不排满 6 个（否则包按 6 倍烧）');
   checked += 1;
 }
 
@@ -3964,6 +4031,12 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
         { id: 4, day: 1, taskType: 1, tragetCount: 50, rewards: [['海商王加速', 2]] },
       ] },
       TradeDayRewardCfg: { data: [{ id: 1, roleNum: 5, rewards: [['海商王加速', 2]] }] },
+      // 战令免费档：reqScore 就是累计利润，1 利润 = 1 积分（客户端 tips 原文）。
+      TradePassCfg: { data: [
+        { period: 1001, rwdId: 1, reqScore: 1000, freeReward: [['海商王加速', 1]], payReward: [] },
+        { period: 1001, rwdId: 2, reqScore: 3300, freeReward: [['RUBY', 100]], payReward: [] },
+        { period: 1001, rwdId: 3, reqScore: 7800, freeReward: [['海商王加速', 1]], payReward: [] },
+      ] },
     },
   };
   // 雷达是一张配对表：91 特产布匹 → 64 的紧缺是布匹；64 特产海洋球 → 97 的紧缺是海洋球。
@@ -4148,6 +4221,99 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(richPlan.actions.some((a) => a.kind === 'tradeAchieve'), '利润过线要领成就');
   assert.ok(richPlan.actions.some((a) => a.kind === 'tradeTask' && a.body.taskId === 1), '联盟利润过线要领任务 1');
   assert.ok(richPlan.actions.some((a) => a.kind === 'tradeReportReward'), '商情共享 6/5 要领奖励');
+
+  // 8.5 紧缺货每天 10 点重置：没被共享过的港口 rare=0 = **不知道**，不能当「没有卖点」也不能瞎猜。
+  // 实盘 10:00 重置后 17 个港只剩 3 个有 rare，若不区分就会把「不知道」当成「没有」→ 一单都不敢做，
+  // 或者按昨天的配对瞎买 → 货砸手里。
+  const sparseRadar = { radar: [
+    { cityId: 91, specGoodsId: 1005, rareGoodsId: 0, reportName: '' },
+    { cityId: 64, specGoodsId: 4010, rareGoodsId: 1005, reportName: '我' },
+    { cityId: 97, specGoodsId: 3003, rareGoodsId: 0, reportName: '' },
+  ] };
+  const sparse = viewTradeKing({
+    ...dockSurvey(),
+    radar: sparseRadar,
+    city: { goods: shelf, specGoodsId: 1005, rareGoodsId: 0, isReport: false },
+    info: {
+      ...dockSurvey().info,
+      cargo: { cargoLv: 1, cityId: 91, moveStartTime: 0, moveEndTime: 0, moveToCityId: 0 },
+    },
+  }, { config: cfg });
+  assert.equal(sparse.knownCount, 1, '只有 1 个港口的紧缺是已知的');
+  assert.equal(sparse.unknownCities.length, 2, '另外 2 个是「未知」，不是「没有」');
+  assert.equal(sparse.routes.length, 1, '已知航线只有 1 条（64 买布匹）');
+  assert.equal(sparse.routes[0].sellCity, 64, '布匹的买家是 64');
+  assert.equal(sparse.routes[0].buyCity, 91, '布匹在 91 买（本港）');
+  // 本港 91 正是布匹的买入港 → 应该买布匹、开去 64 卖。
+  const sparsePlan = planTradeKing(sparse, { config: cfg });
+  assert.equal(sparsePlan.actions.find((a) => a.kind === 'tradeBuy')?.body.goodsId, 1005, '稀疏雷达下也要敢买已知航线上的货');
+  assert.equal(sparsePlan.actions.find((a) => a.kind === 'tradeSail')?.body.mvToCityId, 64, '开去买家 64');
+  // 手上有一件「买家未知」的货 → 不能瞎起航。
+  const orphan = viewTradeKing({
+    ...dockSurvey(),
+    radar: { radar: [
+      { cityId: 91, specGoodsId: 1005, rareGoodsId: 0, reportName: '' },
+      { cityId: 64, specGoodsId: 4010, rareGoodsId: 0, reportName: '' },
+    ] },
+    city: { goods: [{ goodsId: 2007, stock: 0, price: 110 }], specGoodsId: 2007, rareGoodsId: 0, isReport: true },
+    info: {
+      ...dockSurvey().info,
+      player: {
+        coins: 500, maxCoins: 10500, profit: 500, buySpeedTimes: 0,
+        goods: [{ pid: 3, goodsId: 1005, num: 50, buyPrice: 44, cityId: 91 }],
+      },
+      cargo: { cargoLv: 1, cityId: 64, moveStartTime: 0, moveEndTime: 0, moveToCityId: 0 },
+    },
+  }, { config: cfg });
+  const orphanPlan = planTradeKing(orphan, { config: cfg });
+  // 买家不明时**不能瞎猜一个买家**（昨天的配对今天就变了），但也不能干等着：
+  // 去一个「紧缺未知」的港口探路 —— 到了共享一次就把那个港点亮，顺路看看能不能把货出掉。
+  const orphanSail = orphanPlan.actions.find((a) => a.kind === 'tradeSail');
+  assert.ok(orphanSail, '买家不明也要动起来（去探路）');
+  assert.ok([91, 64].includes(orphanSail.body.mvToCityId) || orphanSail.body.mvToCityId !== 0, '目的地必须是个真实港口');
+  assert.ok(!orphanPlan.actions.some((a) => a.kind === 'tradeBuy'), '买家不明的货一件都不买（宁可不买也不砸手里）');
+
+  // 8.6 战令 key 必须带「可达档位数」。积分是边赚边涨的（= 累计利润），所以一天里会反复够到新档；
+  // 若 key 只带日期：领完手上这几档后服务端回 prompt=35，这个失败进跨轮 rejected →
+  // **当天后面所有新解锁的档位都领不到**（实盘 10:03 领到 2 档，13:35 已到 4 档却全被挡住）。
+  const passAt = (profit) => planTradeKing(viewTradeKing(dockSurvey({
+    player: { coins: 500, maxCoins: 20000, profit, goods: [], buySpeedTimes: 0 },
+  }), { config: cfg }), { config: cfg });
+  const passKey2 = passAt(4000).actions.find((a) => a.kind === 'tradePass')?.key;
+  const passKey3 = passAt(12000).actions.find((a) => a.kind === 'tradePass')?.key;
+  assert.ok(passKey2 && passKey2.endsWith(':2'), `积分 4000 够 2 档，key 应带 2，实际 ${passKey2}`);
+  assert.ok(passKey3 && passKey3.endsWith(':3'), `积分 12000 够 3 档，key 应带 3，实际 ${passKey3}`);
+  assert.ok(passKey2 !== passKey3, '档位数一变 key 就得变，否则新解锁的档位会被当天的失败记录挡住');
+  // 积分还不够第一档（1000）→ 一个请求都不发。
+  assert.ok(!passAt(500).actions.some((a) => a.kind === 'tradePass'), '0 分/不够档时不该问战令（必被拒）');
+
+  // 8.7 联盟任务的文案要把配置模板的 {0} 换成 tragetCount，日志里不能出现裸占位符。
+  const taskPlan = planTradeKing(viewTradeKing(dockSurvey({
+    player: { coins: 500, maxCoins: 60000, profit: 12000, goods: [], buySpeedTimes: 0 },
+    guildTask: { profit: 60000, tradeTimes: 10, gotTaskId: [] },
+  }), { config: cfg }), { config: cfg });
+  const taskLabel = taskPlan.actions.find((a) => a.kind === 'tradeTask')?.label ?? '';
+  assert.ok(!taskLabel.includes('{0}'), `联盟任务文案不能留占位符，实际：${taskLabel}`);
+
+  // 8.8 领奖会带回「海商王加速」（商会指针），但探测时的 speed.owned 是旧快照。
+  // 若直接拿旧快照判「在航且没指针 → 静默到靠港」，刚领到的指针会白等 2 小时
+  // （实盘 13:45：一次领到 6 档含 2 个指针，船却仍挂着 119 分钟）。
+  // 所以「本轮成功领过奖」要把静默窗推迟一轮。
+  assert.equal(tradeGainedReward([
+    { step: { kind: 'tradePass' }, ok: true },
+    { step: { kind: 'tradeSpeed' }, ok: true },
+  ]), true, '领奖成功 → 要推迟静默（下一轮重探，指针数已更新）');
+  assert.equal(tradeGainedReward([
+    { step: { kind: 'tradeBuy' }, ok: true },
+    { step: { kind: 'tradeSail' }, ok: true },
+  ]), false, '只有买卖起航 → 没有新指针，照常静默到靠港');
+  assert.equal(tradeGainedReward([
+    { step: { kind: 'tradePass' }, ok: false, error: 'server prompt: prompt=35' },
+  ]), false, '领奖被拒（已领完）不算，不能因此每轮重探');
+  assert.equal(tradeGainedReward([
+    { step: { kind: 'tradeTask' }, ok: false, skipped: true, error: '刚被服务端拒过，跳过' },
+  ]), false, '跳过的动作不算领到奖');
+  assert.equal(tradeGainedReward(undefined), false, '没有结果不能崩');
 
   // 9. 循环日志：这一段真的探测过就印一行「海商王」，被静默时印原因。
   const tradeRound = formatLoopRound({

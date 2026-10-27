@@ -55,6 +55,15 @@ const STATE_TEXT = {
   STOPPED: '已停止',
 };
 
+// 「无需求配方的小额兜底上限」（planWorld 的 packGapMax）。
+// 0 是合法值（关掉这个口子），所以不能像 maxPack 那样用 `> 0` 判断 —— 空串/没传
+// 要跟 0 分开：前者返回 undefined 让 planWorld 用它自己的默认值 Infinity（不设门槛）。
+function packGapArg(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const num = Number(value);
+  return Number.isFinite(num) && num >= 0 ? num : undefined;
+}
+
 export function createConsole({ host = '127.0.0.1', port = 17321 }) {
   const protocol = loadProtocol();
   const globalLog = [];
@@ -173,6 +182,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         pickUpFloaters: false,
         useSelectPack: true,
         maxPackPerRound: undefined,
+        // 无需求配方的兑包门槛（个包）：null/undefined = 用 planWorld 的默认 Infinity（不拦），0 = 关掉。
+        packGapMax: undefined,
         allowSpeedUp: false,
         allowReroll: false,
         allowPaid: false,
@@ -1574,6 +1585,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           // 材料不齐时默认拿自选包补；前端传 selectPack:false 可关，maxPack 可改每轮上限。
           useSelectPack: payload.selectPack !== false,
           maxPackPerRound: Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined,
+          // 0 是合法值（关掉小额兜底），所以「空串/没传」要跟 0 区分开。
+          packGapMax: packGapArg(payload.packGap),
           // 拾荒默认不做，前端勾了「自动拾荒」才扫海面漂浮物。
           pickUpFloaters: payload.pickFloaters === true,
           // 农田默认做（收成熟作物 + 补种），前端取消勾选才关。
@@ -1698,6 +1711,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.pickUpFloaters = payload.pickFloaters === true;
         loop.useSelectPack = payload.selectPack !== false;
         loop.maxPackPerRound = Number(payload.maxPack) > 0 ? Number(payload.maxPack) : undefined;
+        loop.packGapMax = packGapArg(payload.packGap);
         loop.allowSpeedUp = payload.speedUp === true;
         loop.allowReroll = payload.reroll === true;
         loop.allowPaid = payload.paid === true;
@@ -1793,6 +1807,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           minPowerRatio: loop.minPowerRatio,
           useSelectPack: loop.useSelectPack,
           maxPackPerRound: loop.maxPackPerRound,
+          packGapMax: loop.packGapMax,
           // 运行中改设置不用停掉重开：runLoop 每轮开头都会调它重读一遍。
           live: () => loop,
           // 断线自愈：网关用 code=1000 关掉连接后，server 这边要新建一个 GameClient
@@ -1927,6 +1942,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       // 执行范围也回给页面：运行中回填勾选，避免「页面勾着、服务端其实关着」。
       useSelectPack: loop.useSelectPack !== false,
       maxPackPerRound: loop.maxPackPerRound ?? null,
+      packGapMax: loop.packGapMax ?? null,
       allowSpeedUp: loop.allowSpeedUp === true,
       allowReroll: loop.allowReroll === true,
       allowPaid: loop.allowPaid === true,

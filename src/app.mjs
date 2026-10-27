@@ -542,7 +542,7 @@ async function tasks({ allowMutate, dryRun }) {
 // 材料不齐时默认会拿「原料自选包 / 工事材料自选包」兑出来补（--no-pack 关掉，--max-pack 改上限）。
 // --pick 才扫海面漂浮物（拾荒），结束后打印所得。
 // 没有 --dive：潜水/打捞的请求体里要填「你实际捡到了什么」，纯协议只能伪造，故不做（见 docs/gameplay.md）。
-async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, pickUpFloaters = false, farm = true }) {
+async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelectPack = true, maxPackPerRound, packGapMax, pickUpFloaters = false, farm = true }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -556,7 +556,7 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
     const survey = await surveyWorld(client, protocol, { config, player: response.playerInfo });
     // 货船缺口也并进排产需求：CLI 与挂机必须算出同一份计划（贸易港口没建/探测失败时空表）。
     const cargoDemand = await safeCargoDemand(client, protocol, { stock: survey.stock });
-    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters, farm, cargoDemand });
+    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, packGapMax, pickUpFloaters, farm, cargoDemand });
     console.log(`\n${formatWorldPlan(survey, plan)}\n`);
     console.log(`共 ${plan.actions.length} 个动作${allowSpeedUp ? '' : '（未开 --speed-up，不会花' + SPEED_UP_ITEM + '）'}`
       + `${pickUpFloaters ? `，含拾荒 ${(survey.floaters ?? []).length} 件漂浮物` : '（未开 --pick，不拾荒）'}`);
@@ -959,9 +959,21 @@ async function tradeCli({ allowMutate, dryRun, allowSpeed = true }) {
           + (cand ? ` → 城${cand.destCityId} 单件利润 ${cand.unitProfit}` : ''));
       }
     }
-    console.log('\n配对表（本港特产 → 该卖到哪个港口）：');
+    console.log(`\n港口状态（已知紧缺 ${view.knownCount}/${view.cities.length} 港；每天 10 点重置，只有当天被共享过才知道）：`);
     for (const pair of view.pairs) {
-      console.log(`  城${String(pair.cityId).padStart(3)} 特产 ${pair.specName.padEnd(6, ' ')} → 城${pair.sellCityId}`);
+      console.log(`  城${String(pair.cityId).padStart(3)} 特产 ${pair.specName.padEnd(6, ' ')}`
+        + ` 紧缺 ${pair.known ? String(pair.rareName).padEnd(6, ' ') : '？'.padEnd(6, ' ')}`
+        + ` → 特产卖到 ${pair.sellCityId ? `城${pair.sellCityId}` : '?'}`);
+    }
+    if (view.routes.length > 0) {
+      console.log('\n已知航线（买 → 卖，按回报排序）：');
+      for (const route of view.routes.slice(0, 8)) {
+        console.log(`  ${route.name.padEnd(6, ' ')} 城${route.buyCity} @${route.buyPrice} → 城${route.sellCity} @${route.sellPrice}`
+          + ` 单件 ${route.unitProfit} 回报 ${(route.roi * 100).toFixed(1)}% 一趟约 ${route.tripProfit}`
+          + (route.priceKnown ? '（真实卖价）' : '（估算）'));
+      }
+    } else {
+      console.log('\n还没有任何已知航线：等联盟共享，或者先开去「紧缺未知」的港口探路。');
     }
     console.log(`\n计划 ${plan.actions.length} 条`);
     for (const action of plan.actions) console.log(`  ${action.label}`);
@@ -1138,6 +1150,7 @@ async function loopCli({
   allowPaid,
   useSelectPack = true,
   maxPackPerRound,
+  packGapMax,
   pickUpFloaters = false,
   pickEverySeconds = 0,
   farmEnabled = true,
@@ -1207,6 +1220,7 @@ async function loopCli({
       allowReroll,
       useSelectPack,
       maxPackPerRound,
+      packGapMax,
       pickUpFloaters,
       pickEveryMs: Math.max(0, Number(pickEverySeconds) || 0) * 1000,
       farmEnabled,
@@ -1427,6 +1441,8 @@ async function main() {
       allowPaid: process.argv.includes('--paid'),
       useSelectPack: !process.argv.includes('--no-pack'),
       maxPackPerRound: numericArg('--max-pack'),
+      // 无需求配方的兑包门槛（个包）：默认不设限（工厂无时无刻都在制造），0 = 关掉。
+      packGapMax: numericArg('--pack-gap'),
       pickUpFloaters: process.argv.includes('--pick'),
       pickEverySeconds: at('--pick-every', 0),
       farmEnabled: !process.argv.includes('--no-farm'),
@@ -1494,6 +1510,8 @@ async function main() {
       allowReroll: process.argv.includes('--reroll'),
       useSelectPack: !process.argv.includes('--no-pack'),
       maxPackPerRound: numericArg('--max-pack'),
+      // 无需求配方的兑包门槛（个包）：默认不设限（工厂无时无刻都在制造），0 = 关掉。
+      packGapMax: numericArg('--pack-gap'),
       pickUpFloaters: process.argv.includes('--pick'),
       farm: !process.argv.includes('--no-farm'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),

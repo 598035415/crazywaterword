@@ -35,7 +35,7 @@
 | 挂机领取 | 邮件附件、挂机本段收益、挂机等级奖励、挂机等级升级（只花「挂机徽章」）；循环里默认开启 |
 | 搁浅的货轮 | 世界宝藏：按勾选的等级（多选，默认只抢万吨）抢货轮，已经有人占领的也派（打赢守军就换我们占），一条请求把空闲舰队压上去推占领进度（一天 3 次奖励）；循环里默认开启 |
 | 贸易港口 | 建筑「货轮港口」（界面显示「贸易港口」）：3 艘货船各采购 4 种物品，攒够的格子一条请求全交（拿玩家经验 + 金币），4 格交满船出发、几小时后返航领 4 份藏品奖励；**缺的货会并进工厂排产需求**，工厂优先产它；缺料不买货、不动钻石与加速器；循环里默认开启 |
-| 海商王 | 每天 10~22 点的 17 港口贸易：在港就卖掉手上的货、买本港**特产**、开去「把这件货当**紧缺**」的港口（雷达配对表，单趟价差约 +27%），顺手领成就/联盟任务/商情共享/战令免费档；只花活动内商会币，**不动钻石**；商会指针（免费道具）默认全用；循环里默认开启 |
+| 海商王 | 每天 10~22 点的 17 港口贸易：在港就卖掉手上的货、买**已知航线**上的货、开去「把它当紧缺」的港口（单趟价差约 +25~30%，资金=初始 10000+累计利润，滚得很快）；紧缺货每天 10 点重置，所以会把未知港口逐个「探路+共享」点亮；顺手领成就/联盟任务/商情共享/战令免费档；只花活动内商会币，**不动钻石**；商会指针（免费道具）默认全用；循环里默认开启 |
 | 自动循环 | 上面几块按轮执行，可只读探测、可长期挂机 |
 | 回包归档 | 每条请求/推送按接口全量落盘到 `data/responses/<日期>/`，时序流水另存 `data/protocol.log`，页面日志存 `data/console/<日期>.log` |
 | 网页控制台 | 本地页面，中文业务视图，一键领取 / 一键完成 / 自动循环 / 账号与凭证管理 |
@@ -282,7 +282,7 @@ node src/app.mjs <子命令> [参数]
 | `tasks [--dry]` | 主线 / 支线 / 成就 / 每日订单档位 |
 | `dailies [--dry] [--paid]` | 日常任务闭环 |
 | `heroes [--dry]` | 英雄养成 |
-| `world [--dry] [--speed-up] [--reroll] [--no-pack] [--max-pack N] [--pick] [--no-farm]` | 海面世界一轮 |
+| `world [--dry] [--speed-up] [--reroll] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--no-farm]` | 海面世界一轮 |
 | `radar [--dry] [--power-ratio N] [--max N]` | 联盟情报：领奖 + 每艘空闲船各派一个事件（战力余量默认 1.2，`--max` 默认不限） |
 | `pirates [--dry] [--power-ratio N] [--max N] [--repeat]` | 海盗讨伐（世界地图**真出战**）：按「已击杀最高等级 + 1」找地图上的海盗，派空闲舰队打（300 汽油/次、不掉耐久）。`--repeat` 连已通关等级也刷（只剩固定掉落）；`--max` 限派几艘。跟日常里的免战扫荡（`PirateSweepRequest`）不是一回事 |
 | `forge [--dry]` | 装备厂：收取已锻好的装备 + 按部位均衡排下一件 |
@@ -292,7 +292,7 @@ node src/app.mjs <子命令> [参数]
 | `cargo [--dry]` | 贸易港口（建筑「货轮港口」）：采购中的货船把「库存够的格子」一条请求全交（`FillCargoShipRequest`，拿经验+金币），已返航的船领 4 份藏品奖励（`DrawShipRewardRequest`）。缺料只报缺口不买货 |
 | `trade [--dry] [--no-speed]` | 海商王：在港就卖手上的货 + 共享商情 + 买本港特产 + 起航去「这件货的紧缺港口」+ 用商会指针加速，顺带领成就 / 联盟任务 / 商情奖励 / 战令免费档。`--no-speed` 不用指针（就老实等 2 小时） |
 | `field [gridIdx]` | 资源田报告 / 占田 / 弃田 |
-| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
+| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
 
 **任何会改变账号状态的命令都必须显式授权**：CLI 加 `--yes` 或 `CW_ALLOW_MUTATE=1`，
 网页请求体里带 `confirm: true`。不加就只打印计划，一个字节都不发出去。
@@ -479,11 +479,13 @@ docs/
   ① 先用 `原料自选包` / `工事材料自选包` 兑出来补。兑换关系在 `SelectPackLibCfg`
      （`itemId` = 包，`selectItemId` = 能换的材料，`num` = 每包产出），协议 `SelectPackRequest`。
      因为一包只顶一个单位，它只够补零头（比如订单差 3 个木材），补不了「玻璃差 500」；
-     每轮默认上限 20 个包，`--no-pack` 关掉、`--max-pack N` 调整，网页请求体用 `selectPack:false` / `maxPack`。
-     排产只在**一条配方都排不上**时才兑料（能免费排的先排，不为高档配方烧包），
-     而且**只给「有需求」的配方补**（居民订单缺的 / 贸易港口货船等的）—— 没需求的配方料不够就空着，
-     工厂空转不损失任何东西，包是真金白银攒出来的。只给优先级最高的那一条补；缺口大于每轮额度时是
-     **分轮累积**（每轮兑到额度上限，兑出来的料留着，几轮后凑够自然开排）。
+     每轮默认上限 500 个包，`--no-pack` 关掉、`--max-pack N` 调整，网页请求体用 `selectPack:false` / `maxPack`。
+     产品策略是**「工厂无时无刻都在制造」**：有需求的配方（居民订单 / 货船缺口）绝对优先，
+     都没需求时按配方顺序一条条排，一个产品排到存量上限 50 就换下一个，直到每个产品都顶满。
+     排产缺料就走自选包兜底，默认**不设门槛**（`--pack-gap N` 可收紧）：玻璃这类原料没有任何工厂能产、
+     只能靠包换，卡住兑料就等于卡住整条链（`1海水厂` 就是这样空了一整天，仓库里躺着 26 万个包）；
+     此外兑不齐时优先攒**缺口最小**的那条，免得大配方每轮吃掉全部额度。
+     三道刹车兜住风险：每轮 500 个包封顶 / 无需求破例只排 1 个（瞬成也不排满）/ 产物到上限 50 自动停。
   ② 包不够、或该材料不在任何自选包的覆盖范围里，才跳过等下一轮。
 - 工厂页手动排产：缺料且能用上面这两类包补齐时，按钮会变成**「兑料并制造」**（写明要花几个包），
   点它才会真的兑料——一次补齐全部缺口、不受每轮 20 的限制（这是单次显式授权）。不点的话一个包都不动，

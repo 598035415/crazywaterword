@@ -48,6 +48,13 @@ import {
 // 「暂停探测」这条日志的重复间隔：货轮静默窗可能长达 10 小时（22:00 收摊 → 次日 8:00），
 // 每轮都印一句会把有用的记录挤没，所以只每 30 分钟报一次。
 const SKIP_NOTICE_MS = 30 * 60 * 1000;
+// 「领奖」类海商王动作：成功后可能带回「海商王加速」（商人指针），会影响下一轮要不要继续探测。
+const TRADE_REWARD_KINDS = new Set(['tradePass', 'tradeTask', 'tradeReportReward', 'tradeAchieve']);
+// 本轮有没有「成功领到奖」。领奖常带回「海商王加速」= 商会指针，而探测时的 owned 是旧快照，
+// 所以要靠这个把静默窗推迟一轮（详见海商王段注释）。
+export function tradeGainedReward(results) {
+  return (results ?? []).some((entry) => entry?.ok === true && TRADE_REWARD_KINDS.has(entry?.step?.kind));
+}
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -129,6 +136,9 @@ export async function runLoop(initialClient, protocol, {
   allowReroll = false,
   useSelectPack = true,
   maxPackPerRound,
+  // 无需求配方的兑包门槛（见 planWorld 的 packGapMax）：默认 Infinity = 不设门槛，
+  // 因为产品策略是「工厂无时无刻都在制造」。传数字收紧，传 0 退回「无需求绝不烧包」。
+  packGapMax,
   pickUpFloaters = false,
   pickEveryMs = 0,
   // 农田跟拾荒一样有自己的节奏：作物最快也要 30 分钟成熟，每轮都探测纯属浪费请求，
@@ -463,6 +473,7 @@ export async function runLoop(initialClient, protocol, {
         allowReroll: pickAt(conf, 'allowReroll', allowReroll),
         useSelectPack: pickAt(conf, 'useSelectPack', useSelectPack),
         maxPackPerRound: pickAt(conf, 'maxPackPerRound', maxPackPerRound),
+        packGapMax: pickAt(conf, 'packGapMax', packGapMax),
         pickUpFloaters: pickDue,
         farm: farmDue,
         // 工厂排产的额外需求：货船缺的货（空 Map = 只按订单缺口排）。
@@ -831,22 +842,6 @@ export async function runLoop(initialClient, protocol, {
             shelf: tradeView.shelf,
           });
         }
-        // 静默窗：在航且没指针 → 等靠港；不在贸易时间 → 等开市。两种都不该每 60 秒探一次。
-        if (tradeView.period === 0) {
-          // 本期没开（活动期间之外）：一天看一次就够，别每 60 秒问一遍。
-          tradeSkipUntil = (tradeView.windowOpen ? tradeView.startAt + 86_400 : tradeView.startAt) * 1000;
-          tradeSkipReason = '本期海商王活动未开启';
-        } else if (tradeView.cargo.phase === 'sail' && !(tradeSpeedNow && tradeView.speed.owned > 0)) {
-          tradeSkipUntil = (tradeView.cargo.moveEndTime + 5) * 1000;
-          tradeSkipReason = `航行中（剩 ${Math.ceil(tradeView.cargo.leftSeconds / 60)} 分钟）`;
-        } else if (!tradeView.windowOpen) {
-          tradeSkipUntil = tradeView.startAt * 1000 + 1_000;
-          tradeSkipReason = `不在贸易时间（${new Date(tradeView.startAt * 1000).getHours()} 点开市）`;
-        } else {
-          tradeSkipUntil = 0;
-          tradeSkipReason = '';
-        }
-        tradeSkipNoticedAt = 0;
         if (tradePlan.actions.length > 0) {
           const { results, rejected: stillRejected } = await runWorld(client, protocol, tradePlan, {
             allowMutate,
@@ -858,6 +853,30 @@ export async function runLoop(initialClient, protocol, {
           summary.trade.results = results;
           summary.trade.gain = formatTradeGain(summarizeTrade(results));
         }
+        // ⚠ 静默窗必须放在**执行之后**算。
+        // 领奖（战令免费档 / 联盟任务 / 商情奖励 / 成就）经常带回「海商王加速」= 商会指针，
+        // 而 tradeView.speed.owned 是**探测那一刻**的快照。拿旧快照判「在航且没指针 → 等到靠港」，
+        // 会让刚领到手的指针白等 2 小时（实盘 13:45 领到 2 个，船却仍挂 119 分钟）。
+        // 所以：本轮成功领过奖就先不进静默窗，下一轮重探一次 —— 那时 owned 是新值，能立刻加速靠港。
+        // 领完之后再问会被服务端拒（prompt=35，不算 ok），所以不会无限重探。
+        const gainedReward = tradeGainedReward(summary.trade.results);
+        // 静默窗：在航且没指针 → 等靠港；不在贸易时间 → 等开市。两种都不该每 60 秒探一次。
+        if (tradeView.period === 0) {
+          // 本期没开（活动期间之外）：一天看一次就够，别每 60 秒问一遍。
+          tradeSkipUntil = (tradeView.windowOpen ? tradeView.startAt + 86_400 : tradeView.startAt) * 1000;
+          tradeSkipReason = '本期海商王活动未开启';
+        } else if (tradeView.cargo.phase === 'sail' && !gainedReward
+          && !(tradeSpeedNow && tradeView.speed.owned > 0)) {
+          tradeSkipUntil = (tradeView.cargo.moveEndTime + 5) * 1000;
+          tradeSkipReason = `航行中（剩 ${Math.ceil(tradeView.cargo.leftSeconds / 60)} 分钟）`;
+        } else if (!tradeView.windowOpen) {
+          tradeSkipUntil = tradeView.startAt * 1000 + 1_000;
+          tradeSkipReason = `不在贸易时间（${new Date(tradeView.startAt * 1000).getHours()} 点开市）`;
+        } else {
+          tradeSkipUntil = 0;
+          tradeSkipReason = '';
+        }
+        tradeSkipNoticedAt = 0;
         // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
         lastTradeAt = tickAt;
       } catch (error) {

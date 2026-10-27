@@ -455,6 +455,20 @@ export function planWorld(survey, {
   useSelectPack = true,
   allowPacks = null,
   maxPackPerRound = 500,
+  // 无需求时要不要用自选包把料补上 —— **默认不设门槛（Infinity）**。
+  // 产品策略（2026-10-27 定）：工厂要**无时无刻都在制造**，而不是「缺东西了才制造」。
+  //   ① 有需求（居民订单 / 货船 / 下游缺口）的配方绝对优先（scoreFor 里 ×1e6 的权重）；
+  //   ② 都没需求时，按 pool 顺序一条条往下排，直到该工厂每个产品的存量都顶到上限 50。
+  // 想让 ② 落地，「料不够就不兑」这条必须放开：玻璃这类原料没有任何工厂能产，只能靠包换，
+  // 卡住兑料 = 卡住整条链（1海水厂 lv4 就是这样空了一整天，仓库里躺着 26 万个原料自选包）。
+  //
+  // 所以门槛默认取消，真正的刹车改由这三条守：
+  //   ① 每轮全局 packQuota（maxPackPerRound，默认 500）—— 一轮最多烧 500 个包，永远封顶；
+  //   ② 无需求破例时只排 1 个（packSmallGap → wanted = 1），不拿包把 6 个制造位灌满；
+  //   ③ 产物到存量上限 50 就进不了 pool —— 每个产品最多堆 50 个，烧包有天花板，
+  //      下游一吃就又空出位置，形成自循环，不需要外部需求驱动。
+  // 想收紧：传数字（500 = 一轮额度内兑得齐才兑，20 = 只补零头），0 = 退回「无需求绝不烧包」。
+  packGapMax = Infinity,
   pickUpFloaters = false,
   maxPickups = 50,
   minOrderExp = 0,
@@ -851,6 +865,51 @@ export function planWorld(survey, {
       .sort((a, b2) => scoreFor(b2) - scoreFor(a));
     const costOf = (row) => (row.costItem ?? []).map(([id, n]) => ({ id, num: Number(n) || 0 }));
     const affordable = (row) => costOf(row).every((cost) => free(cost.id) >= cost.num);
+    // 这条配方的缺口折算成「要烧几个自选包」。只给「无需求破例」这条路做判据，不进账本。
+    // 有材料根本没有包能换（比如布匹）时返回 blocked —— 那条配方连破例资格都没有。
+    const gapPacksOf = (row) => {
+      let packs = 0;
+      for (const cost of costOf(row)) {
+        const gap = cost.num - free(cost.id);
+        if (gap <= 0) continue;
+        const pack = packForItem.get(cost.id);
+        if (!pack) return { packs: Infinity, blocked: true, id: cost.id };
+        packs += Math.ceil(gap / (packRate.get(cost.id) ?? 1));
+      }
+      return { packs, blocked: false, id: null };
+    };
+    // 料不够又没排上时，把「为什么没兑包」说清楚。以前这里无条件写「自选包也补不上」，
+    // 结果仓库里躺着 26 万个原料自选包也这么写，看日志的人只能去翻代码
+    // （2026-10-27 1海水厂 空转一整天的日志就是这个）。
+    const whyNoPack = (row) => {
+      if (!useSelectPack) return '，自选包补料已关闭';
+      const lacks = [];
+      for (const cost of costOf(row)) {
+        if (free(cost.id) >= cost.num) continue;
+        const pack = packForItem.get(cost.id);
+        // 余额从「本轮还剩多少」起算，跟 planPacks 同一个口径。
+        const left = pack ? (packLeft.has(pack) ? packLeft.get(pack) : Number(have(pack))) : 0;
+        lacks.push({ id: cost.id, pack, left });
+      }
+      const noPack = lacks.filter((l) => !l.pack).map((l) => l.id);
+      if (noPack.length > 0) return `，${noPack.join('、')} 没有自选包可换`;
+      const empty = lacks.filter((l) => l.left <= 0).map((l) => l.pack);
+      if (empty.length > 0) return `，${empty[0]} 数量不够`;
+      const want = Math.max(0, (demand.get(row.itemId) ?? 0) - queueHeldOf(row.itemId));
+      if (want <= 0) {
+        if (packGapMax <= 0) return '，无需求（小额兜底已关闭）';
+        const gap = gapPacksOf(row);
+        if (gap.blocked) return `，${gap.id} 没有自选包可换`;
+        // 默认 packGapMax = Infinity（不设门槛），此时「缺口大过上限」这条根本不成立，
+        // 走不到就是额度被本轮别的配方吃光了（planPacks 的 quota）。
+        if (packGapMax !== Infinity && gap.packs > packGapMax) {
+          return `，无需求且缺口 ${gap.packs} 个包 > 小额兜底上限 ${packGapMax}`;
+        }
+        return packBudgetPerRound <= 0 ? '，本轮自选包额度已用完' : '，自选包也补不上';
+      }
+      if (packBudgetPerRound <= 0) return '，本轮自选包额度已用完';
+      return '，自选包也补不上';
+    };
     // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
     // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
     const instantOf = (row) => isInstantRecipe({
@@ -866,6 +925,10 @@ export function planWorld(survey, {
     let best = candidates.find((row) => affordable(row)) ?? null;
     let packPlanUsed = null;
     let packTarget = null;
+    // 这次兑换是走「无需求 + 小额缺口」的破例口子进来的：只允许排 1 个。
+    // 瞬成配方一次排满会把刚兑来的料连着烧掉 N 份（N 份 = N 倍包），
+    // 破例的本意是「别让工厂空着」，不是「拿包把制造位灌满」。
+    let packSmallGap = false;
     if (!best && useSelectPack) {
       // 一条都排不了：按优先级逐条试「自选包能不能补齐」，**先找本轮就能兑齐的那一条**。
       // 以前是在第一条有缺口的配方上就 break：缺口 96 的鱼皮（鱼×120）会挡死缺口 6 的生鱼片（鱼×6），
@@ -875,23 +938,40 @@ export function planWorld(survey, {
       // 实测一整夜（每轮都在排、每轮都兑）—— 1金属厂 为产「没人要的铜锭」兑 玻璃×60、
       // 1切鱼厂 兑 鱼×20+碎布×4、1服装厂 兑 塑料×30…一轮上百个包，25 万个也撑不了几十小时。
       // 有需求（居民订单 / 贸易港口货船）时缺口是确定会兑现的，那时候才值得拿包换。
+      //
+      // **产品策略改成「无时无刻都在制造」后（2026-10-27 第二次改）**：上面这条只在
+      // `packGapMax` 收紧时才生效，默认 Infinity = 不拦。此时无需求配方和缺料配方一视同仁，
+      // 靠「每轮 500 额度 + 只排 1 个 + 产物到上限 50」三道刹车兜住。
       let partial = null;
       for (const row of candidates) {
-        if (Math.max(0, (demand.get(row.itemId) ?? 0) - queueHeldOf(row.itemId)) <= 0) continue;
+        const wantOfRow = Math.max(0, (demand.get(row.itemId) ?? 0) - queueHeldOf(row.itemId));
+        // 缺口折算成包数：既做「无需求破例」的判据，也做 partial 的排序依据。
+        const gapCost = packGapMax > 0 ? gapPacksOf(row) : null;
+        let smallGap = false;
+        if (wantOfRow <= 0) {
+          if (!gapCost || gapCost.blocked || gapCost.packs > packGapMax) continue;
+          smallGap = true;
+        }
         const plan = planPacks(costOf(row), `排产 ${b.buildingId} ${row.itemId}`);
         // blocked = 有缺口根本没有包能换（比如布匹），给它兑别的料是白烧，直接跳过这条配方。
         if (plan.blocked || plan.entries.length === 0) continue;
         if (plan.ok) {
           packTarget = row;
           packPlanUsed = plan;
+          packSmallGap = smallGap;
           break;
         }
-        if (!partial) partial = { row, plan };
+        // 一条都兑不齐时**挑缺口最小的那条攒**，而不是排序第一的那条：
+        // 否则缺口 1200 的巨无霸每轮吃掉全部 500 额度，后面缺口 60 的配方永远轮不上，
+        // 「一个个排到都满」就变成了「只喂一条大配方」。缺口越小越先攒够开排。
+        const cost = gapCost && !gapCost.blocked ? gapCost.packs : Infinity;
+        if (!partial || cost < partial.cost) partial = { row, plan, smallGap, cost };
       }
       // 一条都兑不齐 → 退回第一条能部分兑的，把料攒起来（兑出来的料不会退，下轮接着补）。
       if (!packPlanUsed && partial) {
         packTarget = partial.row;
         packPlanUsed = partial.plan;
+        packSmallGap = partial.smallGap;
       }
     }
     if (packPlanUsed) {
@@ -899,7 +979,8 @@ export function planWorld(survey, {
       const gained = packPlanUsed.entries.map((entry) => `${entry.itemId}×${entry.gain}`).join('、');
       if (packPlanUsed.ok) {
         best = packTarget;
-        notes.push(`${b.buildingId} ${best.itemId} 缺料，用自选包补齐后开排（${gained}）`);
+        notes.push(`${b.buildingId} ${best.itemId} 缺料，用自选包补齐后开排（${gained}）`
+          + `${packSmallGap ? `（无需求，但缺口 ≤ ${packGapMax} 个包，按小额兜底只排 1 个）` : ''}`);
       } else {
         notes.push(`${b.buildingId} ${packTarget.itemId} 缺料，本轮先用自选包补 ${gained}`
           + `，还不够，下一轮继续（每轮上限 ${packBudgetPerRound} 个包）`);
@@ -910,12 +991,11 @@ export function planWorld(survey, {
       if (candidates.length === 0) {
         notes.push(`${b.buildingId} 空闲：没有能排的配方（产品到存量上限 ${survey.stockCap} / 等级不够）`);
       } else {
-        const short = candidates
-          .map((row) => costOf(row).filter((cost) => free(cost.id) < cost.num)
-            .map((cost) => `${cost.id} ${free(cost.id)}/${cost.num}`).join(' ')
-            .trim())
-          .find(Boolean) ?? '未知';
-        notes.push(`${b.buildingId} 空闲：料不够（${short}），自选包也补不上`);
+        const shortRow = candidates.find((row) => costOf(row).some((cost) => free(cost.id) < cost.num))
+          ?? candidates[0];
+        const short = costOf(shortRow).filter((cost) => free(cost.id) < cost.num)
+          .map((cost) => `${cost.id} ${free(cost.id)}/${cost.num}`).join(' ') || '未知';
+        notes.push(`${b.buildingId} 空闲：料不够（${short}）${whyNoPack(shortRow)}`);
       }
       continue;
     }
@@ -931,9 +1011,12 @@ export function planWorld(survey, {
     //   - 有**明确需求**（订单 / 货船）时按缺口排，别一次干到 6 个造成过量：
     //     货船要 2 个淡水、排 6 个，多出来的 4 个既占库存也占材料
     const needNow = Math.max(0, (demand.get(best.itemId) ?? 0) - queueHeldOf(best.itemId));
-    const wanted = fillInstantQueue && instant && !headRunning
-      ? (needNow > 0 ? Math.min(openSlots, needNow) : openSlots)
-      : 1;
+    // 走「无需求小额兜底」排上的这条，强制只排 1 个：料是拿包换的，排满等于把包按 N 倍烧。
+    const wanted = packSmallGap
+      ? 1
+      : (fillInstantQueue && instant && !headRunning
+        ? (needNow > 0 ? Math.min(openSlots, needNow) : openSlots)
+        : 1);
     // 这条配方的持有量（仓库 + 待收 + 队列）。pool 已经按同一个 heldOf 过滤过上限，
     // 这里只是把它取出来给循环里的「瞬成排满」再逐份卡上限用。
     const held = heldOf(best.itemId);
