@@ -159,7 +159,7 @@ export const PAGE = `<!doctype html>
       <button id="loop-stop" class="danger">停止</button>
       <span id="loop-hint" class="warn"></span>
     </div>
-    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 锻造 → 海兽培育」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
+    <pre id="loop-view">轮数填 0 表示一直跑。每轮按「任务领取 → 日常 → 海面 → 挂机领取 → 货轮 → 情报 → 海盗 → 锻造 → 海兽培育 → 贸易港口」的顺序重新探测后再执行。钻石与付费礼包永不动，加速只花加速器。
 运行中改完设置**不用停掉重开**：按钮会变成「应用设置」，点一下下一轮就生效（轮数除外，那个要重开）。
 间隔按「本轮开始 → 下一轮开始」算，不会因为某一轮跑得久就整体往后漂；填 0（或小于 5 秒）会按 5 秒处理。
 点「停止」后不会硬中断：当前这一段跑完就退出，所以状态会先显示「正在停止」。
@@ -221,6 +221,31 @@ export const PAGE = `<!doctype html>
 战力余量越大越保守：1.2 表示舰队战力至少是敌方的 1.2 倍才派；战败会掉舰船耐久，修船要资源。
 状态「上次 3 分钟前 · 还差 20 秒」里的时间只在这轮真的探测成功后才更新 —— 探测失败不占用间隔，下一轮立刻重试。</pre>
 
+    <h2>自动海盗讨伐</h2>
+    <div class="bar">
+      <label class="dim" title="派空闲舰队真出战打世界地图上的海盗。每次烧 300 汽油、不掉耐久，收益是首杀奖励 + 固定掉落">
+        <input type="checkbox" id="pirate-on" checked> 自动讨伐海盗
+      </label>
+      <label class="dim">时间间隔 <input id="pirate-every" value="60" style="width:64px"> 秒</label>
+      <label class="dim" title="默认只打「下一个没打过的等级」（有首杀奖励）。勾上才会重复刷已通关等级，那种只有固定掉落">
+        <input type="checkbox" id="pirate-repeat"> 刷已通关等级
+      </label>
+      <button id="pirate-run">立刻讨伐一次</button>
+      <span id="pirate-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="pirate-view">派空闲舰队**真出战**打世界地图上的海盗部队（ChallengePirateRequest）：一艘船打一个海盗，打完击杀记录 +1。
+**跟「免战扫荡」不是一回事**：扫荡是每日任务「累计击败野怪」那条（PirateSweepRequest，一天 10 次，不动舰队也不烧汽油，
+在「日常」页里自动做）；这里是真的把船开出去打。
+**跟「联盟情报」也不是一回事**：情报事件是雷达里刷出来的，有 6 小时时效；这里打的是地图上常驻的海盗部队。
+成本 300 汽油/次（WorldParamCfg「打野怪消耗汽油」），**不掉耐久**（「打野怪消耗耐久」= 0）。
+收益 = 首杀奖励（firstKillReward + 首件装备）+ 每次固定掉落（GOLD 250 + 材料），所以**默认只打没打过的下一个等级**，
+照客户端自动讨伐的口径：每种类型从「已击杀最高等级 + 1」往上找，地图上没有这一级就等刷新。
+勾上「刷已通关等级」才会去打打过的那几级 —— 那种只剩固定掉落，值不值自己判断。
+战力余量沿用「自动情报」那栏那个数（默认 1.2），敌方战力按 **赛季 + 类型 + 等级** 查 WorldPirateCfg
+（同等级不同赛季战力能差 40 倍）。赛季从角色所在的 worldId 算，算不出来时会取各赛季最高战力，宁可不派也不打输。
+**排在货轮和情报后面**：三段抢的是同一批空闲船 —— 货轮错过就没了、情报挂 6 小时还在、海盗没人抢，
+所以它经常看到「0 艘空闲船，这轮不派」，那是正常的。</pre>
+
     <h2>拾荒</h2>
     <div class="bar">
       <label class="dim"><input type="checkbox" id="world-pick" checked> 自动拾荒</label>
@@ -271,6 +296,28 @@ export const PAGE = `<!doctype html>
 排产按「背包 + 打造中」的件数算：哪个部位少就补哪个（英雄每个部位只能穿一件，三个部位要成套）；件数相同时按 武器 → 防具 → 饰品 轮转。
 部位内先试品质最高的配方，材料或金币不够就自动降级 —— 所以紫材料攒够 160 时会自动改造紫装，不用改设置。
 已穿在英雄身上的不计入（那是「已在用」，不是「可分配」）。**永不动钻石、不加速**（SpeedMakeEquipRequest 需要花钻石）。</pre>
+
+    <h2>贸易港口（货轮港口）</h2>
+    <div class="bar">
+      <label class="dim" title="港口最多停靠 3 艘货船，每艘采购 4 种物品。交一格立得玩家经验 + 金币，4 格交完船就出发，几小时后返航、领 4 份藏品奖励">
+        <input type="checkbox" id="cargo-on" checked> 自动贸易
+      </label>
+      <label class="dim">时间间隔 <input id="cargo-every" value="60" style="width:64px"> 秒</label>
+      <button id="cargo-run">立刻交一次货</button>
+      <span id="cargo-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="cargo-view">建筑在 BuildingCfg 里叫「货轮港口」（界面显示「贸易港口」），建好解锁 3 个船位。
+每艘船采购 4 种物品，界面上那个「全部交货」= FillCargoShipRequest{shipIndex, cargoIndex[]}，
+cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够的格子一起交掉。
+供货完成即可得玩家经验 + 金币（奖励写在每个槽位的 reward 上），**4 格交满船就出发**；
+返航时间在 DispCargoShip.arriveTime（**秒**，不是毫秒），到点用 DrawShipRewardRequest{index} 领
+4 份藏品奖励（大师徽章 / 稀有·史诗·传说藏品经验 / 藏品碎片）。
+缺料的格子只提示缺口、**不买货**（客户端那里会弹「购买补齐」，我们不买）；等工厂/农田慢慢补，下一轮自然够。
+**缺的货会通知工厂排产**：货船缺口会并进工厂排产的「需求」（跟居民订单缺口同一张表），
+所以工厂空位会优先产货船要的东西，不用等它自己排到。船都出海时这份需求自动清空。
+**永不动钻石、不用加速器**（SpeedUpShipRequest 要花加速器，没做）。
+排在挂机最后一段：前面几段（交单/排产）先把材料用掉，剩下的才拿来贸易，避免互相抢料。
+间隔填 0 = 每轮都看。</pre>
 
     <h2>海兽培育</h2>
     <div class="bar">
@@ -353,7 +400,7 @@ export const PAGE = `<!doctype html>
       <button id="world-run" class="primary">执行一轮</button>
       <span id="world-hint" class="warn"></span>
     </div>
-    <pre id="world-view">收成品 → 竣工 → 交单 → 给空闲工厂排产（按订单缺口，瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。
+    <pre id="world-view">收成品 → 竣工 → 交单 → 给空闲工厂排产（按需求缺口：居民订单缺的 + 贸易港口货船缺的；队列空时瞬成配方一次排满）→ 收农田 → 播种 → 余料升级建筑。
 「空闲」= 这座工厂的制造队列为空；队列里还有东西在造就完全不碰，所有产品都到存量上限时它就该空着。</pre>
     <div id="world-factories"></div>
     <div id="world-orders"></div>
@@ -882,9 +929,11 @@ const LOOP_FIELDS = [
   'loop-rounds', 'loop-every', 'world-speedup', 'world-reroll',
   'world-pick', 'pick-every', 'world-farm', 'farm-every',
   'loop-radar', 'radar-every', 'radar-ratio',
+  'pirate-on', 'pirate-every', 'pirate-repeat',
   'forge-on', 'forge-every', 'pet-on', 'pet-every', 'pet-quality', 'pet-feed',
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
   'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
+  'cargo-on', 'cargo-every',
 ];
 for (const id of LOOP_FIELDS) {
   const node = $(id);
@@ -916,22 +965,30 @@ function renderLoop(data) {
   syncInterval('pick-every', data.pickEveryMs);
   syncInterval('farm-every', data.farmEveryMs);
   syncInterval('radar-every', data.radarEveryMs);
+  syncInterval('pirate-every', data.pirateEveryMs);
   syncInterval('forge-every', data.forgeEveryMs);
   syncInterval('pet-every', data.petEveryMs);
   syncInterval('idle-every', data.idleEveryMs);
   syncInterval('treasure-every', data.treasureEveryMs);
+  syncInterval('cargo-every', data.cargoEveryMs);
   // 状态行一律按**服务端实际生效**的开关算（未挂机时才看页面勾选）——
   // 页面勾着但服务端关着时，写「还差 20 秒」会误导。
   const gateOn = (id, serverValue) => (data.running && typeof serverValue === 'boolean' ? serverValue : $(id).checked);
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, gateOn('world-pick', data.pickEnabled), data.running);
   renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, gateOn('world-farm', data.farmEnabled), data.running);
   renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, gateOn('loop-radar', data.radarEnabled), data.running);
+  renderGate('pirate-state', data.lastPirateAt, data.pirateEveryMs, gateOn('pirate-on', data.pirateEnabled), data.running);
+  // 运行中把「刷已通关等级」回填（默认关），标脏的不动。
+  if (data.running && typeof data.pirateRepeat === 'boolean' && !loopDirty.has('pirate-repeat')) {
+    $('pirate-repeat').checked = data.pirateRepeat;
+  }
   renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, gateOn('forge-on', data.forgeEnabled), data.running);
   renderGate('pet-state', data.lastPetAt, data.petEveryMs, gateOn('pet-on', data.petEnabled), data.running);
   // 运行中把服务端实际生效的「材料加速」回填（默认开），标脏的不动。
   if (data.running && typeof data.petFeed === 'boolean' && !loopDirty.has('pet-feed')) $('pet-feed').checked = data.petFeed;
   renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, gateOn('idle-on', data.idleEnabled), data.running);
   renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, gateOn('treasure-on', data.treasureEnabled), data.running);
+  renderGate('cargo-state', data.lastCargoAt, data.cargoEveryMs, gateOn('cargo-on', data.cargoEnabled), data.running);
   renderTreasureCount(data, data.history[data.history.length - 1]);
   if (!data.treasureStats) fetchTreasureCountOnce();
   // 运行中把「抢哪些」回填到多选框（默认只勾万吨），标脏的不动。
@@ -981,6 +1038,10 @@ $('loop-start').onclick = async () => {
         // 情报默认开，跟拾荒/农田一样有独立间隔（默认 60 秒）；战力余量越小越激进（战败掉耐久）。
         radar: $('loop-radar').checked,
         radarEverySeconds: Number($('radar-every').value || 0),
+        // 海盗讨伐（真出战）：默认开，60 秒看一眼；只打首杀等级，勾了才刷已通关的。
+        pirate: $('pirate-on').checked,
+        pirateEverySeconds: Number($('pirate-every').value || 0),
+        pirateRepeat: $('pirate-repeat').checked,
         // 锻造默认开，默认 3 分钟看一眼（一件蓝装约 25 分钟；造好不收等于停产）。
         forge: $('forge-on').checked,
         forgeEverySeconds: Number($('forge-every').value || 0),
@@ -998,6 +1059,9 @@ $('loop-start').onclick = async () => {
         treasure: $('treasure-on').checked,
         treasureEverySeconds: Number($('treasure-every').value || 0),
         treasureColors: [3, 4, 5].filter((color) => $('treasure-color-' + color).checked),
+        // 贸易港口（建筑「货轮港口」）默认开，默认 60 秒看一眼：交货换经验金币、返航领藏品奖励。
+        cargo: $('cargo-on').checked,
+        cargoEverySeconds: Number($('cargo-every').value || 0),
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -1045,6 +1109,28 @@ $('idle-run').onclick = async () => {
 
 // 手动「立刻抢一次」：不看间隔，跟挂机里那套完全一样（探测 → 按勾选的等级抢货轮，被占着的也派）。
 // 勾选的等级一起带上：服务端会先存进 session.loop，面板与之后启动的挂机看到的是同一份选择。
+// 手动「立刻讨伐一次」：判据跟挂机里那一段完全一样（战力余量取「自动情报」那栏），只是不等间隔。
+$('pirate-run').onclick = async () => {
+  $('pirate-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/pirates/run', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, repeat: $('pirate-repeat').checked }),
+    });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const done = results.filter((entry) => entry.ok).length;
+    // 注意：这一段在外层模板字符串里，不能写美元大括号或反引号（会被 Node 先求值），
+    // 换行要写成两个反斜杠加 n（输出到浏览器才是换行符）。
+    $('pirate-view').textContent = (data.text || '') + (results.length
+      ? '\\n\\n本次派出 ' + done + ' 艘' + (failed ? '，失败 ' + failed + ' 条（明细见下方日志）' : '')
+      : '\\n\\n这轮没有可派的目标');
+    $('pirate-state').textContent = results.length ? '派出 ' + done + ' 艘' : '没有可打的';
+  } catch (error) {
+    $('pirate-state').textContent = error.message;
+  }
+};
+
 $('treasure-run').onclick = async () => {
   $('treasure-state').textContent = '执行中 ...';
   try {
@@ -1106,6 +1192,24 @@ $('pet-run').onclick = async () => {
     refreshLoop();
   } catch (error) {
     $('pet-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻交一次货」：探测 → 攒够的格子一次交掉 → 到点的船领奖，跟挂机里那套完全一样。
+$('cargo-run').onclick = async () => {
+  $('cargo-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/cargo/run', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : String.fromCharCode(10, 10) + '没有可交的货（料没攒够 / 船在航行 / 还没到返航时间）';
+    $('cargo-view').textContent = (data.text || '') + tail;
+    $('cargo-state').textContent = results.length ? '执行完成' : '没有可交的';
+    refreshLoop();
+  } catch (error) {
+    $('cargo-state').textContent = error.message;
   }
 };
 

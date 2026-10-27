@@ -14,6 +14,7 @@ import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyPirates, viewPirates, planPirates, formatPiratePlan } from './pirate.mjs';
 import { surveyEquip, planEquip, formatEquipPlan, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetPlan, formatPetSummary, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary, mailClaimable, planAfkClaims } from './idle.mjs';
@@ -29,6 +30,17 @@ import {
   DEFAULT_MAX_FLEETS,
   DEFAULT_COLORS,
 } from './treasure.mjs';
+import {
+  surveyCargo,
+  fetchStock,
+  viewCargo,
+  planCargo,
+  formatCargoSummary,
+  summarizeCargo,
+  formatCargoGain,
+  safeCargoDemand,
+  CARGO_SLOTS,
+} from './tradePort.mjs';
 
 const READ_ONLY_PROBES = [
   'AllResourceRequest',
@@ -534,7 +546,9 @@ async function world({ allowMutate, dryRun, allowSpeedUp, allowReroll, useSelect
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyWorld(client, protocol, { config, player: response.playerInfo });
-    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters, farm });
+    // 货船缺口也并进排产需求：CLI 与挂机必须算出同一份计划（贸易港口没建/探测失败时空表）。
+    const cargoDemand = await safeCargoDemand(client, protocol, { stock: survey.stock });
+    const plan = planWorld(survey, { config, allowSpeedUp, allowReroll, useSelectPack, maxPackPerRound, pickUpFloaters, farm, cargoDemand });
     console.log(`\n${formatWorldPlan(survey, plan)}\n`);
     console.log(`共 ${plan.actions.length} 个动作${allowSpeedUp ? '' : '（未开 --speed-up，不会花' + SPEED_UP_ITEM + '）'}`
       + `${pickUpFloaters ? `，含拾荒 ${(survey.floaters ?? []).length} 件漂浮物` : '（未开 --pick，不拾荒）'}`);
@@ -756,6 +770,61 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
   }
 }
 
+// 海盗讨伐（世界地图**真出战**）：按「已击杀最高等级 + 1」找地图上的海盗，派空闲舰队去打。
+// 跟每日任务里的「免战扫荡」（PirateSweepRequest，一天 10 次、不动舰队）是两码事。
+// --dry 只列计划；--yes 才真派（每次烧 300 汽油，不掉耐久）。
+// --repeat 连已通关等级也刷（只剩固定掉落）；--power-ratio 改战力余量；--max N 限制派几艘。
+async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Infinity, repeat = false }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  const response = await client.connect(login);
+  const config = loadConfigSafe();
+  // 赛季要从 worldId 算（战力按 season_type_level 三元组查表），所以必须把 playerInfo 传下去。
+  const player = response.playerInfo ?? null;
+  try {
+    console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}`);
+    const survey = await surveyPirates(client, protocol, { config, player });
+    const view = viewPirates(survey, { config, minPowerRatio, repeat });
+    const plan = planPirates(view, { maxPerRound });
+    console.log(`\n${formatPiratePlan(view, plan)}\n`);
+    const capText = Number.isFinite(Number(maxPerRound)) ? `一次最多派 ${maxPerRound} 艘` : '空闲船全派';
+    console.log(`共 ${plan.actions.length} 个动作（战力余量 ${minPowerRatio}×，${repeat ? '含已通关等级' : '只打首杀等级'}，${capText}）`);
+    if (view.season <= 0) {
+      console.log('注意：拿不到世界赛季（playerInfo 里没有 worldId），战力按各赛季最高值估，偏保守。');
+    }
+
+    if (dryRun) {
+      console.log('--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 900,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+
+    // 只认重新探测的结果：舰队状态和击杀进度都是服务端说了算。
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const after = await surveyPirates(client, protocol, { config, player });
+    const afterView = viewPirates(after, { config, minPowerRatio, repeat });
+    const progress = (one) => one.types.map((type) => `${type.name.replace('海盗', '')}${type.killedLevel}`).join('/');
+    console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
+    console.log(`  击杀进度 ${progress(view)} -> ${progress(afterView)}`);
+    console.log(`  汽油 ${view.petrol} -> ${after.petrol}`);
+  } finally {
+    client.stop();
+  }
+}
+
 // 搁浅的货轮（世界宝藏）：按勾选的等级挑货轮（无人占领的优先，被占着的也派）→ 一条请求把空闲舰队压上去。
 async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
   const { url, login } = loadCredentials();
@@ -802,8 +871,58 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
   }
 }
 
-// 临时验证命令：SetAutoFarmingRequest 到底管什么？
-// 协议里它只有一个 isOn，配置里却同时有「自动潜水」和「自动拾荒」两个 param，
+// 贸易港口（建筑「货轮港口」）：3 艘货船逐格交货换 EXP+金币，返航后领 4 份藏品奖励。
+// 默认只试算（--dry 之外才执行写操作），跟循环里那套完全一样：探测 → 计划 → 执行。
+async function cargoCli({ allowMutate, dryRun }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  try {
+    const response = await client.connect(login);
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const stock = await fetchStock(client, protocol);
+    const survey = await surveyCargo(client, protocol, { stock });
+    const view = viewCargo(survey);
+    const plan = planCargo(view);
+    console.log(`\n${formatCargoSummary(view)}`);
+    for (const ship of view.ships) {
+      console.log(`  货船#${ship.index} ${ship.statusText} 已交 ${ship.filledCount}/${CARGO_SLOTS}`
+        + (ship.phase === 'sailing' ? `  返航剩 ${Math.ceil(ship.leftSeconds / 60)} 分` : '')
+        + (ship.claimable ? '  可领奖' : ''));
+      for (const slot of ship.slots) {
+        console.log(`    [${slot.slot}] ${slot.id}×${slot.num} ${slot.filled ? '已交' : `未交（库存 ${slot.have}）`}`
+          + ` → ${slot.reward.map((r) => `${r.id}×${r.num}`).join(' ')}`);
+      }
+    }
+    console.log(`\n计划 ${plan.actions.length} 条`);
+    for (const action of plan.actions) console.log(`  ${action.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+
+    if (dryRun) {
+      console.log('\n--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    const { results } = await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 900,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+    const gain = formatCargoGain(summarizeCargo(results));
+    if (gain) console.log(`\n${gain}`);
+  } finally {
+    client.stop();
+  }
+}
+
+// 临时验证命令：SetAutoFarmingRequest 到底管什么？// 协议里它只有一个 isOn，配置里却同时有「自动潜水」和「自动拾荒」两个 param，
 // 而海面响应里也有一堆并列的自动开关。所以不猜，发一次，前后各拍一张快照对比：
 // 漂浮物数量掉不掉、autoFarming 变不变 true、三个小游戏等级动不动。
 // 它会改账号状态，因此要 --yes；--off 用来恢复关闭；--wait 控制观察秒数。
@@ -938,6 +1057,8 @@ async function field({ sub, gridIdx, fleets, allowMutate }) {
 // 拾荒另外有自己的间隔（--pick-every，秒；0 = 不限制）。
 // 农田默认开（收成熟作物 + 补种），--no-farm 关；间隔 --farm-every（秒，默认 120）。
 // 联盟情报默认开（领奖 + 派兵），--no-radar 关；间隔 --radar-every（秒，默认 60）。
+// 海盗讨伐默认开（真出战打地图海盗），--no-pirate 关；间隔 --pirate-every（秒，默认 60），
+// --pirate-repeat 连已通关等级也刷（默认只打首杀等级）。
 // 装备厂默认开（收装备 + 锻造），--no-forge 关；间隔 --forge-every（秒，默认 180）。
 // 海兽培育室默认开（收成熟 + 排空位），--no-pet 关；间隔 --pet-every（秒，默认 300），
 // 品质上限 --pet-max-quality（默认 ORANGE，红配方要 season 2 + 100 万金）。
@@ -957,6 +1078,9 @@ async function loopCli({
   farmEverySeconds = 120,
   radarEnabled = true,
   radarEverySeconds = 60,
+  pirateEnabled = true,
+  pirateEverySeconds = 60,
+  pirateRepeat = false,
   forgeEnabled = true,
   forgeEverySeconds = 180,
   petEnabled = true,
@@ -966,6 +1090,9 @@ async function loopCli({
   petFeed = true,
   idleEnabled = true,
   idleEverySeconds = 300,
+  // 贸易港口（建筑「货轮港口」）：3 艘货船逐格交货换 EXP/金币，返航后领藏品奖励。
+  cargoEnabled = true,
+  cargoEverySeconds = 60,
   treasureEnabled = true,
   treasureEverySeconds = 60,
   // 抢哪些货轮等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）；默认只抢万吨。
@@ -993,10 +1120,12 @@ async function loopCli({
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
+    console.log(`海盗=${pirateEnabled ? (pirateEverySeconds > 0 ? `开(每 ${pirateEverySeconds}s 讨伐一次，${pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${minPowerRatio}×)` : `开(每轮都讨伐，${pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${minPowerRatio}×)`) : '关'}`);
     console.log(`锻造=${forgeEnabled ? (forgeEverySeconds > 0 ? `开(每 ${forgeEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`海兽培育=${petEnabled ? (petEverySeconds > 0 ? `开(每 ${petEverySeconds}s 看一眼，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})` : `开(每轮都看，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})`) : '关'}`);
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
+    console.log(`贸易港口=${cargoEnabled ? (cargoEverySeconds > 0 ? `开(每 ${cargoEverySeconds}s 看一眼：逐格交货换经验金币 + 返航领奖)` : '开(每轮都看)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -1014,6 +1143,9 @@ async function loopCli({
       farmEveryMs: Math.max(0, Number(farmEverySeconds) || 0) * 1000,
       radarEnabled,
       radarEveryMs: Math.max(0, Number(radarEverySeconds) || 0) * 1000,
+      pirateEnabled,
+      pirateEveryMs: Math.max(0, Number(pirateEverySeconds) || 0) * 1000,
+      pirateRepeat,
       forgeEnabled,
       forgeEveryMs: Math.max(0, Number(forgeEverySeconds) || 0) * 1000,
       petEnabled,
@@ -1026,13 +1158,15 @@ async function loopCli({
       treasureEveryMs: Math.max(0, Number(treasureEverySeconds) || 0) * 1000,
       treasureColors,
       minPowerRatio,
+      cargoEnabled,
+      cargoEveryMs: Math.max(0, Number(cargoEverySeconds) || 0) * 1000,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'pirate' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure' || entry.phase === 'cargo') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -1227,6 +1361,10 @@ async function main() {
       farmEverySeconds: at('--farm-every', 120),
       radarEnabled: !process.argv.includes('--no-radar'),
       radarEverySeconds: at('--radar-every', 60),
+      pirateEnabled: !process.argv.includes('--no-pirate'),
+      pirateEverySeconds: at('--pirate-every', 60),
+      // 默认只打「没打过的下一个等级」，--pirate-repeat 才刷已通关的。
+      pirateRepeat: process.argv.includes('--pirate-repeat'),
       forgeEnabled: !process.argv.includes('--no-forge'),
       forgeEverySeconds: at('--forge-every', 180),
       petEnabled: !process.argv.includes('--no-pet'),
@@ -1244,6 +1382,9 @@ async function main() {
         ? colorsOf(valueArg('--treasure-colors').split(/[,，\s]+/))
         : DEFAULT_COLORS,
       minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
+      // 贸易港口：--no-cargo 关，--cargo-every 秒（默认 60）。
+      cargoEnabled: !process.argv.includes('--no-cargo'),
+      cargoEverySeconds: at('--cargo-every', 60),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -1296,6 +1437,19 @@ async function main() {
     return;
   }
 
+  if (mode === 'pirates') {
+    await pirateCli({
+      dryRun: process.argv.includes('--dry'),
+      // 战力余量沿用情报那个参数名，省得记两套。
+      minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
+      maxPerRound: numericArg('--max') ?? Infinity,
+      // 默认只打首杀等级（没打过的下一个级别），--repeat 才刷已通关的。
+      repeat: process.argv.includes('--repeat'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
   if (mode === 'treasure') {
     // --colors 3,4,5 是多选（3 蓝小型 / 4 紫中型 / 5 橙万吨）；只给 --min-color 时按「≥ 该等级」换算，
     // 保留旧用法不报错。两个都不给 = 默认只抢万吨（DEFAULT_COLORS）。
@@ -1333,9 +1487,16 @@ async function main() {
     return;
   }
 
-  if (mode === 'idle') {
-    await idleCli({
+  if (mode === 'cargo') {
+    await cargoCli({
       dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'idle') {
+    await idleCli({      dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;

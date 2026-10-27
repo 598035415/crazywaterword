@@ -1,4 +1,5 @@
-// 海面世界的只读探测与计划器：收成品、竣工、建造新建筑、交居民订单、按订单缺口排产、余料升级建筑。
+// 海面世界的只读探测与计划器：收成品、竣工、建造新建筑、交居民订单、按需求缺口排产、余料升级建筑。
+// 「需求缺口」= 居民订单缺的 + 外部传进来的（贸易港口的货船缺口，见 cargoDemand）。
 //
 // 所有事实都来自客户端自身的调用点与配置表，没有推测：
 // - buildingId 形如 "1食品厂" / "1A民居" / "1指标楼A"，即 <序号><可选字母><建筑类型>，
@@ -285,7 +286,22 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
       buildingId,
       type,
       level,
-      factory: raw.factory ?? null,
+      factory: raw.factory
+        ? {
+            ...raw.factory,
+            // 队列项的 finishTime 语义（2026-10-26 实测，别想当然）：
+            //   队列是**串行**的，只有**队首**有真实 finishTime（跑着的>now / 已完成的<=now），
+            //   第 2 项及以后服务端根本不编码这个字段（protobuf 默认 0，省略不写）。
+            //   normalize 成普通对象时原型上的默认 0 丢了 → undefined，
+            //   于是「排队中」和「已完成」分不开。统一补成 0：0 = 还没轮到它。
+            factoryQ: (raw.factory.factoryQ ?? []).map((job) => ({
+              ...job,
+              idx: Number(job.idx ?? 0) || 0,
+              productId: job.productId ?? '',
+              finishTime: Number(job.finishTime) || 0,
+            })),
+          }
+        : null,
       // 农田挂在 building.farm 上：{productId, plantTime, ripeTime}。
       // 空地和「已种下」靠 productId 有无区分，成熟靠 ripeTime <= now。
       // 注意 product.asset 对农田恒为空 —— 作物收获后直接进仓库，不走建筑产物。
@@ -420,7 +436,7 @@ export function planWorld(survey, {
   allowReroll = false,
   useSelectPack = true,
   allowPacks = null,
-  maxPackPerRound = 20,
+  maxPackPerRound = 500,
   pickUpFloaters = false,
   maxPickups = 50,
   minOrderExp = 0,
@@ -435,6 +451,10 @@ export function planWorld(survey, {
   // 农田开关：收成熟作物 + 补种空地。跟拾荒一样由调用方按自己的间隔门控
   // （循环默认 2 分钟看一次），关掉就完全不碰农田。
   farm = true,
+  // 外部需求（Map<itemId, 数量>）：居民订单之外还有谁在等这批货 —— 目前是贸易港口的货船缺口。
+  // 并进排产需求的同一张表（见下面的 demand），所以工厂会优先产它，而不是拿空位去产别的。
+  // 纯函数：不传/传空 Map 就等于旧行为（只认订单缺口）。
+  cargoDemand = null,
 } = {}) {
   const { now, have } = survey;
   const produceReduce = produceReduceSec === null || produceReduceSec === undefined
@@ -449,14 +469,21 @@ export function planWorld(survey, {
   // 兑换关系在 SelectPackLibCfg：itemId = 包，selectItemId = 能换出的材料，num = 每包产出。
   // 协议是 SelectPackRequest { itemId, selectItemId, num }。
   // 只有表里列出的材料才兑得到 —— 缺「布匹」这种不在任何原料包里的东西时，这里查不到就直接跳过。
-  // 一包只顶一个单位，所以它只能补零头（比如订单差 3 个木材），补不了「玻璃差 500」这种大缺口，
-  // 因此每轮消耗上限由 maxPackPerRound 卡住，默认 20。
+  // 每轮消耗上限由 maxPackPerRound 卡住（默认 500：本账号原料自选包 25 万+，
+  // 只给 20 个的话「鱼×120」这种配方要攒 6 轮才兑得齐，工厂干等着）。
+  // 注意额度**只是上限**：真正能兑多少还由各包的实际库存卡住（见下面的 left），
+  // 额度 500 但仓库只有 3 个包时，这一轮就只兑 3 个，绝不会兑出仓库里没有的东西。
   const packs = packIndex(config, { allowPacks });
   const packForItem = new Map([...packs].map(([itemId, entry]) => [itemId, entry.pack]));
   const packRate = new Map([...packs].map(([itemId, entry]) => [itemId, entry.per]));
   const covered = new Map();  // 靠包补到的量，乐观计入库存（兑换动作排在使用它的动作之前）
   const packLeft = new Map(); // 各包本轮还能用几个
+  // 白名单里所有包的实际持有总量：额度不可能花得比这更多，先取 min 免得日志里
+  // 写着「每轮上限 500 个包」而仓库里只有 3 个。
+  const packStockTotal = [...new Set([...packs.values()].map((entry) => entry.pack))]
+    .reduce((sum, pack) => sum + Number(have(pack) ?? 0), 0);
   let packQuota = Math.max(0, Number(maxPackPerRound) || 0);
+  if (packStockTotal > 0) packQuota = Math.min(packQuota, packStockTotal);
   const packBudgetPerRound = packQuota;
 
   // 可用量 = 库存 + 靠包补到的 - 已预留
@@ -486,10 +513,15 @@ export function planWorld(survey, {
         plan.blocked = true;
         continue;
       }
-      if (!left.has(pack)) left.set(pack, Number(have(pack)));
+      // 余额从「本轮还剩多少」起算：同一轮里可能已经为别的配方兑过这个包
+      // （典型：瞬成配方排满，每一份都单独补一次料），直接读 have(pack) 会把已花掉的
+      // 份额重新算一遍 → 兑超额、被服务端拒。packLeft 由 applyPacks 维护。
+      if (!left.has(pack)) {
+        left.set(pack, packLeft.has(pack) ? packLeft.get(pack) : Number(have(pack)));
+      }
       const budget = Math.min(left.get(pack), quota);
       if (budget <= 0) {
-        plan.notes.push(`${label} 缺 ${g.id}，但 ${pack} 数量不够（库存 ${have(pack)}，本轮额度已用完）`);
+        plan.notes.push(`${label} 缺 ${g.id}，但 ${pack} 数量不够（剩 ${left.get(pack)}，额度剩 ${quota}）`);
         plan.ok = false;
         continue;
       }
@@ -728,53 +760,120 @@ export function planWorld(survey, {
   for (const order of survey.orders) {
     for (const m of order.missing) demand.set(m.id, (demand.get(m.id) ?? 0) + m.num);
   }
+  // 贸易港口的货船缺口也并进来。**不额外加权**：两边的诉求是一样的（「仓库里这个东西不够，
+  // 赶紧产」），缺口大的自然排前面。区别只在后果 —— 订单交不出去会掉档，货船交不满不开船，
+  // 但货船常驻、订单会刷新，所以没必要人为压一方。
+  for (const [id, num] of cargoDemand ?? []) {
+    const gap = Math.max(0, Number(num) || 0);
+    if (gap > 0) demand.set(id, (demand.get(id) ?? 0) + gap);
+  }
+  // 日志里要看得到这条链路：否则「工厂为什么突然产这个」只能靠猜。
+  const cargoWants = [...(cargoDemand ?? [])].filter(([, num]) => Number(num) > 0);
+  if (cargoWants.length > 0) {
+    notes.push(`货船需求已并入排产：${cargoWants.map(([id, num]) => `${id}×${num}`).join(' ')}`);
+  }
   const produceRows = rowsOf(config, 'BuildingProduceCfg');
   const instantHints = new Set(survey.produce?.instant ?? []);
-  // 订单缺口的先产，其余按产出时间短的先产（早点回本）。
-  const scoreOf = (row) => (demand.get(row.itemId) ?? 0) * 1e6 - Number(row.produceTime || 0);
+  // **全局在产量**：所有工厂的「待收 + 队列」里这件物品一共有几个。
+  // 存量上限是全局限，不是单厂限 —— 同一件物品可能好几座工厂都能产（配方表按 buildType 分，
+  // 布匹这类材料就不止一座能出）。只算本厂的话，A 厂排了 40 个、B 厂完全看不见，
+  // 照样再排一批，第二个必被服务端 `storage full` 拒。
+  // finishedProducts[].num 是 protobuf int64（可能是 {low,high} 对象），必须走 assetCount，
+  // 裸 Number() 会得到 NaN，然后 heldOf 一路 NaN、`held < stockCap` 恒 false → 配方全被过滤掉。
+  const globalPending = new Map();
+  for (const other of survey.factories ?? []) {
+    for (const asset of other.factory?.finishedProducts ?? []) {
+      globalPending.set(asset.id, (globalPending.get(asset.id) ?? 0) + assetCount(asset.num));
+    }
+    for (const job of other.factory?.factoryQ ?? []) {
+      globalPending.set(job.productId, (globalPending.get(job.productId) ?? 0) + 1);
+    }
+  }
+  const pendingOf = (itemId) => globalPending.get(itemId) ?? 0;
+  // 持有量 = 仓库 + 全球在产（跟服务端判 storage full 的口径一致）。
+  const globalHeldOf = (itemId) => have(itemId) + pendingOf(itemId);
+  // 需求的排序权重在每座工厂里现算（要扣掉这座工厂「已经在产」的量，见下面的 scoreFor）——
+  // 同一个物品在 A 厂已经排了 2 个、在 B 厂一个没排，两边的优先级不该一样。
   for (const b of survey.factories) {
     if (b.factory.autoProductId) {
       notes.push(`${b.buildingId} 已设自动生产 ${b.factory.autoProductId}，不覆盖`);
       continue;
     }
-    const queue = b.factory.factoryQ ?? [];
-    // 没在生产东西才补。队列非空 = 有活（可能是我们上一轮排的，也可能是用户手动排的）。
-    if (queue.length > 0) continue;
     const slots = Math.max(0, Number(survey.factorySlots) || 0);
     if (slots === 0) continue;
-    // 产品持有量 = 仓库 + 这个工厂待收的 + 队列里排着的 —— 跟服务端判 storage full 的口径一致。
-    // 存量上限的过滤必须用它，不能只看仓库：仓库没满但工厂已囤满时，只按仓库过滤会把这条配方
-    // 当成"可排"，循环里再 break，结果最优先的那条配方一条占住位置，后面真正能排的配方永远轮不到，
-    // 整座工厂长期空转。
-    const heldOf = (itemId) => have(itemId)
-      + (b.factory.finishedProducts ?? [])
-        .filter((asset) => asset.id === itemId)
-        .reduce((sum, asset) => sum + Number(asset.num ?? 0), 0)
-      + queue.filter((job) => job.productId === itemId).length;
+    const queue = b.factory.factoryQ ?? [];
+    // 队列是**串行**的：只有队首真的在产，第 2 项及以后都只是排着队（服务端连 finishTime 都不给）。
+    // 所以「队列里有没有活」不能看 queue.length，要看**队首**：
+    //   队首在跑 / 未排上时间 —— 这一轮新排的东西只会排到它后面等，排瞬成也一样等
+    //                            （实测 2026-10-26：1服装厂 队首是 45 分钟的鱼皮鞋，
+    //                             后面堆了 4 个瞬成，全都得等它跑完才逐个落地）
+    //   队首已完成 / 空队列    —— 瞬成才是真的「排下去就出货」，一次排满剩余空位
+    const head = queue[0] ?? null;
+    const headFinish = head ? Number(head.finishTime) || 0 : 0;
+    // `> now` = 还在跑，`<= now` = 已完成（服务端会自己搬进待收）。
+    // `finishTime = 0` 是「这条队列还没被服务端排上时间」（刚排完还没结算），也按忙处理。
+    const headRunning = head ? (headFinish === 0 || headFinish > now) : false;
+    const openSlots = Math.max(0, slots - queue.length);
+    if (openSlots === 0) continue;
+    // 持有量 / 在产量统一走全局口径（见上面 globalHeldOf / pendingOf）：
+    // 单厂视角会让两座都能产同一件物品的工厂各排一批，服务端直接回 `storage full`。
+    const heldOf = globalHeldOf;
+    const queueHeldOf = pendingOf;
+    // 排序权重：**有效需求**（缺口 - 这座工厂已经在产的量）优先，其余按产出时间短的先排（早点回本）。
+    // 扣掉在产的量很关键：货船要 2 个淡水、1海水厂 队列里已经排了 2 个，这时「淡水」不该
+    // 还压着别的配方排第一 —— 那样每轮都会再排一个，直接干到存量上限。
+    const scoreFor = (row) => Math.max(0, (demand.get(row.itemId) ?? 0) - queueHeldOf(row.itemId)) * 1e6
+      - Number(row.produceTime || 0);
     // pool = 等级够 + 未到存量上限的配方，**不看料**，按优先级排好。
     // 之后再分成两条路：料够的直接排（老行为）；一条都不够时，按优先级逐条试算「自选包能不能补齐」，
     // 只给**真正要排的那一条**兑料 —— 不能给整池子都兑，那会把包烧在没有意义的配方上。
     const pool = produceRows
       .filter((row) => row.buildType === b.type && row.unlockLevel <= b.level)
       .filter((row) => (survey.stockCap > 0 ? heldOf(row.itemId) < survey.stockCap : true))
-      .sort((a, b2) => scoreOf(b2) - scoreOf(a));
+      .sort((a, b2) => scoreFor(b2) - scoreFor(a));
     const costOf = (row) => (row.costItem ?? []).map(([id, n]) => ({ id, num: Number(n) || 0 }));
     const affordable = (row) => costOf(row).every((cost) => free(cost.id) >= cost.num);
+    // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
+    // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
+    const instantOf = (row) => isInstantRecipe({
+      finalSeconds: produceFinalTime(row.produceTime, produceReduce),
+      hint: instantHints.has(`${b.type}\u0000${row.itemId}`),
+    });
+    // 队首还在跑的时候也可以排，但**只排 1 个**（见下面的 wanted）：
+    // 空位闲着才是真浪费，而排 1 个只占 1/6 容量，不会像「排满」那样把 5 个位全堆成排队项
+    // （实测 2026-10-26：1服装厂 队首 45 分钟的鱼皮鞋后面堆了 4 个瞬成，全得等它跑完）。
+    // 有需求的配方靠 scoreFor 里的需求加权自然排在最前面，不用在这儿过滤。
+    const candidates = pool;
 
-    let best = pool.find((row) => affordable(row)) ?? null;
+    let best = candidates.find((row) => affordable(row)) ?? null;
     let packPlanUsed = null;
     let packTarget = null;
-    if (!best && useSelectPack && pool.length > 0) {
-      // 一条都排不了：按优先级找第一条「缺口全部有包可换」的配方，只给它补料。
-      // 额度不够一轮补满时**也要落账** —— 兑出来的料不会退，留着下一轮接着补。
-      // 不落账的话，43 的缺口撞上每轮 20 的额度会永远停在「一个都兑不出」，鱼油这类配方再也排不上。
-      for (const row of pool) {
+    if (!best && useSelectPack) {
+      // 一条都排不了：按优先级逐条试「自选包能不能补齐」，**先找本轮就能兑齐的那一条**。
+      // 以前是在第一条有缺口的配方上就 break：缺口 96 的鱼皮（鱼×120）会挡死缺口 6 的生鱼片（鱼×6），
+      // 工厂被排在最前面的大配方钉死，永远等料。现在兑不齐的先记着，继续往后找能兑齐的。
+      //
+      // **没有需求的配方不烧包**（2026-10-27 加）：工厂空着不损失任何东西，包是真金白银攒出来的。
+      // 实测一整夜（每轮都在排、每轮都兑）—— 1金属厂 为产「没人要的铜锭」兑 玻璃×60、
+      // 1切鱼厂 兑 鱼×20+碎布×4、1服装厂 兑 塑料×30…一轮上百个包，25 万个也撑不了几十小时。
+      // 有需求（居民订单 / 贸易港口货船）时缺口是确定会兑现的，那时候才值得拿包换。
+      let partial = null;
+      for (const row of candidates) {
+        if (Math.max(0, (demand.get(row.itemId) ?? 0) - queueHeldOf(row.itemId)) <= 0) continue;
         const plan = planPacks(costOf(row), `排产 ${b.buildingId} ${row.itemId}`);
         // blocked = 有缺口根本没有包能换（比如布匹），给它兑别的料是白烧，直接跳过这条配方。
         if (plan.blocked || plan.entries.length === 0) continue;
-        packTarget = row;
-        packPlanUsed = plan;
-        break;
+        if (plan.ok) {
+          packTarget = row;
+          packPlanUsed = plan;
+          break;
+        }
+        if (!partial) partial = { row, plan };
+      }
+      // 一条都兑不齐 → 退回第一条能部分兑的，把料攒起来（兑出来的料不会退，下轮接着补）。
+      if (!packPlanUsed && partial) {
+        packTarget = partial.row;
+        packPlanUsed = partial.plan;
       }
     }
     if (packPlanUsed) {
@@ -790,10 +889,10 @@ export function planWorld(survey, {
     }
     if (!best) {
       // 空闲是正常状态，但原因要分开写：全到上限 / 料不够补不上 —— 否则用户看不出该做什么。
-      if (pool.length === 0) {
+      if (candidates.length === 0) {
         notes.push(`${b.buildingId} 空闲：没有能排的配方（产品到存量上限 ${survey.stockCap} / 等级不够）`);
       } else {
-        const short = pool
+        const short = candidates
           .map((row) => costOf(row).filter((cost) => free(cost.id) < cost.num)
             .map((cost) => `${cost.id} ${free(cost.id)}/${cost.num}`).join(' ')
             .trim())
@@ -804,14 +903,19 @@ export function planWorld(survey, {
     }
     // 兑换动作已在上面的 applyPacks 里推进 actions，位置就在排产动作之前（数组顺序即执行顺序）。
     const need = demand.get(best.itemId) ?? 0;
-    // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
-    // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
     const finalSeconds = produceFinalTime(best.produceTime, produceReduce);
-    const instant = isInstantRecipe({
-      finalSeconds,
-      hint: instantHints.has(`${b.type}\u0000${best.itemId}`),
-    });
-    const wanted = fillInstantQueue && instant ? slots : 1;
+    const instant = instantOf(best);
+    // 一次排几个：瞬成 + **队列空** → 把剩余空位排满（每一份都真的立刻完成）；
+    // 队首还在跑 → 只排 1 个（排多了只是往队尾堆一堆排队项，全在等队首，还把位置占满）。
+    // 一次排几个：
+    //   - 队首还在跑 → **1 个**（多排只是往队尾堆排队项，全在等队首）
+    //   - 队列空/队首已完成 → 瞬成配方把剩余空位排满；非瞬成仍只 1 个
+    //   - 有**明确需求**（订单 / 货船）时按缺口排，别一次干到 6 个造成过量：
+    //     货船要 2 个淡水、排 6 个，多出来的 4 个既占库存也占材料
+    const needNow = Math.max(0, (demand.get(best.itemId) ?? 0) - queueHeldOf(best.itemId));
+    const wanted = fillInstantQueue && instant && !headRunning
+      ? (needNow > 0 ? Math.min(openSlots, needNow) : openSlots)
+      : 1;
     // 这条配方的持有量（仓库 + 待收 + 队列）。pool 已经按同一个 heldOf 过滤过上限，
     // 这里只是把它取出来给循环里的「瞬成排满」再逐份卡上限用。
     const held = heldOf(best.itemId);
@@ -823,8 +927,23 @@ export function planWorld(survey, {
     let planned = 0;
     for (let k = 0; k < wanted; k += 1) {
       // 每排一个都要再扣一次料：瞬成排满 = 同一配方连着烧 N 份材料。
-      if (!(best.costItem ?? []).every(([id, n]) => free(id) >= n)) {
-        const short = (best.costItem ?? []).filter(([id, n]) => free(id) < n).map(([id, n]) => `${id} ${free(id)}/${n}`).join(' ');
+      // 料不够时**先试着用自选包补这一份**（额度还有、并且这个配方**有需求**才补）——
+      // 以前这里是直接 break，结果挑中的配方只排得动前几个就停（生鱼片 6 个只排 4 个）。
+      // 「有需求」这条与下面的兜底路径保持一致：没需求的配方不烧包，否则一整夜每轮都往
+      // 没人要的产品上砸几百个包。
+      let shortCosts = (best.costItem ?? []).filter(([id, n]) => free(id) < n);
+      if (shortCosts.length > 0 && useSelectPack && needNow > 0) {
+        const plan = planPacks(costOf(best), `排产 ${b.buildingId} ${best.itemId}`);
+        if (plan.entries.length > 0) {
+          applyPacks(plan, `排产 ${b.buildingId} ${best.itemId}`);
+          notes.push(`${b.buildingId} ${best.itemId} 第 ${k + 1} 个缺料，用自选包补 `
+            + `${plan.entries.map((entry) => `${entry.itemId}×${entry.gain}`).join('、')}`
+            + (plan.ok ? '' : '（本轮额度还没兑够，下轮继续）'));
+        }
+        shortCosts = (best.costItem ?? []).filter(([id, n]) => free(id) < n);
+      }
+      if (shortCosts.length > 0) {
+        const short = shortCosts.map(([id, n]) => `${id} ${free(id)}/${n}`).join(' ');
         notes.push(`${b.buildingId} ${best.itemId} 排到第 ${k + 1} 个材料不够（${short}），本座工厂本轮排 ${k} 个`);
         break;
       }
@@ -835,6 +954,9 @@ export function planWorld(survey, {
       }
       for (const [id, n] of best.costItem ?? []) reserve(id, n);
       planned += 1;
+      // 本轮排出去的也要记进全局在产量：同一件物品可能后面还有另一座工厂也要产，
+      // 不记账的话两座会各排一批，合计超存量上限，第二个必被 `storage full` 拒。
+      globalPending.set(best.itemId, pendingOf(best.itemId) + 1);
       actions.push({
         kind: 'startProduce',
         request: 'StartFactoryProduceRequest',
@@ -849,10 +971,10 @@ export function planWorld(survey, {
         transient: true,
         label: `排产 ${b.buildingId} -> ${best.itemId}（${timeText}`
           + `${wanted > 1 ? `，第 ${k + 1}/${wanted} 个` : ''}`
-          + `${costText ? `，耗 ${costText}` : ''}${need ? `，订单缺 ${need}` : ''}）`,
+          + `${costText ? `，耗 ${costText}` : ''}${need ? `，需求 ${need}` : ''}）`,
       });
     }
-    if (planned > 1) notes.push(`${b.buildingId} 瞬成配方 ${best.itemId} 一次排了 ${planned} 个，队列已排满`);
+    if (planned > 1) notes.push(`${b.buildingId} 瞬成配方 ${best.itemId} 一次排了 ${planned} 个（队列空，每一份都能立刻完成）`);
   }
 
   // 5.5 农田：熟的一次批量收，空出来的地一次批量播。

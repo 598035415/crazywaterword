@@ -965,10 +965,96 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const slow = planWorld(surveyFor({ seaweed: 9, reduce: 0 }), { config });
   assert.equal(producesOf(slow).length, 1, 'a non-instant recipe is still queued one at a time');
   assert.equal(producesOf(slow)[0].body.productId, '鱼', 'the shorter recipe is still preferred');
-  // 队列里还有东西在造：这座工厂完全不碰 —— 只有「没在生产东西」才补，
-  // 这样也不会把用户手动排的队插花。
-  const busy = planWorld(surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }] }), { config });
-  assert.equal(producesOf(busy).length, 0, 'a factory that is still producing is left alone');
+  // 队列非空但**没满**：只补「瞬成」配方到剩余空位。
+  // 以前是队列非空就整座跳过，实测切鱼厂排了个 32 分钟的鱼皮之后 5 个制造位空着半小时，
+  // 生鱼片/鱼肠线这些瞬成配方全被挡住；而长配方往正在跑的队列后面塞等于把料压死，所以只放瞬成的。
+  // 队列是**串行**的：只有队首真的在产，第 2 项及以后只是排队（服务端连 finishTime 都不编码）。
+  // 所以「队首还在跑」时**一单都不排** —— 新排的东西只能排到队尾等，瞬成也不例外。
+  // 实测 2026-10-26：1服装厂 队首是 70 分钟的鱼皮鞋，后面堆了 4 个瞬成，全在等它跑完。
+  const busyQueue = [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }];
+  const busy = planWorld(surveyFor({ seaweed: 9, queue: busyQueue }), { config });
+  assert.equal(producesOf(busy).length, 1, '队首在跑时只排 1 个（不批量堆队列）');
+  assert.equal(producesOf(busy)[0].body.productId, '鱼', '没需求时排时间最短的（鱼 300s）');
+  // 队首已经完成（finishTime <= now）：视同空闲，瞬成把剩余空位排满。
+  const doneQueue = [{ idx: 1, productId: '烤鱼', finishTime: 500 }];
+  const headDone = planWorld(surveyFor({ seaweed: 9, queue: doneQueue }), { config });
+  assert.equal(producesOf(headDone).length, 5, '队首已完成 → 剩下 5 个空位排满瞬成');
+  assert.ok(producesOf(headDone).every((action) => action.body.productId === '鱼'), '排的是瞬成的鱼');
+  // 队首 finishTime = 0 = 服务端还没给这条队列排上时间（刚排完没结算），也按忙处理。
+  const queuedHead = [{ idx: 1, productId: '烤鱼', finishTime: 0 }];
+  const zeroHead = planWorld(surveyFor({ seaweed: 9, queue: queuedHead }), { config });
+  assert.equal(producesOf(zeroHead).length, 1, '队首 finishTime=0（还没排上时间）也按忙处理，只排 1 个');
+
+  // 例外：**有明确需求的配方**（订单缺口 / 货船缺口）在队首还在跑时也要排进去 ——
+  // 反正都要排队，那就排确定要用的那条，而不是干等着。一轮 1 个，不批量。
+  const busyDemandSurvey = surveyFor({ seaweed: 9, queue: busyQueue });
+  busyDemandSurvey.stock.set('鱼', 4);
+  // 队列里已经有 2 个烤鱼，所以需求得给到 4 才算「还没填满」。
+  const busyDemand = planWorld(busyDemandSurvey, { config, cargoDemand: new Map([['烤鱼', 4]]) });
+  assert.equal(producesOf(busyDemand).length, 1, '队首在跑时，有需求的配方也只排 1 个');
+  assert.equal(producesOf(busyDemand)[0].body.productId, '烤鱼', '排的是有需求的那条，不是瞬成的鱼');
+  // 队列空 + 有需求 + 瞬成配方：按缺口排，不排满空位（货船要 2 个就产 2 个，多产的既占库存也占材料）。
+  const gapSurvey = surveyFor({ seaweed: 9 });
+  const gapPlan = planWorld(gapSurvey, { config, cargoDemand: new Map([['鱼', 2]]) });
+  assert.equal(producesOf(gapPlan).length, 2, '货船要 2 个 → 瞬成也只排 2 个（不排满 6 个空位）');
+  assert.ok(producesOf(gapPlan).every((action) => action.body.productId === '鱼'), '排的是货船要的那条');
+  // finishedProducts 的 num 是 protobuf int64：可能是 {low,high} 对象。裸 Number() 会 NaN，
+  // 然后 heldOf 一路 NaN、`held < stockCap` 恒 false → 整座工厂的配方全被过滤掉（排不了产）。
+  const int64Survey = surveyFor({ seaweed: 9 });
+  const int64Factory = { ...int64Survey.factories[0].factory, finishedProducts: [{ type: 'product', id: '鱼', num: { low: 50, high: 0 } }] };
+  int64Survey.factories[0].factory = int64Factory;
+  int64Survey.buildings[0].factory = int64Factory;
+  const int64Plan = planWorld(int64Survey, { config });
+  assert.equal(producesOf(int64Plan).length, 0, 'int64 形状的待收量要算进持有量（50/50 已到上限）');
+
+  // 存量上限是**全局限**：同一件物品可能好几座工厂都能产。
+  // 只算本厂的话，A 厂待收 48 个、B 厂完全看不见，照样再排 6 个 → 服务端回 storage full。
+  const crossSurvey = surveyFor({ seaweed: 9 });
+  crossSurvey.factories[0].factory.finishedProducts = [{ type: 'product', id: '鱼', num: 48 }];
+  const twin = {
+    ...crossSurvey.factories[0],
+    buildingId: '2切鱼厂',
+    factory: { factoryQ: [], finishedProducts: [], autoProductId: '' },
+  };
+  crossSurvey.factories.push(twin);
+  crossSurvey.buildings.push(twin);
+  const crossPlan = planWorld(crossSurvey, { config });
+  assert.equal(producesOf(crossPlan).length, 2,
+    '两座工厂合计只能再排 2 个（48/50），不是各排一批');
+  // 需求已经被「在产」的那批填上时不再重复排（demand 是缺口，队列/待收要算进去）。
+  const coveredSurvey = surveyFor({ seaweed: 9, queue: busyQueue });
+  coveredSurvey.stock.set('鱼', 4);
+  const covered = planWorld(coveredSurvey, { config, cargoDemand: new Map([['烤鱼', 2]]) });
+  assert.equal(producesOf(covered).some((action) => action.body.productId === '烤鱼'), false,
+    '队列里已经排了 2 个烤鱼 → 缺口填满，不再重复排');
+
+  // 贸易港口的货船缺口并进排产需求（cargoDemand）：工厂先产「货船要的」，而不是「时间最短的」。
+  // 没有这条路时，货船缺的东西只能干等工厂哪天顺手排到它，船就一直不走。
+  const cargoStock = () => surveyFor({ seaweed: 9, reduce: 0 });
+  const baselineSurvey = cargoStock();
+  baselineSurvey.stock.set('鱼', 4);
+  const baseline = planWorld(baselineSurvey, { config });
+  assert.equal(producesOf(baseline)[0].body.productId, '鱼', '没有额外需求时先排时间最短的（鱼 300s）');
+  const wantedSurvey = cargoStock();
+  wantedSurvey.stock.set('鱼', 4);
+  const wanted = planWorld(wantedSurvey, { config, cargoDemand: new Map([['烤鱼', 2]]) });
+  assert.equal(wanted.actions.find((a) => a.kind === 'startProduce').body.productId, '烤鱼',
+    '货船要烤鱼时先排烤鱼（缺口 ×1e6 压过时间差）');
+  const zeroSurvey = cargoStock();
+  zeroSurvey.stock.set('鱼', 4);
+  const zeroDemand = planWorld(zeroSurvey, { config, cargoDemand: new Map([['烤鱼', 0]]) });
+  assert.equal(zeroDemand.actions.find((a) => a.kind === 'startProduce').body.productId, '鱼',
+    '缺口 0 不参与排序（不能靠列一条 0 需求把某个配方顶上来）');
+  // 不传 / 传空表 = 旧行为，不能再有别的副作用。
+  const noDemand = planWorld(cargoStock(), { config, cargoDemand: null });
+  assert.equal(producesOf(noDemand).length, 1, 'cargoDemand 不传时行为不变');
+  const busySlow = planWorld(surveyFor({ seaweed: 9, reduce: 0, queue: busyQueue }), { config });
+  assert.equal(producesOf(busySlow).length, 1, '队首在跑 + 没有瞬成配方：也只排 1 个（不当成空闲批量排）');
+  const busyFull = planWorld(surveyFor({
+    seaweed: 9,
+    queue: Array.from({ length: 6 }, (_, i) => ({ idx: i + 1, productId: '烤鱼', finishTime: 5000 })),
+  }), { config });
+  assert.equal(producesOf(busyFull).length, 0, '队列排满 = 没位置，一个都不排');
   // 所有产品都到上限 → 空闲是正常状态，notes 里要说明原因（候选被过滤 / 循环里被 held 卡住都算）。
   assert.ok(noRoom.notes.some((note) => note.includes('空闲') || note.includes('上限')),
     'an idle factory says why');
@@ -1817,7 +1903,9 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 
   // 额度不够一轮补满（缺口 43 > 每轮 20）：只兑 20、本轮不排，但**必须落账**（下轮接着补）。
   // 不落账的话 43 的缺口永远兑不出，鱼油这条配方就再也排不上了。
-  const partial = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 20 });
+  // 有需求才值得烧包：这是「贸易港口货船在等鱼油」的场景。
+  const wantsOil = { cargoDemand: new Map([['鱼油', 999]]) };
+  const partial = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 20, ...wantsOil });
   assert.equal(packsOf(partial).length, 1, '缺口能兑时排产会先兑料');
   assert.equal(packsOf(partial)[0].body.selectItemId, '鱼', '兑的是缺的那个材料');
   assert.equal(packsOf(partial)[0].body.num, 20, '每轮额度 20 卡住，不会一次兑 43');
@@ -1825,7 +1913,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(partial.notes.some((n) => n.includes('下一轮继续')), '要说明这是分轮补，不是不干了');
 
   // 额度够 → 兑 43 补齐再排，且兑换排在排产前面（数组顺序即执行顺序）。
-  const full = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 100 });
+  const full = planWorld(surveyFor({ stock: rich }), { config, maxPackPerRound: 100, ...wantsOil });
   assert.equal(packsOf(full)[0].body.num, 43, '缺 43 就兑 43');
   assert.ok(full.actions.findIndex((a) => a.kind === 'selectPack') < full.actions.findIndex((a) => a.kind === 'startProduce'),
     '兑换必须排在排产之前');
@@ -1833,7 +1921,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(full.notes.some((n) => n.includes('用自选包补齐后开排')), '日志要说清料是兑出来的');
 
   // 分轮累积的最后一轮：只剩 3 个缺口 → 兑 3 个就能排。
-  const nearly = planWorld(surveyFor({ stock: { ...rich, 鱼: 47 } }), { config, maxPackPerRound: 20 });
+  const nearly = planWorld(surveyFor({ stock: { ...rich, 鱼: 47 } }), { config, maxPackPerRound: 20, ...wantsOil });
   assert.equal(packsOf(nearly)[0].body.num, 3, '只补剩下的缺口');
   assert.equal(producesOf(nearly).length, 1, '这一轮就能排上了');
 
@@ -1848,7 +1936,8 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const blockedConfig = { tables: { ...config.tables, BuildingProduceCfg: { data: [
     { buildType: '切鱼厂', itemId: '鱼皮', produceTime: 2700, unlockLevel: 1, costItem: [['鱼', 120], ['布匹', 80]] },
   ] } } };
-  const blocked = planWorld(surveyFor({ stock: { 鱼: 7, 布匹: 0, 原料自选包: 253_516 } }), { config: blockedConfig });
+  const blocked = planWorld(surveyFor({ stock: { 鱼: 7, 布匹: 0, 原料自选包: 253_516 } }),
+    { config: blockedConfig, cargoDemand: new Map([['鱼皮', 999]]) });
   assert.equal(packsOf(blocked).length, 0, '有换不出来的材料就不兑（免得白烧包）');
   assert.equal(producesOf(blocked).length, 0, '也不排');
   assert.ok(blocked.notes.some((n) => n.includes('自选包也补不上')), '原因要写清楚');
@@ -1862,6 +1951,69 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   });
   assert.equal(packsOf(cheapFirst).length, 0, '能免费排的配方先排，不为它兑料');
   assert.equal(producesOf(cheapFirst)[0].body.productId, '生鱼片', '优先排料够的那条');
+
+  // 缺口大的配方不许挡住缺口小的：鱼皮（鱼×120，缺口 120 > 每轮 20）排在生鱼片（鱼×6）前面时，
+  // 以前在鱼皮上就 break 了 —— 兑 20 个鱼、本轮不排、下一轮又兑 20，生鱼片永远轮不上。
+  // 现在先扫一遍找「本轮能兑齐」的，鱼皮跳过，直接排生鱼片。
+  const bigFirst = { tables: { ...config.tables, BuildingProduceCfg: { data: [
+    { buildType: '切鱼厂', itemId: '鱼皮', produceTime: 60, unlockLevel: 1, costItem: [['鱼', 120]] },
+    { buildType: '切鱼厂', itemId: '生鱼片', produceTime: 90, unlockLevel: 1, costItem: [['鱼', 6]] },
+  ] } } };
+  const skipBig = planWorld(surveyFor({ stock: { 鱼: 0, 原料自选包: 500 } }), {
+    config: bigFirst, maxPackPerRound: 20,
+    cargoDemand: new Map([['鱼皮', 1], ['生鱼片', 1]]),
+  });
+  assert.equal(producesOf(skipBig)[0]?.body.productId, '生鱼片', '兑不齐的大配方要跳过，先排本轮能兑齐的');
+  assert.equal(packsOf(skipBig).length, 1, '只为真正要排的那条兑料');
+  assert.equal(packsOf(skipBig)[0].body.num, 6, '兑的是生鱼片的 6 个鱼，不是鱼皮的 120');
+  assert.ok(!packsOf(skipBig).some((action) => action.body.num > 20), '不会给排不上的大配方兑一堆料');
+
+  // 瞬成排满时每一份都要能继续补料：以前只判一次「这条配方料够不够」，
+  // 于是 鱼 7 + 6 个制造位 = 只排得动 1 个（剩下的直接 break），空位白空着。
+  const refillSurvey = surveyFor({ stock: { 鱼: 7, 原料自选包: 500 } });
+  // 774 秒减免 → 90 秒的生鱼片是瞬成配方，才会走「排满 6 个」那条路。
+  refillSurvey.produce = { reduce: 774, instant: [], source: 'appoint' };
+  const refill = planWorld(refillSurvey, {
+    config: { tables: { ...config.tables, BuildingProduceCfg: { data: [
+      { buildType: '切鱼厂', itemId: '生鱼片', produceTime: 90, unlockLevel: 1, costItem: [['鱼', 6]] },
+    ] } } },
+    maxPackPerRound: 100,
+    // 有需求才补料：没需求的配方不烧自选包（见 planWorld 里那条规则）。
+    cargoDemand: new Map([['生鱼片', 999]]),
+  });
+  assert.equal(producesOf(refill).length, 6, '瞬成配方要把 6 个制造位排满（料不够的那几份拿包补）');
+  // 第 1 份用库存里的 6 个鱼，第 2 份只缺 5（还剩 1 个），后面 4 份各缺 6 → 5 + 6×4 = 29 个包。
+  assert.equal(packsOf(refill).reduce((n, action) => n + action.body.num, 0), 29,
+    '缺多少补多少：第 2 份缺 5，其余 4 份各缺 6');
+  // 兑换动作必须夹在「用它之前那次排产」和「它支撑的那次排产」之间（数组顺序即执行顺序）。
+  const firstProduce = refill.actions.findIndex((action) => action.kind === 'startProduce');
+  const secondProduce = refill.actions.findIndex((action, i) => action.kind === 'startProduce' && i > firstProduce);
+  const firstPack = refill.actions.findIndex((action) => action.kind === 'selectPack');
+  assert.ok(firstPack > firstProduce && firstPack < secondProduce,
+    `补料要排在它支撑的那次排产之前（produce#${firstProduce} < pack#${firstPack} < produce#${secondProduce}）`);
+
+  // 额度默认 500，但**不能超过仓库里真实的包数**：包只有 20 个时，本轮最多烧 20 个，
+  // 日志里也要写真实值（每轮上限 20 个包），不能写着 500 骗人。
+  const stockBound = planWorld(surveyFor({ stock: { 鱼: 0, 玻璃: 0, 原料自选包: 20 } }), { config, ...wantsOil });
+  assert.ok(stockBound.notes.some((n) => n.includes('每轮上限 20 个包')), '额度会被实际库存压下来');
+  // 瞬成排满时每一份都补料，也不能把包兑超额（兑出仓库里没有的包 = 服务端直接拒）。
+  const limitedSurvey = surveyFor({ stock: { 鱼: 0, 原料自选包: 20 } });
+  limitedSurvey.produce = { reduce: 774, instant: [], source: 'appoint' };
+  const limited = planWorld(limitedSurvey, {
+    config: { tables: { ...config.tables, BuildingProduceCfg: { data: [
+      { buildType: '切鱼厂', itemId: '生鱼片', produceTime: 90, unlockLevel: 1, costItem: [['鱼', 6]] },
+    ] } } },
+    cargoDemand: new Map([['生鱼片', 999]]),
+  });
+  assert.equal(packsOf(limited).reduce((n, action) => n + action.body.num, 0), 20,
+    '包只有 20 个：一份 6 个 → 兑齐 3 份用掉 18，第 4 份只剩 2，总数正好 20');
+  assert.equal(producesOf(limited).length, 3, '料兑完就停，不排出假动作');
+
+  // **没有需求的配方不烧包**（2026-10-27 加）：否则一整夜每轮都往没人要的产品上砸几百个包
+  // （实测 1金属厂 为产没人要的铜锭兑 玻璃×60、1服装厂 兑 塑料×30…25 万个包撑不了几十小时）。
+  const noWant = planWorld(surveyFor({ stock: { 鱼: 0, 玻璃: 0, 原料自选包: 253_516 } }), { config });
+  assert.equal(packsOf(noWant).length, 0, '没需求的配方不乱兑料');
+  assert.equal(producesOf(noWant).length, 0, '料不够又没需求 → 空着（工厂空转不损失任何东西）');
   checked += 1;
 }
 
@@ -3507,4 +3659,250 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 日志脱敏与回包归档）`);
+// 贸易港口（建筑「货轮港口」）：采购中的船逐格交货（cargoIndex 从 1 开始）、航行的船不碰、
+// 返航的船领奖。这里钉死的都是「错了不报错、只会白丢物品或被服务端拒」的地方。
+{
+  const { viewCargo, planCargo, formatCargoSummary, summarizeCargo, secondsOf } = await import('./tradePort.mjs');
+  // arriveTime 是**秒**，now 是毫秒 —— 这两个混用是这套协议最容易踩的坑，先钉死。
+  const NOW_MS = 1_700_000_000_000;
+  assert.equal(secondsOf(NOW_MS), 1_700_000_000, 'arriveTime 是秒，别拿毫秒直接比');
+  const NOW_SEC = secondsOf(NOW_MS);
+  const slot = (id, num, filled = false) => ({
+    asset: { type: 0, id, num },
+    filled,
+    reward: { asset: [{ type: 1, id: 'EXP', num: 100 }, { type: 1, id: 'GOLD', num: 500 }] },
+  });
+  const ship = (index, over = {}) => ({ index, status: 0, orderItem: [], arriveTime: 0, reward: [], ...over });
+
+  // 三艘船：1 号采购中且料齐；2 号航行中；3 号已返航可领奖。
+  const survey = {
+    now: NOW_MS,
+    stock: new Map([['铜锭', 11], ['鱼皮风筝', 2], ['淡水', 50], ['吊床', 46]]),
+    ships: [
+      ship(1, { orderItem: [slot('铜锭', 3), slot('鱼皮风筝', 2), slot('淡水', 4), slot('吊床', 2)] }),
+      ship(2, { status: 1, arriveTime: NOW_SEC + 3600, orderItem: [slot('粗纸', 3, true), slot('淡水', 4, true)] }),
+      ship(3, { status: 2, arriveTime: NOW_SEC - 60, orderItem: [slot('救生衣', 3, true)] }),
+    ],
+  };
+  const view = viewCargo(survey);
+  assert.equal(view.order.length, 1, '1 号船在采购中');
+  assert.equal(view.sailing.length, 1, '2 号船在航行');
+  assert.equal(view.arrived.length, 1, '3 号船已返航');
+  assert.equal(view.nextArriveLeftSeconds, 3600, '最近返航时间按秒算，别多出三位');
+  assert.equal(ship(1).status, 0, 'status 0 = 采购中');
+
+  const plan = planCargo(view);
+  const fill = plan.actions.find((action) => action.kind === 'cargoFill');
+  assert.ok(fill, '料齐的采购船要交货');
+  assert.equal(fill.request, 'FillCargoShipRequest');
+  assert.equal(fill.response, 'FillCargoShipResponse', '交货有回包，走 request 而不是 sendWatch');
+  assert.deepEqual(fill.body, { shipIndex: 1, cargoIndex: [1, 2, 3, 4] }, 'cargoIndex 从 1 开始，一次交满 4 格');
+  assert.equal(fill.transient, true, '交货失败多是瞬时状态，不能进跨轮 rejected');
+  assert.equal(fill.key, 'cargoFill:1', 'stepKey 取不到 shipIndex，必须显式给 key');
+  assert.equal(fill.group, 'cargo:1', '一条船失败不能连累另外两艘');
+
+  const reward = plan.actions.find((action) => action.kind === 'cargoReward');
+  assert.ok(reward, '返航的船要领奖');
+  assert.equal(reward.request, 'DrawShipRewardRequest');
+  assert.deepEqual(reward.body, { index: 3 }, '领奖按船号');
+  assert.notEqual(reward.key, fill.key, '领奖与交货的 key 不能撞');
+  assert.equal(plan.actions.length, 2, '航行中的 2 号船一个请求都不该发');
+  assert.ok(plan.notes.some((note) => note.includes('航行中')), '要说清 2 号船在航行');
+
+  // 缺料：只交够的那几格，缺的只报缺口，绝不替玩家买货。
+  const short = viewCargo({
+    now: NOW_MS,
+    stock: new Map([['铜锭', 3], ['淡水', 1]]),
+    ships: [ship(1, { orderItem: [slot('铜锭', 3), slot('鱼皮风筝', 2), slot('淡水', 4), slot('吊床', 2)] })],
+  });
+  assert.equal(short.order[0].short.length, 3, '三格缺料');
+  const shortPlan = planCargo(short);
+  assert.deepEqual(shortPlan.actions[0].body.cargoIndex, [1], '只交库存够的第 1 格');
+  assert.equal(shortPlan.actions[0].items.length, 1, 'items 只记真正交出去的');
+  assert.ok(shortPlan.notes.some((note) => note.includes('淡水 1/4')), '缺口要写清 有/需');
+
+  // 同一件物品被两艘船同时采购（实探里 1 号和 2 号船都要淡水×4）：按船号扣减，不能超卖。
+  const clash = viewCargo({
+    now: NOW_MS,
+    stock: new Map([['淡水', 5]]),
+    ships: [
+      ship(1, { orderItem: [slot('淡水', 4)] }),
+      ship(2, { orderItem: [slot('淡水', 4)] }),
+    ],
+  });
+  const clashPlan = planCargo(clash);
+  assert.equal(clashPlan.actions.length, 1, '只有一艘船的淡水够（5 个不够两家各 4 个）');
+  assert.equal(clashPlan.actions[0].body.shipIndex, 1, '按船号顺序，先到先得');
+  assert.ok(clashPlan.notes.some((note) => note.includes('货船#2')), '被抢空的那艘要有说明');
+
+  // 库存传不进来（探测时没给 stock）时宁可一单不发，也不能按「无限库存」发货。
+  const noStock = planCargo(viewCargo({ now: NOW_MS, ships: survey.ships }));
+  assert.equal(noStock.actions.filter((action) => action.kind === 'cargoFill').length, 0, '没有库存表就不交货');
+  assert.equal(noStock.actions.filter((action) => action.kind === 'cargoReward').length, 1, '领奖不依赖库存');
+
+  // 概览文案 + 收益统计。
+  assert.ok(formatCargoSummary(view).includes('货船 3 艘'), '概览要有船数');
+  assert.ok(formatCargoSummary({ ships: [], order: [], sailing: [], arrived: [], mismatch: [], nextArriveLeftSeconds: 0 }).includes('没有货船'));
+  const gain = summarizeCargo([
+    { ok: true, step: { kind: 'cargoFill' }, body: { reward: { asset: [{ id: 'EXP', num: 1563 }, { id: 'GOLD', num: 7391 }] } } },
+    { ok: true, step: { kind: 'cargoReward' }, body: { reward: { asset: [{ id: '藏品大师经验', num: 2 }, { id: 'GOLD', num: 100 }] } } },
+    { ok: false, step: { kind: 'cargoFill' }, body: null },
+  ]);
+  assert.deepEqual(gain, [{ id: 'EXP', num: 1563 }, { id: 'GOLD', num: 7491 }, { id: '藏品大师经验', num: 2 }],
+    '同一资源要合并，失败的不计');
+
+  // 货船缺口 → 工厂排产需求：只算「采购中」的船、只算「未交且不够」的格子。
+  const { cargoDemandOf } = await import('./tradePort.mjs');
+  const demandView = viewCargo({
+    now: NOW_MS,
+    stock: new Map([['铜锭', 1], ['淡水', 50], ['粗纸', 0]]),
+    ships: [
+      // 采购中：铜锭缺 2（3-1）、淡水够（不出需求）、鱼皮风筝缺 0 库存 2 缺 2。
+      ship(1, { orderItem: [slot('铜锭', 3), slot('淡水', 4), slot('鱼皮风筝', 2)] }),
+      // 已交的格子不出需求。
+      ship(2, { orderItem: [slot('吊床', 2, true)] }),
+      // 航行中的船不采购，给它补货纯属占仓库。
+      ship(3, { status: 1, arriveTime: NOW_SEC + 3600, orderItem: [slot('粗纸', 3)] }),
+    ],
+  });
+  const demand = cargoDemandOf(demandView);
+  assert.equal(demand.get('铜锭'), 2, '缺口 = 需 - 有');
+  assert.equal(demand.get('鱼皮风筝'), 2, '库存 0 时缺口就是全额');
+  assert.equal(demand.get('淡水'), undefined, '库存够的格子不出需求');
+  assert.equal(demand.get('吊床'), undefined, '已交的格子不出需求');
+  assert.equal(demand.get('粗纸'), undefined, '航行中的船不出需求');
+  assert.equal(cargoDemandOf({ order: [] }).size, 0, '没有采购中的船就是空表');
+  checked += 1;
+}
+
+// 海盗讨伐（世界地图真出战）：战力必须按赛季查、默认只打首杀等级、一船一海盗。
+// 这里钉死的都是「错了不会报错、只会白烧汽油」的地方，所以每条都要有断言。
+{
+  const { pirateOf, petrolCostOf, seasonOf, viewPirates, planPirates, formatPirateSummary } = await import('./pirate.mjs');
+  const config = { tables: {
+    // 「打野怪消耗汽油」在 WorldParamCfg，不在 PirateParamCfg（后者只有「每日野怪扫荡次数」）。
+    WorldParamCfg: { data: [{ paramName: '打野怪消耗汽油', paramValue: 300 }] },
+    WorldPirateCfg: { data: [
+      // 同 type + level 三个赛季并存：战力差 17 倍。只按 type+level find 会永远命中 S1 那行。
+      { season: '1', type: 1, level: 7, power: 458000, showName: '海盗先锋', fixedReward: [['GOLD', 250]] },
+      { season: '1', type: 1, level: 8, power: 551000, showName: '海盗先锋', firstKillReward: [['蓝武器材料', 40]], fixedReward: [['GOLD', 250]] },
+      { season: '2', type: 1, level: 8, power: 1830000, showName: '海盗先锋', firstKillReward: [['紫武器材料', 40]], fixedReward: [['GOLD', 250]] },
+      { season: '10', type: 1, level: 8, power: 9530000, showName: '海盗先锋' },
+      { season: '1', type: 3, level: 6, power: 383000, showName: '海盗头目' },
+    ] },
+  } };
+
+  // 赛季必须参与查表（客户端 WorldIdRule.getSeason = floor(worldId / 1e6 % 1000)）。
+  assert.equal(seasonOf({ worldId: 2001014410 }), 1, 'worldId 2001014410 属于 S1');
+  assert.equal(seasonOf(null), 0, '拿不到 player 就是赛季未知');
+  assert.equal(pirateOf(config, { season: 1, type: 1, level: 8 }).power, 551000, 'S1 用 S1 那一行');
+  assert.equal(pirateOf(config, { season: 2, type: 1, level: 8 }).power, 1830000, 'S2 必须用 S2 那一行，不能命中 S1');
+  assert.equal(pirateOf(config, { season: 2, type: 1, level: 8 }).exact, true, '命中要标 exact');
+  // 赛季未知不能低估（低估 = 派出打不过的船，白烧 300 汽油）；取各赛季最高是保守方向。
+  assert.equal(pirateOf(config, { season: 0, type: 1, level: 8 }).power, 9530000, '赛季未知取各赛季最大战力');
+  assert.equal(pirateOf(config, { season: 0, type: 1, level: 8 }).exact, false, '不精确命中要能看出来');
+  // 表里没有 = 配置过期（返回 null），不能退化成 0 战力 —— 0 会让「需要战力」恒真。
+  assert.equal(pirateOf(config, { season: 1, type: 9, level: 1 }), null, '查不到就是 null');
+  assert.equal(petrolCostOf(config), 300, '打一次 300 汽油（WorldParamCfg）');
+  assert.equal(petrolCostOf({ tables: {} }), 300, '配置读不到时用兜底 300，不能变 0（0 等于无限次）');
+
+  const fleet = (over) => ({ buildingId: '1远征船', state: 1, power: 3000000, durability: 2000, maxDurability: 2000, ...over });
+  const survey = ({ pirates = [], killed = new Map(), fleets = [], petrol = 5000, season = 1 } = {}) => ({
+    now: 1000, season, petrol, sweepTimes: 0, stock: new Map(), pirates, killed, fleets,
+  });
+  const pirate = (over) => ({ uid: 1, type: 1, level: 8, gridIdx: 100, cityId: 9, ...over });
+
+  // 默认只打「已击杀最高等级 + 1」（客户端自动讨伐同款）：地图上的 Lv7 已通关，不该再打。
+  const noRepeat = viewPirates(survey({
+    pirates: [pirate({ uid: 1, level: 7 }), pirate({ uid: 2, level: 8 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+  }), { config });
+  assert.equal(noRepeat.targets.length, 1, '只把 Lv8 当目标');
+  assert.equal(noRepeat.targets[0].level, 8, '目标是下一个未击杀等级');
+  assert.equal(noRepeat.targets[0].firstKill, true, '标成首杀（有 firstKillReward）');
+  assert.ok(noRepeat.types[0].reason === '', '有目标时不该给「打不了」的理由');
+
+  // 打开 repeat 才把已通关等级也算进来（只剩固定掉落）。
+  const repeated = viewPirates(survey({
+    pirates: [pirate({ uid: 1, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+  }), { config, repeat: true });
+  assert.equal(viewPirates(survey({
+    pirates: [pirate({ uid: 1, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+  }), { config }).targets.length, 0, '默认不刷已通关等级');
+  assert.equal(repeated.targets.length, 1, 'repeat 才把 Lv7 算进来');
+  assert.equal(repeated.targets[0].firstKill, false, '重复刷的不是首杀');
+
+  // 同 type 同级的首杀目标只留一个：两艘船同时打两个 Lv8，第二单打完已是「已通关」，白烧 300 汽油。
+  const twoLevels = viewPirates(survey({
+    pirates: [pirate({ uid: 1 }), pirate({ uid: 2 }), pirate({ uid: 3, type: 3, level: 6 })],
+    killed: new Map([[1, 7], [3, 5]]),
+    fleets: [fleet({ buildingId: '1远征船' }), fleet({ buildingId: '2远征船', power: 2000000 })],
+  }), { config });
+  assert.equal(twoLevels.targets.length, 2, '同 type 同级只留一个首杀目标');
+
+  const plan = planPirates(twoLevels);
+  assert.equal(plan.actions.length, 2, '两艘空闲船各打一个');
+  assert.equal(plan.actions[0].request, 'ChallengePirateRequest', '真出战的请求名（不是 PirateFightRequest）');
+  assert.deepEqual(plan.actions[0].body.fleetBuildingIds, ['1远征船'], '一艘船打一个海盗');
+  assert.equal(plan.actions[0].body.uid, 1, '最强的那艘先挑等级最高的');
+  assert.equal(plan.actions[0].body.cityId, 9, '必须带 cityId');
+  assert.equal(plan.actions[0].transient, true, '派兵失败是瞬时状态，不能进跨轮 rejected');
+  assert.equal(plan.actions[0].group, 'pirateChallenge:1远征船', '按船隔离失败，别一条失败全废');
+  assert.ok(plan.actions[0].label.includes('首杀'), `首杀要说出来，实际：${plan.actions[0].label}`);
+
+  // 战力不够就不派，并且要说清是「战力不够」而不是「没目标了」。
+  const weak = planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ power: 500000 })],
+  }), { config }));
+  assert.equal(weak.actions.length, 0, '500000 < 551000×1.2，不能派');
+  assert.ok(weak.notes.some((note) => note.includes('最强空闲船只有')), `要说明战力不够，实际：${weak.notes.join(' / ')}`);
+
+  // 汽油按「这次要烧的量」累计判断：只够一次就只能派一艘。
+  const thirsty = planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1 }), pirate({ uid: 3, type: 3, level: 6 })],
+    killed: new Map([[1, 7], [3, 5]]),
+    fleets: [fleet({ buildingId: '1远征船' }), fleet({ buildingId: '2远征船', power: 2000000 })],
+    petrol: 300,
+  }), { config }));
+  assert.equal(thirsty.actions.length, 1, '只有 300 汽油就只派一艘');
+  assert.ok(thirsty.notes.some((note) => note.includes('汽油只够')), '要说清汽油只够几次');
+
+  const dry = planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+    petrol: 100,
+  }), { config }));
+  assert.equal(dry.actions.length, 0, '汽油不够一次就不派');
+
+  // 概览行：赛季、汽油单价、空闲船、三种 type 的击杀进度都要能看见。
+  const summaryText = formatPirateSummary(noRepeat);
+  assert.ok(summaryText.includes('S1') && summaryText.includes('每次 300') && summaryText.includes('击杀'),
+    `概览要带赛季/汽油/进度，实际：${summaryText}`);
+
+  // 循环日志：这一轮真的探测过就印一行「海盗」（否则看起来像开关没生效）。
+  const pirateRound = formatLoopRound({
+    round: 7, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    pirate: {
+      planned: 1, notes: [], summary: 'S1 · 汽油 5000（每次 300） · 空闲船 1/2（最强 300.0万） · 击杀 先锋 7 / 精锐 0 / 头目 0',
+      results: [{ step: { kind: 'pirateChallenge', label: '派 1远征船 打 海盗先锋 Lv8' }, ok: true }],
+    },
+    gates: { pirate: { enabled: true, everyMs: 60_000, lastAt: 1_700_000_000, waitSeconds: 40, throttled: true } },
+  });
+  assert.ok(pirateRound.includes('海盗 计划 1'), `要有海盗概览行，实际：\n${pirateRound}`);
+  assert.ok(pirateRound.includes('成功 讨伐海盗'), `成功行要标出讨伐海盗，实际：\n${pirateRound}`);
+  assert.ok(pirateRound.includes('海盗 间隔未到，还差 40 秒'), `要有节流提示，实际：\n${pirateRound}`);
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海盗讨伐 / 日志脱敏与回包归档）`);

@@ -1,13 +1,15 @@
 // 自动循环：每轮依次跑 任务领取 → 日常（含任务奖励与活跃度宝箱） → 海面（收成品/竣工/建造/交单/排产/升级）
 // → 挂机领取（邮件 / 本段收益 / 等级奖励 / 升级） → 搁浅的货轮（按勾选等级抢货轮，默认只抢万吨）
-// → 联盟情报（领奖 + 派舰队） → 装备厂（收装备 + 锻造） → 海兽培育室（收成熟 + 排空位）。
+// → 联盟情报（领奖 + 派舰队） → 海盗讨伐（派空闲船真出战打地图海盗） → 装备厂（收装备 + 锻造） → 海兽培育室（收成熟 + 排空位）
+// → 贸易港口（3 艘货船逐格交货换 EXP/金币，返航后领 4 份藏品奖励）。
 //
-// 拾荒 / 农田 / 货轮 / 情报 / 锻造 / 挂机领取 / 培育 各自有独立间隔（gateDue）：自动循环每轮都会看一眼，
+// 拾荒 / 农田 / 货轮 / 情报 / 海盗 / 锻造 / 挂机领取 / 培育 各自有独立间隔（gateDue）：自动循环每轮都会看一眼，
 // 只有「距上次执行」超过自己的间隔才真的跑一次，其余轮次整段跳过（连探测请求都不发）。
 //
-// 货轮排在情报**前面**是刻意的：两边抢的是同一份资源 —— 空闲舰队。
+// 货轮 → 情报 → 海盗 的先后顺序是刻意的：三段抢的是同一份资源 —— 空闲舰队。
 // 货轮每小时整点才刷一次、万吨全服 1 艘，错过就没了；情报事件 6 小时才刷一批、
-// 而且一直挂在那儿不会跑。所以先让货轮挑船，剩下的才给情报。
+// 而且一直挂在那儿不会跑；海盗是自己的世界里刷的、没人抢，也不刷新倒计时。
+// 所以先让货轮挑船，剩下的给情报，最后剩下的才去打海盗。
 //
 // 循环是显式开的：必须同时给 --loop 与 --yes，且每轮都是「先只读探测，再算计划，再执行」，
 // 所以第二轮起没有可做的事时计划自然为空，不会重复发同样的请求。
@@ -17,8 +19,10 @@ import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
 import { surveyRadar, viewRadar, planRadar, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyPirates, viewPirates, planPirates, formatPirateSummary } from './pirate.mjs';
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
+import { surveyCargo, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, cargoDemandOf } from './tradePort.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
 import {
   surveyTreasure,
@@ -127,6 +131,17 @@ export async function runLoop(initialClient, protocol, {
   // 时间没到就整段跳过（省掉 RadarInfo + MyFleets + AllItem 三个请求）。
   radarEnabled = true,
   radarEveryMs = 60_000,
+  // 海盗讨伐：派空闲舰队**真出战**打世界地图上的海盗（ChallengePirateRequest）。
+  // 跟免战扫荡（dailies 1010 的 PirateSweepRequest，一天 10 次、不动舰队）是两码事：
+  // 真出战每次烧 300 汽油、不掉耐久，收益是首杀奖励 + 固定掉落。
+  // 默认开、60 秒看一眼；它排在情报之后，只能捡货轮和情报没带走的空闲船。
+  pirateEnabled = true,
+  pirateEveryMs = 60_000,
+  // 只打「没打过的下一个等级」（客户端自动讨伐同款口径，首杀才有 firstKillReward）。
+  // 打开 = 连已通关的等级也打，只拿 fixedReward（每次 GOLD 250 + 材料）。
+  pirateRepeat = false,
+  // 一次最多派几艘船去打海盗（默认不限 = 有多少空闲船派多少）。
+  pirateMaxPerRound = Infinity,
   // 装备厂（锻造）：造好了收取 + 按部位均衡排下一件。一件蓝装原时长 1800 秒、
   // 减完「锻造时间」委任也要 25 分钟左右，所以默认 3 分钟看一眼就够。
   // 它比农田更值得勤看：同一时间只能造一件，造好不收等于整座工厂停产。
@@ -143,6 +158,12 @@ export async function runLoop(initialClient, protocol, {
   // PetParamCfg「投喂减少培育时间」（本服 4 小时）。默认开 —— 不花钻石/加速器/广告，
   // 只吃「鱼肠线/粗铁/烤鱼」这类囤着没别的用途的培育材料。
   petFeed = true,
+  // 贸易港口（建筑「货轮港口」）：3 艘货船各采购 4 种物品，交齐一格立得 EXP+金币，
+  // 4 格交完船出发、几小时后返航，返航后领 4 份藏品奖励（徽章 / 经验 / 碎片）。
+  // 全程免费（只吃工厂与农田产出的常规货），所以默认开；请求只有一个 CargoShipsRequest，
+  // 默认 60 秒看一眼 —— 返航是小时级的，等一分钟不会漏。
+  cargoEnabled = true,
+  cargoEveryMs = 60_000,
   // 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励/升级。三件都免费、不发就白放着，
   // 但节奏是「小时级」的（收益 8 小时封顶、等级奖励是按级一次），所以 5 分钟看一次足够，
   // 不必每轮都多打 3 个请求（AfkInfo + EmailBox + 库存复用）。
@@ -177,7 +198,7 @@ export async function runLoop(initialClient, protocol, {
   // 下面十几处 `client.request(...)` 自动就跟上新的，不用逐个改。
   let client = initialClient;
   let linkError = '';
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -187,6 +208,8 @@ export async function runLoop(initialClient, protocol, {
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
+  // 海盗讨伐同理：探测（海盗列表 + 舰队 + 击杀记录）成功就计时。
+  let lastPirateAt = 0;
   // 锻造同理：探测是一整套「读装备厂 → 收取 → 排产」，探测成功就计时。
   let lastForgeAt = 0;
   // 培育同理：探测成功就计时（哪怕这一轮没有空位、也没有成熟的）。
@@ -195,6 +218,16 @@ export async function runLoop(initialClient, protocol, {
   let lastIdleAt = 0;
   // 货轮同理：探测成功就计时（哪怕这一轮没有可抢的）。
   let lastTreasureAt = 0;
+  // 贸易港口同理：探测成功就计时（哪怕三艘船都在航行、或者物品还不够交）。
+  let lastCargoAt = 0;
+  // 货船缺口 → 工厂排产需求（Map<itemId, 数量>），由第 9 段探测后更新、下一轮的排产使用。
+  // null = 从来没探测过（第一次挂机），海面那一段会补一次只读探测。
+  let cargoOrderDemand = null;
+  // 三艘船全在航行时没有任何可做的（船在海上不采购，物品再怎么攒也得等它回来），
+  // 所以直接静默到最早那艘返航为止 —— 否则 60 秒一次的只读请求纯属白打 5 小时。
+  let cargoSkipUntil = 0;
+  let cargoSkipReason = '';
+  let cargoSkipNoticedAt = 0;
   // 「今日没机会了」的静默窗（毫秒时间戳）：命中后连探测请求都不发。
   // 判据见 treasure.mjs 的 skipUntilOf —— 奖励次数满了 / 活动结束 / 勾选等级里一个可抢的都没有。
   let treasureSkipUntil = 0;
@@ -278,7 +311,7 @@ export async function runLoop(initialClient, protocol, {
     const summary = {
       round, startedAt: Math.floor(tickAt / 1000), link: '', everyMs: everyNow,
       tasks: part(), dailies: part(), world: { ...part(), population: '-', floaterLoot: null },
-      idle: part(), treasure: part(), radar: part(), forge: part(), pet: part(),
+      idle: part(), treasure: part(), radar: part(), pirate: part(), forge: part(), pet: part(), cargo: part(),
     };
 
     // 一轮的统一收尾：补耗时 → 进历史 → 交给页面/日志。
@@ -370,6 +403,10 @@ export async function runLoop(initialClient, protocol, {
     const farmEvery = pickAt(conf, 'farmEveryMs', farmEveryMs);
     const pickDue = pickOn && gateDue(lastPickAt, pickEvery, tickAt);
     const farmDue = farmOn && gateDue(lastFarmAt, farmEvery, tickAt);
+    // 贸易港口的开关在这里就取：工厂排产要用它的货船缺口当需求（见下面的 cargoDemand），
+    // 所以不能等到最后一段才读。第 9 段复用这两个变量。
+    const cargoOn = pickAt(conf, 'cargoEnabled', cargoEnabled);
+    const cargoEvery = pickAt(conf, 'cargoEveryMs', cargoEveryMs);
     // 海面是这一轮的**地基**：后面的挂机领取（库存）、货轮（汽油）、情报/锻造/培育（建筑与库存）
     // 全都复用它的 survey。所以它拿不到就只能结束本轮，不能带着 null 往下跑（那会变成一串
     // 「Cannot read properties of null」把真正的原因埋掉）。
@@ -380,6 +417,18 @@ export async function runLoop(initialClient, protocol, {
     if (halted()) break;
     try {
       worldSurvey = await linkRetry(() => surveyWorld(client, protocol, { config, player }));
+      // 货船缺口 → 工厂排产需求。用上一轮（第 9 段）探测到的那份；
+      // 从来没有探测过（挂机刚启动 / 刚打开贸易港口）就现在补一次只读探测 ——
+      // 否则第一轮排产完全看不到货船要什么，得白等一整轮。
+      if (cargoOn && cargoOrderDemand === null) {
+        try {
+          const firstCargo = await surveyCargo(client, protocol, { stock: worldSurvey.stock });
+          cargoOrderDemand = cargoDemandOf(viewCargo(firstCargo));
+        } catch {
+          // 补探测失败不影响海面这一段：这一轮按「订单缺口」排，下一轮再说。
+          cargoOrderDemand = null;
+        }
+      }
       worldPlan = planWorld(worldSurvey, {
         config,
         allowSpeedUp: pickAt(conf, 'allowSpeedUp', allowSpeedUp),
@@ -388,6 +437,8 @@ export async function runLoop(initialClient, protocol, {
         maxPackPerRound: pickAt(conf, 'maxPackPerRound', maxPackPerRound),
         pickUpFloaters: pickDue,
         farm: farmDue,
+        // 工厂排产的额外需求：货船缺的货（空 Map = 只按订单缺口排）。
+        cargoDemand: cargoOn ? cargoOrderDemand : null,
       });
       summary.world.planned = worldPlan.actions.length;
       summary.world.notes = [...worldSurvey.notes, ...worldPlan.notes];
@@ -546,7 +597,53 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
-    // 7. 装备厂（锻造）：造好了就收，收完接着排下一件；按部位件数最少的先补。
+    // 7. 海盗讨伐：派空闲舰队**真出战**打世界地图上的海盗（ChallengePirateRequest）。
+    //    只捡货轮和情报没带走的船 —— 那两段都排在它前面，所以这里经常是「0 艘空闲船，不派」。
+    //    默认只打「下一个未击杀等级」（客户端自动讨伐同款口径）：打完击杀记录 +1，下一轮自动指向下一级；
+    //    重复刷已通关等级要显式开 pirateRepeat（那只有 fixedReward，没有首杀奖励）。
+    //    复用 world 段的库存（汽油）—— 这一轮只多打三个只读请求：AllPirate + MyFleets + PirateKillRecord。
+    const pirateOn = pickAt(conf, 'pirateEnabled', pirateEnabled);
+    const pirateEvery = pickAt(conf, 'pirateEveryMs', pirateEveryMs);
+    const pirateRepeatNow = pickAt(conf, 'pirateRepeat', pirateRepeat) === true;
+    const pirateCapNow = pickAt(conf, 'pirateMaxPerRound', pirateMaxPerRound);
+    const pirateDue = pirateOn && gateDue(lastPirateAt, pirateEvery, tickAt);
+    if (halted()) break;
+    if (pirateDue) {
+      try {
+        const pirateSurvey = await linkRetry(() => surveyPirates(client, protocol, {
+          config,
+          stock: worldSurvey.stock,
+          // 赛季要从 worldId 算（WorldPirateCfg 战力按 season_type_level 三元组查），
+          // 拿不到就会退化成「取各赛季最高战力」，偏保守但不会打输。
+          player,
+        }));
+        const pirateView = viewPirates(pirateSurvey, {
+          config,
+          minPowerRatio: ratioNow,
+          repeat: pirateRepeatNow,
+        });
+        const piratePlan = planPirates(pirateView, { maxPerRound: pirateCapNow });
+        summary.pirate.planned = piratePlan.actions.length;
+        summary.pirate.notes = piratePlan.notes;
+        summary.pirate.summary = formatPirateSummary(pirateView);
+        if (piratePlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, piratePlan, {
+            allowMutate,
+            rejected: rejected.pirate,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'pirate', ...entry }),
+          });
+          rejected.pirate = stillRejected;
+          summary.pirate.results = results;
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastPirateAt = tickAt;
+      } catch (error) {
+        summary.pirate.notes = [`海盗探测失败：${error.message}`];
+      }
+    }
+
+    // 8. 装备厂（锻造）：造好了就收，收完接着排下一件；按部位件数最少的先补。
     //    复用 world 那一轮已经拉到的建筑与库存（含 GOLD），所以这轮只多一个 EquipsRequest。
     const forgeOn = pickAt(conf, 'forgeEnabled', forgeEnabled);
     const forgeEvery = pickAt(conf, 'forgeEveryMs', forgeEveryMs);
@@ -580,7 +677,7 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
-    // 8. 海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满。
+    // 9. 海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满。
     //    复用 world 那一轮拉到的建筑与库存（含 GOLD），这轮零额外请求。
     const petOn = pickAt(conf, 'petEnabled', petEnabled);
     const petEvery = pickAt(conf, 'petEveryMs', petEveryMs);
@@ -617,6 +714,59 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
+    // 9. 贸易港口（建筑 buildingType「货轮港口」，UI 名「贸易港口」）：
+    //    3 艘货船各采购 4 种物品，交一格立得 EXP+金币，4 格交完船出发，
+    //    arriveTime 到了再领 4 份藏品奖励（徽章 / 经验 / 碎片）。全程免费。
+    //    排在最后一段：它吃的是工厂和农田产出的常规物品，跟前面几段抢的是同一个仓库 ——
+    //    前面都做完了，剩下的才拿去贸易，避免跟海面那段的交单/排产互相抢料。
+    //    库存必须扣掉海面这一段已经排进计划的消耗（worldPlan.reserved），否则拿探测时的
+    //    绝对量去交货会超卖，服务端必拒。
+    // cargoOn / cargoEvery 在第 3 段（工厂排产要用货船缺口）就已经取过了，这里直接用。
+    const cargoSkipping = cargoOn && cargoSkipUntil > tickAt;
+    const cargoDue = cargoOn && !cargoSkipping && gateDue(lastCargoAt, cargoEvery, tickAt);
+    if (halted()) break;
+    if (cargoDue) {
+      try {
+        const cargoStock = new Map(worldSurvey?.stock ?? []);
+        for (const [id, num] of worldPlan?.reserved ?? []) {
+          cargoStock.set(id, Number(cargoStock.get(id) ?? 0) - Number(num ?? 0));
+        }
+        const cargoSurvey = await linkRetry(() => surveyCargo(client, protocol, { stock: cargoStock }));
+        const cargoView = viewCargo(cargoSurvey);
+        const cargoPlan = planCargo(cargoView);
+        summary.cargo.planned = cargoPlan.actions.length;
+        summary.cargo.notes = cargoPlan.notes;
+        summary.cargo.summary = formatCargoSummary(cargoView);
+        // 这份缺口下一轮喂给工厂排产（并入 planWorld 的 demand）。
+        cargoOrderDemand = cargoDemandOf(cargoView);
+        // 三艘都出海了：静默到最早那艘返航（船在海上不采购，这期间的库存变化不影响任何决策）。
+        const allSailing = cargoView.ships.length > 0
+          && cargoView.order.length === 0
+          && cargoView.arrived.length === 0
+          && cargoView.nextArriveAt * 1000 > tickAt;
+        cargoSkipUntil = allSailing ? cargoView.nextArriveAt * 1000 : 0;
+        cargoSkipReason = allSailing ? `三艘货船都在航行` : '';
+        cargoSkipNoticedAt = 0;
+        // 船都出海了就没有「缺货」这回事：清掉需求，否则工厂会照着过期的缺口一直产同一件东西。
+        if (allSailing) cargoOrderDemand = new Map();
+        if (cargoPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, cargoPlan, {
+            allowMutate,
+            rejected: rejected.cargo,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'cargo', ...entry }),
+          });
+          rejected.cargo = stillRejected;
+          summary.cargo.results = results;
+          summary.cargo.gain = formatCargoGain(summarizeCargo(results));
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastCargoAt = tickAt;
+      } catch (error) {
+        summary.cargo.notes = [`贸易港口探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan?.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -624,6 +774,9 @@ export async function runLoop(initialClient, protocol, {
     // 静默窗还在跑的时候，攒够 30 分钟才再报一次（第一次已经在设窗那一轮报过了）。
     const treasureSkipNotice = treasureSkipping && tickAt - treasureSkipNoticedAt >= SKIP_NOTICE_MS;
     if (treasureSkipNotice) treasureSkipNoticedAt = tickAt;
+    // 贸易港口的静默窗是「船在海上」这一个原因，设窗那一轮印一次就够。
+    const cargoSkipNotice = cargoSkipping && tickAt - cargoSkipNoticedAt >= SKIP_NOTICE_MS;
+    if (cargoSkipNotice) cargoSkipNoticedAt = tickAt;
     // gates 里必须是**这一轮真正生效**的值（conf），否则网页上改了设置，
     // 状态行还按启动时的旧值算「还差多久」，看起来像改了没用。
     summary.gates = {
@@ -645,8 +798,20 @@ export async function runLoop(initialClient, protocol, {
         stats: treasureStats,
       },
       radar: { ...gateSummary(radarOn, radarEvery, lastRadarAt, tickAt), throttled: radarOn && !radarDue },
+      pirate: { ...gateSummary(pirateOn, pirateEvery, lastPirateAt, tickAt), throttled: pirateOn && !pirateDue },
       forge: { ...gateSummary(forgeOn, forgeEvery, lastForgeAt, tickAt), throttled: forgeOn && !forgeDue },
       pet: { ...gateSummary(petOn, petEvery, lastPetAt, tickAt), throttled: petOn && !petDue },
+      cargo: {
+        ...gateSummary(cargoOn, cargoEvery, lastCargoAt, tickAt),
+        // 静默中不算「间隔未到」：两种完全不同的原因，混在一起就看不出为什么一直没请求。
+        throttled: cargoOn && !cargoDue && !cargoSkipping,
+        skipped: cargoSkipping,
+        skipReason: cargoSkipping ? cargoSkipReason : '',
+        skipForever: false,
+        skipLeftSeconds: cargoSkipping ? Math.max(0, Math.ceil((cargoSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: cargoSkipping ? Math.floor(cargoSkipUntil / 1000) : null,
+        skipNotice: cargoSkipNotice,
+      },
     };
 
     // 本轮耗时：页面上直接能看到「一轮 12 秒」，据此判断间隔是否够用。
@@ -671,12 +836,15 @@ const KIND_TEXT = {
   farmPlant: '播种',
   radarReward: '领情报奖励',
   radarDispatch: '派舰队',
+  pirateChallenge: '讨伐海盗',
   treasureDispatch: '抢货轮',
   equipPick: '收装备',
   equipMake: '锻造',
   petPick: '收海兽',
   petBreed: '培育海兽',
   petFeed: '材料加速',
+  cargoFill: '交货',
+  cargoReward: '领贸易奖励',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -738,6 +906,17 @@ function detailLines(part, limit = 4) {
   return lines;
 }
 
+// 海面备注：以前一个都印不出来，工厂为什么空着全靠猜。这里最多印 4 条，
+// 并且先印「排产相关」的（空闲/缺料/自选包/存量上限），其余（拾荒额度、农田、订单保留）排后面。
+const WORLD_NOTE_HOT = /空闲|缺料|自选包|排产|存量上限/;
+function worldNoteLines(world) {
+  const notes = (world?.notes ?? []).filter((note) => typeof note === 'string' && note);
+  if (notes.length === 0) return [];
+  const hot = notes.filter((note) => WORLD_NOTE_HOT.test(note));
+  const rest = notes.filter((note) => !WORLD_NOTE_HOT.test(note));
+  return [...hot, ...rest].slice(0, 4).map((note) => `    注意 ${note}`);
+}
+
 export function formatLoopRound(summary) {
   const ok = (results) => results.filter((entry) => entry.ok).length;
   const failed = (results) => results.filter((entry) => entry.ok === false && !entry.skipped).length;
@@ -775,6 +954,9 @@ export function formatLoopRound(summary) {
     ...(summary.dailies.notes ?? []).map((note) => `    注意 ${note}`),
     `${line('海面', summary.world)}  人口 ${summary.world.population}`,
     ...detailLines(summary.world),
+    // 海面这一段的 note 以前**没有任何出口**（控制台和网页都看不到），
+    // 于是「为什么这座工厂没排产」只能靠猜。这里把它印出来，最多 4 条。
+    ...worldNoteLines(summary.world),
     // 挂机领取同理：这一轮真的探测过就印一行（哪怕「本段还剩 7 小时」「邮件都已领」）——
     // 否则日志里看不到它，很容易以为开关没生效。
     ...(summary.idle && (summary.idle.summary || (summary.idle.notes ?? []).length > 0)
@@ -797,6 +979,13 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.radar),
         ...(summary.radar.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 海盗同理：这轮真的探测过就印一行（哪怕是「地图上没有下一级」）——
+    // 否则日志里看不到它，很容易以为开关没生效。被间隔挡住的那轮只在 gateLine 里体现。
+    ...(summary.pirate && (summary.pirate.summary || (summary.pirate.notes ?? []).length > 0)
+      ? [`${line('海盗', summary.pirate)}${summary.pirate.summary ? `  ${summary.pirate.summary}` : ''}`,
+        ...detailLines(summary.pirate),
+        ...(summary.pirate.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     // 锻造同理：这轮真的探测过就印一行（哪怕是「还在锻造、还剩 20 分钟」），
     // 否则日志里看不到它，很容易以为开关没生效。
     ...(summary.forge && (summary.forge.summary || (summary.forge.notes ?? []).length > 0)
@@ -810,11 +999,20 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.pet),
         ...(summary.pet.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 贸易港口同理：探测过就印一行（哪怕是「三艘都在航行」），否则看不出开关是否生效。
+    ...(summary.cargo && (summary.cargo.summary || (summary.cargo.notes ?? []).length > 0)
+      ? [`${line('贸易港口', summary.cargo)}${summary.cargo.summary ? `  ${summary.cargo.summary}` : ''}`
+          + (summary.cargo.gain ? `  ${summary.cargo.gain}` : ''),
+        ...detailLines(summary.cargo),
+        ...(summary.cargo.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...(floater ? [`  ${floater}`] : []),
     ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
+    ...[gateLine('海盗', summary.gates?.pirate)].filter(Boolean),
     ...[gateLine('锻造', summary.gates?.forge)].filter(Boolean),
     ...[gateLine('海兽培育', summary.gates?.pet)].filter(Boolean),
+    ...[gateLine('贸易港口', summary.gates?.cargo)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),
