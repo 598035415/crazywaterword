@@ -23,6 +23,14 @@ import { surveyPet, planPet, formatPetPlan, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
 import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, rewardCountText, DEFAULT_MAX_FLEETS, DEFAULT_COLORS, colorsOf, colorsText } from './treasure.mjs';
 import { surveyCargo, fetchStock, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, safeCargoDemand, CARGO_SLOTS } from './tradePort.mjs';
+import {
+  surveyTradeKing,
+  viewTradeKing,
+  planTradeKing,
+  formatTradeSummary,
+  summarizeTrade,
+  formatTradeGain,
+} from './tradeKing.mjs';
 import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts, packCoverPlan, exchangePacks } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
@@ -152,6 +160,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         cargoEnabled: true,
         cargoEveryMs: 60_000,
         lastCargoAt: null,
+        // 海商王（活动「Trade」，每天 10~22 点）：在港就卖 + 买本港特产 + 开去紧缺港口。
+        // 只花活动内的商会币（不花钻石），商会指针是免费道具 —— 默认全用。
+        tradeEnabled: true,
+        tradeEveryMs: 60_000,
+        lastTradeAt: null,
+        tradeAllowSpeed: true,
+        tradePass: true,
         minPowerRatio: DEFAULT_MIN_POWER_RATIO,
         // 运行中可改的执行范围（以前只在 start 时生效，改完必须停掉重开）：
         // 拾荒开关、材料不齐时用不用自选包、加速器/拒单/付费这些允许项。
@@ -591,6 +606,67 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
       notes: plan.notes,
       text: formatTreasureSummary(view) + `\n${formatTreasurePlan(view, plan)}`,
+    };
+  }
+
+  // 海商王（活动「Trade」）：只读视图 + 一段（卖/买/起航）的计划，真正的写走 /api/trade/run。
+  // 单独跑时自己拉一次库存（商会指针的存量在里面）；循环里复用海面那一段的 stock，零额外请求。
+  async function trade(session, account, options = {}) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const stock = await fetchStock(instance, protocol);
+    const survey = await surveyTradeKing(instance, protocol, { stock, learned: options.learned ?? null });
+    const view = viewTradeKing(survey, { config });
+    const plan = planTradeKing(view, {
+      config,
+      allowSpeed: options.allowSpeed !== false,
+      allowPass: options.allowPass !== false,
+    });
+    return {
+      survey,
+      view,
+      plan,
+      payload: {
+        period: view.period,
+        open: view.open,
+        windowOpen: view.windowOpen,
+        startAt: view.startAt,
+        endAt: view.endAt,
+        nextRefreshAt: view.nextRefreshAt,
+        summary: formatTradeSummary(view),
+        ship: view.ship,
+        player: view.player,
+        cargo: view.cargo,
+        holdings: view.holdings,
+        shelf: view.shelf,
+        specGoodsId: view.specGoodsId,
+        rareGoodsId: view.rareGoodsId,
+        targetCityId: view.targetCityId,
+        sellable: view.sellable.map((h) => ({
+          pid: h.pid, name: h.name, num: h.num, buyPrice: h.buyPrice, sellPrice: h.sellPrice, profit: h.profit, profitable: h.profitable,
+        })),
+        candidates: view.candidates.map((c) => ({
+          goodsId: c.goodsId,
+          name: c.name,
+          quality: c.quality,
+          price: c.price,
+          base: c.base,
+          ratio: Number(c.ratio.toFixed(3)),
+          avail: c.avail,
+          destCityId: c.destCityId,
+          unitProfit: c.unitProfit,
+          isSpec: c.isSpec,
+          sure: c.sure,
+        })),
+        pairs: view.pairs,
+        rewards: view.rewards,
+        speed: view.speed,
+        actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+        notes: plan.notes,
+        text: formatTradeSummary(view) + (plan.actions.length > 0
+          ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
+          : `\n没有可做的（${plan.notes[0] ?? '等下一个刷新点'}）`),
+      },
     };
   }
 
@@ -1096,6 +1172,40 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
+      if (route === 'GET /api/trade') {
+        const { account, session } = scoped_(parsed);
+        json((await trade(session, account)).payload);
+        return;
+      }
+      // 立刻跑一段海商王（卖 → 共享 → 买 → 起航 → 加速），判据与循环里那套完全一样。
+      if (route === 'POST /api/trade/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const instance = await ensureConnected(session, account);
+        const config = loadConfigSafe();
+        const stock = await fetchStock(instance, protocol);
+        const survey = await surveyTradeKing(instance, protocol, { stock });
+        const view = viewTradeKing(survey, { config });
+        const plan = planTradeKing(view, { config, allowSpeed: payload.allowSpeed !== false, allowPass: true });
+        const { results } = await runWorld(instance, protocol, plan, {
+          allowMutate: true,
+          window: 800,
+          onStep: (entry) => {
+            if (entry.skipped) emit(session, 'warn', `海商王「${entry.step.label}」跳过：${entry.error}`);
+            else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `海商王 ${entry.step.label}` : `海商王 ${entry.step.label} 失败：${entry.error}`);
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        const gain = formatTradeGain(summarizeTrade(results));
+        if (gain) emit(session, 'info', gain);
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          gain: summarizeTrade(results),
+          ...(await trade(session, account)).payload,
+        });
+        return;
+      }
       if (route === 'GET /api/pet') {        const { account, session } = scoped_(parsed);
         json(await pet(session, account));
         return;
@@ -1577,6 +1687,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 交货拿 EXP+金币是免费的，返航是小时级的，一分钟看一次就够。
         loop.cargoEnabled = payload.cargo !== false;
         loop.cargoEveryMs = secondsArg(payload.cargoEverySeconds, 60) * 1000;
+        // 海商王默认开，间隔默认 60 秒（一趟卖+买+起航就完事，指针够时几乎瞬移）。
+        loop.tradeEnabled = payload.trade !== false;
+        loop.tradeEveryMs = secondsArg(payload.tradeEverySeconds, 60) * 1000;
+        loop.tradeAllowSpeed = payload.tradeSpeed !== false;
+        loop.tradePass = payload.tradePass !== false;
         loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
         // 执行范围也存进 loop：运行中改「拾荒 / 自选包 / 加速器 / 拒单」下一轮就能生效。
         // 注意 allowPaid 只影响日常里的点金/折扣店，热更新同样安全（每段都重新读）。
@@ -1597,6 +1712,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           loop.lastPetAt = null;
           loop.lastIdleAt = null;
           loop.lastTreasureAt = null;
+          loop.lastCargoAt = null;
+          loop.lastTradeAt = null;
         }
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
         const farmText = loop.farmEnabled
@@ -1622,12 +1739,15 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const cargoText = loop.cargoEnabled
           ? (loop.cargoEveryMs > 0 ? `贸易港口每 ${Math.round(loop.cargoEveryMs / 1000)} 秒看一眼` : '贸易港口每轮都看')
           : '贸易港口关';
+        const tradeText = loop.tradeEnabled
+          ? (loop.tradeEveryMs > 0 ? `海商王每 ${Math.round(loop.tradeEveryMs / 1000)} 秒跑一段（指针${loop.tradeAllowSpeed ? '全用' : '不用'}）` : '海商王每轮都跑')
+          : '海商王关';
         const pirateText = loop.pirateEnabled
           ? `海盗${loop.pirateEveryMs > 0 ? `每 ${Math.round(loop.pirateEveryMs / 1000)} 秒` : '每轮'}讨伐一次`
             + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×）`
           : '海盗关';
         const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
-        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
+        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
         // 热更新到此为止：正在跑的那个 runLoop 会从 live() 读到新值，下一轮自动生效。
         if (hot) {
           json({ ok: true, running: true, hot: true, note: '设置已应用，下一轮生效' });
@@ -1666,6 +1786,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           treasureColors: loop.treasureColors,
           cargoEnabled: loop.cargoEnabled,
           cargoEveryMs: loop.cargoEveryMs,
+          tradeEnabled: loop.tradeEnabled,
+          tradeEveryMs: loop.tradeEveryMs,
+          tradeAllowSpeed: loop.tradeAllowSpeed,
+          tradePass: loop.tradePass,
           minPowerRatio: loop.minPowerRatio,
           useSelectPack: loop.useSelectPack,
           maxPackPerRound: loop.maxPackPerRound,
@@ -1690,6 +1814,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastPetAt = summary.gates?.pet?.lastAt ?? loop.lastPetAt;
             loop.lastIdleAt = summary.gates?.idle?.lastAt ?? loop.lastIdleAt;
             loop.lastTreasureAt = summary.gates?.treasure?.lastAt ?? loop.lastTreasureAt;
+            loop.lastCargoAt = summary.gates?.cargo?.lastAt ?? loop.lastCargoAt;
+            loop.lastTradeAt = summary.gates?.trade?.lastAt ?? loop.lastTradeAt;
             // 奖励次数只有真的探测过才有新值（静默窗里是上一轮的旧值，保留着给页面显示）。
             loop.treasureStats = summary.gates?.treasure?.stats ?? loop.treasureStats;
             loop.history.push(summary);
@@ -1792,6 +1918,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       cargoEnabled: loop.cargoEnabled,
       cargoEveryMs: loop.cargoEveryMs,
       lastCargoAt: loop.lastCargoAt,
+      tradeEnabled: loop.tradeEnabled,
+      tradeEveryMs: loop.tradeEveryMs,
+      lastTradeAt: loop.lastTradeAt,
+      tradeAllowSpeed: loop.tradeAllowSpeed,
+      tradePass: loop.tradePass,
       minPowerRatio: loop.minPowerRatio,
       // 执行范围也回给页面：运行中回填勾选，避免「页面勾着、服务端其实关着」。
       useSelectPack: loop.useSelectPack !== false,

@@ -33,6 +33,9 @@ export const WORK_MATERIAL_PACK = '工事材料自选包';
 export const STOCK_PARAM = '产品存量初始上限';
 export const SLOTS_PARAM = '制造位上限';
 const POPULATION_PARAM = '初始人口上限';
+// BuildingCfg.buildingType 里的农田名（UI 名同款）。农田只能靠它认，
+// 因为服务端只在有作物时才编码 building.farm，空地回包里没有这个字段。
+export const FARM_TYPE = '农田';
 
 // 生产时间的公式是**减免后**的，不是 BuildingProduceCfg.produceTime 原值：
 //   BuildingProduceUtil.produceFinalTime = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
@@ -142,6 +145,26 @@ export function topLevel(config, buildingType) {
   return rowsOf(config, 'BuildingUpgradeCfg')
     .filter((r) => r.buildingType === buildingType)
     .reduce((max, r) => Math.max(max, r.level), 0);
+}
+
+// 一块建筑的农田状态：是地块 → {productId, plantAt, ripeAt}（空地三者全 0）；不是 → null。
+//
+// ⚠️ 别用「回包里有没有 farm 字段」判断这是不是农田（2026-10-27 实测）：
+//   服务端**只在有作物时**才编码 farm，空地整条回包里压根没有这个字段 ——
+//   空地长这样：`{"buildingId":"3农田","level":1,"product":{"asset":[]},"skinId":0,...}`。
+//   按字段判断的后果是空地全部变成 farm: null，planWorld 里 farms.length === 0，
+//   整段农田逻辑被静默跳过（连「没种子可种」的 note 都打不出来），地一直空着、
+//   播种永远不发生。所以这里只认 buildingType（'1农田'.endsWith('农田')）。
+//
+// 另外要求已建成：建造中的农田是 level=0 + buildFinishTime，
+// 那种地块不能当空地拿去播种（服务端会拒，白刷一条失败）。
+export function farmOf(raw, type, level) {
+  if (type !== FARM_TYPE || !(Number(level) > 0)) return null;
+  return {
+    productId: raw?.farm?.productId || '',
+    plantAt: Number(raw?.farm?.plantTime ?? 0) || 0,
+    ripeAt: Number(raw?.farm?.ripeTime ?? 0) || 0,
+  };
 }
 
 // --- 生产时间减免 ----------------------------------------------------------------
@@ -305,13 +328,8 @@ export async function surveyWorld(client, protocol, { config = null, player = nu
       // 农田挂在 building.farm 上：{productId, plantTime, ripeTime}。
       // 空地和「已种下」靠 productId 有无区分，成熟靠 ripeTime <= now。
       // 注意 product.asset 对农田恒为空 —— 作物收获后直接进仓库，不走建筑产物。
-      farm: raw.farm
-        ? {
-            productId: raw.farm.productId || '',
-            plantAt: Number(raw.farm.plantTime ?? 0) || 0,
-            ripeAt: Number(raw.farm.ripeTime ?? 0) || 0,
-          }
-        : null,
+      // 「这块地是不是农田」的判断全在 farmOf() 里（别用「有没有 farm 字段」，见那里的注释）。
+      farm: farmOf(raw, type, level),
       product: (raw.product?.asset ?? []).map((a) => ({ id: a.id, num: Number(a.num ?? 0) })),
       // 装备厂（锻造）挂在 building.equipMaking 上：{ makeId, equipId, star, finishTime }。
       // 它**没有 factory 字段**，所以不走 BuildingProduce 那套排产 —— planWorld 完全不碰它，

@@ -1493,3 +1493,69 @@ s.finishDive = function (t) {
 `kind: 'diving'` / `DivingRequest` / `BeginSalvageRequest` / `EndSalvageRequest`。
 **要动这组断言，先读完本节。**
 
+## 15. 海商王（活动「Trade」，17 港口贸易）
+
+**玩法规则**（客户端 `TipsDescCfg['海商王']` 原文核对）：世界地图上 17 个港口，每个港口有一种**特产**（固定不变）
+和一种**紧缺货物**（每天 10 点更新）；货物分 4 档品质，品质越高利润空间越大、库存越少；港口库存**全联盟共享**
+先到先得；每天 10~22 点**每 2 小时**（10/12/14/16/18/20）刷新价格与库存；货物**不能在买入港出售**；
+各港航行均 2 小时，「商会指针」每个 −30 分钟；利润 =（卖出价 − 买入价）× 数量 ×（1 + 商船利润加成），
+亏本卖出无加成、亏损不计入累计利润；紧缺货物必须**亲自到港**才能查看与共享（共享后全联盟可见）。
+
+### 15.1 价格形状（2026-10-27 实盘）
+
+每个港口挂 17 种货，`price = TradeGoodsCfg.unitPrice × 系数`，系数落在 `[0.85, 1.13]`：
+
+| 港口 | specGoodsId（系数最低 = 特产） | rareGoodsId（系数最高 = 当日紧缺） |
+|---|---|---|
+| 91 | 布匹 44 / 基准 50 = 0.88 | 海鲜披萨 316 / 280 = 1.129 |
+| 64 | 海洋球 681 / 800 = 0.851 | 布匹 56 / 50 = 1.12 |
+
+`TradeCityResponse.goods[].stock` 是「本刷新周期内已被买走的数量」，可买量 = `TradeGoodsCfg.maxCount − stock`
+（实盘 4010 在 64 号港 stock=7 → 可买 6993）。
+
+### 15.2 雷达是一张配对表
+
+`TradeGuildRadarResponse.radar[]` 是联盟成员共享的商情：每个港口一条 `{cityId, specGoodsId, rareGoodsId, reportName}`。
+实盘 17 个港口的 `specGoodsId` 集合与 `rareGoodsId` 集合是**同一组 17 种货的两个排列** ——
+每件特产恰好是另一个港口的紧缺货。于是最优路线不是自由规划，而是一条固定环线：
+
+> 在 C 买 C 的特产 → 开到「紧缺 = C 特产」的 D 卖掉 → 在 D 买 D 的特产 → …
+
+每一段都吃 0.88 → 1.13 的最大价差（+27%，再乘商船加成）。`TradeInfoResponse.worldCargo` 是别人在跑的航线，
+只能当情报参考，不参与决策。
+
+### 15.3 协议与判据
+
+| 请求 | 回包 | 说明 |
+|---|---|---|
+| `TradeInfoRequest {}` | `TradeInfoResponse` | `period`（0 = 本期没开）、`player{coins,maxCoins,profit,goods[{pid,goodsId,num,buyPrice,cityId}],buySpeedTimes}`、`cargo{cargoLv,cityId,moveStartTime,moveEndTime,moveToCityId}`、`gotAchieveRwdId`、`gotReportRwdId`、`guildReportNum`、`worldCargo[]`、`guildTask{profit,tradeTimes,gotTaskId[]}`（**联盟**累计，不是个人的） |
+| `TradeCityRequest {cityId}` | `TradeCityResponse` | ⚠ 只能查**船所在的港口**，别处一律 `server prompt: not in city`（实盘 12 个城市全拒） |
+| `TradeBuyRequest {cityId,goodsId,buyNum}` | → `player` | 10 点前返回 `server prompt: not trade time` |
+| `TradeSellRequest {cityId,pid,sellNum}` | → `player` | `pid` 取 `player.goods[].pid`；在买入港卖会被拒（客户端也拦） |
+| `TradeMoveRequest {cityId,mvToCityId}` | `TradeMoveResponse{cargo}` | `moveEndTime = now + 7200`（**秒**） |
+| `TradeSpeedRequest {useNum}` | `TradeSpeedResponse{moveEndTime}` | 每个 −1800 秒，`useNum` 客户端滑块上限 **4** |
+| `TradeCargoUpgradeRequest {}` | `TradeCargoUpgradeResponse{cargo}` | 升船：要 RUBY（300/600/1200/2000），**不做** |
+| `TradeCityReportRequest {cityId}` | 无回包（推 `SCTradeCityReport`） | 共享当日紧缺货，`isReport=true` 表示已被共享过 |
+| `GotTradeAchievementRequest {}` | `{gotAchieveRwdId,reward}` | 个人累计利润成就，判据 `profit > target`（客户端**严格大于**） |
+| `TradeGotTaskRequest {taskId}` | `{gotTaskId,reward}` | 联盟任务，`taskType` 0 = 联盟累计利润 / 1 = 联盟贸易次数 ≥ `tragetCount` |
+| `GotTradeReportRequest {}` | `GotTTradeReportResponse{gotReportRwdId,reward}` | 商情共享奖励，判据 `guildReportNum ≥ TradeDayRewardCfg.roleNum`（5/10/15） |
+| `BattlePassGotRewardRequest {type:3}` | `{got[],reward}` | 海商王战令（`BattlePassType.BP_TRADE = 3`）免费档，积分 = 累计利润 |
+
+**时间闸门**：`TradeBuyRequest` 在 10 点前被拒，但 `TradeMoveRequest` / `TradeSpeedRequest` **不受限制** ——
+所以可以 10 点前先把船开到位、指针全用掉，开门立刻抢库存（全联盟共享、先到先得）。
+
+### 15.4 自动化决策（`src/tradeKing.mjs`）
+
+1. **领奖**：成就（`profit > target`）、联盟任务（按 id 顺序一次领 1 个）、商情共享奖励、战令免费档（积分到线才发）。
+2. **卖**：本港货架里有这件货、且 `price ≥ buyPrice` 才卖（亏本留着 —— 亏了掉本金，而亏损不计入累计利润）。
+3. **共享商情**：`isReport=false` 时发一次（免费，也是全联盟雷达的来源）。
+4. **买**：候选只认「有确切卖点」的货 —— 它必须是某个港口的当日紧缺货；再按 `unitProfit/price` 与
+   `unitProfit/容量` 两个线性规划顶点各算一次分配，取利润大的那个（资金通常是瓶颈）。
+   ⚠ **一条航线只能去一个港口**，所以一次只买一种货：混着买会把第二件货运到卖不掉它的港口。
+   买入量按「卖完之后」的资金与舱位算（同一轮里卖的货会腾出空间）。
+5. **起航**：目的地 = 手上货的紧缺港口；空舱则是本港特产的紧缺港口。收市前到不了就不走。
+6. **加速**：起航后立刻用指针（`useNum = min(4, 持有量)`），2 小时航程能被 4 个指针直接抹平。
+7. **静默窗**：在航且没指针 → 静默到靠港；不在 10~22 点 → 静默到开市；`period=0` → 一天看一次。
+
+占用估算：资金 10000 + 单趟 +27%，4 个指针一趟 ≈ 每轮（60 秒）复利一次，12 小时窗口内的上限是「指针数量」而不是时间。
+

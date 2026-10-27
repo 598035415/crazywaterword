@@ -319,6 +319,28 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 排在挂机最后一段：前面几段（交单/排产）先把材料用掉，剩下的才拿来贸易，避免互相抢料。
 间隔填 0 = 每轮都看。</pre>
 
+    <h2>海商王（港口贸易）</h2>
+    <div class="bar">
+      <label class="dim" title="每天 10~22 点的港口贸易活动：在港就卖掉手上的货、买本港特产、开去「把这件货当紧缺」的港口">
+        <input type="checkbox" id="trade-on" checked> 自动跑海商王
+      </label>
+      <label class="dim">时间间隔 <input id="trade-every" value="60" style="width:64px"> 秒</label>
+      <label class="dim" title="商会指针（免费道具，联盟任务/战令产出）每个缩短 30 分钟航程。关掉就老实等 2 小时一趟">
+        <input type="checkbox" id="trade-speed" checked> 用商会指针
+      </label>
+      <button id="trade-run">立刻跑一段</button>
+      <span id="trade-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="trade-view">17 个港口，每个港口有一种「特产」（固定，价格最低）和一种「紧缺货物」（每天 10 点变，价格最高）。
+最赚钱的路子是把这两个对上：**在 A 买 A 的特产 → 开到「紧缺 = 这件货」的 B 卖掉**，单趟价差约 +27%，
+再乘商船加成（lv1 是 +3%）。雷达（联盟成员共享的商情）给出的 17 个特产和 17 个紧缺货正好互为配对，
+所以路线是一条固定环线：卖完就在本地买特产、开去下一站，一直转到收市。
+- 港口库存全联盟共享、先到先得，每 2 小时（10/12/14/16/18/20 点）刷一次价格与库存 → 刷新后越快抢到越好。
+- 10 点前买不了（server prompt: not trade time），但**能开船和用指针**，所以可以先就位、开门就抢。
+- 只花活动内的商会币（每期重置），**不花钻石**：升船（300/600/1200/2000 钻）和买指针（50 钻/次）都不做。
+- 顺手领：个人累计利润成就、联盟任务、商情共享奖励、海商王战令免费档。
+- 一趟「卖 + 买 + 起航」算一轮，间隔填 0 = 每轮都跑；在航且没指针时会静默到靠港，不会白打请求。</pre>
+
     <h2>海兽培育</h2>
     <div class="bar">
       <label class="dim" title="海兽培育室：成熟的一次领走，队列空位按「材料够的里面品质最高」排满（基因是该物种专属的，攒着没有任何别的用途）">
@@ -934,6 +956,7 @@ const LOOP_FIELDS = [
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
   'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
   'cargo-on', 'cargo-every',
+  'trade-on', 'trade-every', 'trade-speed',
 ];
 for (const id of LOOP_FIELDS) {
   const node = $(id);
@@ -971,6 +994,7 @@ function renderLoop(data) {
   syncInterval('idle-every', data.idleEveryMs);
   syncInterval('treasure-every', data.treasureEveryMs);
   syncInterval('cargo-every', data.cargoEveryMs);
+  syncInterval('trade-every', data.tradeEveryMs);
   // 状态行一律按**服务端实际生效**的开关算（未挂机时才看页面勾选）——
   // 页面勾着但服务端关着时，写「还差 20 秒」会误导。
   const gateOn = (id, serverValue) => (data.running && typeof serverValue === 'boolean' ? serverValue : $(id).checked);
@@ -989,6 +1013,11 @@ function renderLoop(data) {
   renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, gateOn('idle-on', data.idleEnabled), data.running);
   renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, gateOn('treasure-on', data.treasureEnabled), data.running);
   renderGate('cargo-state', data.lastCargoAt, data.cargoEveryMs, gateOn('cargo-on', data.cargoEnabled), data.running);
+  renderGate('trade-state', data.lastTradeAt, data.tradeEveryMs, gateOn('trade-on', data.tradeEnabled), data.running);
+  // 运行中把「用商会指针」回填（默认开），标脏的不动。
+  if (data.running && typeof data.tradeAllowSpeed === 'boolean' && !loopDirty.has('trade-speed')) {
+    $('trade-speed').checked = data.tradeAllowSpeed;
+  }
   renderTreasureCount(data, data.history[data.history.length - 1]);
   if (!data.treasureStats) fetchTreasureCountOnce();
   // 运行中把「抢哪些」回填到多选框（默认只勾万吨），标脏的不动。
@@ -1062,6 +1091,10 @@ $('loop-start').onclick = async () => {
         // 贸易港口（建筑「货轮港口」）默认开，默认 60 秒看一眼：交货换经验金币、返航领藏品奖励。
         cargo: $('cargo-on').checked,
         cargoEverySeconds: Number($('cargo-every').value || 0),
+        // 海商王：默认开、60 秒一段、商会指针全用（免费道具）。
+        trade: $('trade-on').checked,
+        tradeEverySeconds: Number($('trade-every').value || 0),
+        tradeSpeed: $('trade-speed').checked,
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -1210,6 +1243,27 @@ $('cargo-run').onclick = async () => {
     refreshLoop();
   } catch (error) {
     $('cargo-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻跑一段海商王」：卖 → 共享商情 → 买本港特产 → 起航 → 用指针，跟挂机里那套完全一样。
+$('trade-run').onclick = async () => {
+  $('trade-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/trade/run', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, allowSpeed: $('trade-speed').checked }),
+    });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : String.fromCharCode(10, 10) + '这一段没有要做的事（航行中 / 不在贸易时间 / 没货可买）';
+    $('trade-view').textContent = (data.text || '') + tail;
+    $('trade-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  } catch (error) {
+    $('trade-state').textContent = error.message;
   }
 };
 

@@ -23,6 +23,15 @@ import { surveyPirates, viewPirates, planPirates, formatPirateSummary } from './
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
 import { surveyCargo, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, cargoDemandOf } from './tradePort.mjs';
+import {
+  surveyTradeKing,
+  viewTradeKing,
+  planTradeKing,
+  formatTradeSummary,
+  summarizeTrade,
+  formatTradeGain,
+  mergeLearned,
+} from './tradeKing.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
 import {
   surveyTreasure,
@@ -164,6 +173,15 @@ export async function runLoop(initialClient, protocol, {
   // 默认 60 秒看一眼 —— 返航是小时级的，等一分钟不会漏。
   cargoEnabled = true,
   cargoEveryMs = 60_000,
+  // 海商王（10~22 点的港口贸易活动）：在港就卖掉、买本港特产、开去「把这件货当紧缺」的港口。
+  // 全程只花活动内的商会币，不花钻石；唯一消耗是商会指针（免费道具，联盟任务/战令产出）。
+  // 一趟「卖+买+起航」就是一轮，所以 60 秒看一眼足够；在航且没指针时会静默到靠港。
+  tradeEnabled = true,
+  tradeEveryMs = 60_000,
+  // 用商会指针加速航程（免费道具）。关掉就是老老实实等 2 小时一趟。
+  tradeAllowSpeed = true,
+  // 领海商王战令的免费奖励（BattlePassGotRewardRequest type=3，只会发免费档）。
+  tradePass = true,
   // 挂机领取：邮件附件 + 挂机本段收益 + 挂机等级奖励/升级。三件都免费、不发就白放着，
   // 但节奏是「小时级」的（收益 8 小时封顶、等级奖励是按级一次），所以 5 分钟看一次足够，
   // 不必每轮都多打 3 个请求（AfkInfo + EmailBox + 库存复用）。
@@ -198,7 +216,7 @@ export async function runLoop(initialClient, protocol, {
   // 下面十几处 `client.request(...)` 自动就跟上新的，不用逐个改。
   let client = initialClient;
   let linkError = '';
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -220,6 +238,15 @@ export async function runLoop(initialClient, protocol, {
   let lastTreasureAt = 0;
   // 贸易港口同理：探测成功就计时（哪怕三艘船都在航行、或者物品还不够交）。
   let lastCargoAt = 0;
+  // 海商王同理：探测成功就计时（哪怕正在航行、或者不在 10~22 点的贸易时间里）。
+  let lastTradeAt = 0;
+  // 海商王的「在航且没指针」静默窗：2 小时一趟，每 60 秒打一次 TradeInfo 纯属浪费。
+  let tradeSkipUntil = 0;
+  let tradeSkipReason = '';
+  let tradeSkipNoticedAt = 0;
+  // 学到的「港口 → 挂哪些货」（停靠过才知道）。只在内存里，重启就重新学 ——
+  // 它只是用来判断第二件货卖不卖得掉，丢了大不了少赚一点，不值得为它落盘。
+  let tradeLearned = null;
   // 货船缺口 → 工厂排产需求（Map<itemId, 数量>），由第 9 段探测后更新、下一轮的排产使用。
   // null = 从来没探测过（第一次挂机），海面那一段会补一次只读探测。
   let cargoOrderDemand = null;
@@ -312,6 +339,7 @@ export async function runLoop(initialClient, protocol, {
       round, startedAt: Math.floor(tickAt / 1000), link: '', everyMs: everyNow,
       tasks: part(), dailies: part(), world: { ...part(), population: '-', floaterLoot: null },
       idle: part(), treasure: part(), radar: part(), pirate: part(), forge: part(), pet: part(), cargo: part(),
+      trade: part(),
     };
 
     // 一轮的统一收尾：补耗时 → 进历史 → 交给页面/日志。
@@ -767,6 +795,76 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
+    // 10. 海商王（活动「Trade」，每天 10~22 点，17 个港口之间低买高卖）：
+    //     在港 → 领奖 + 卖掉 + 共享商情 + 买本港特产 + 开去「把这件货当紧缺」的港口；
+    //     在航 → 只用商会指针加速（免费道具）。
+    //     它不跟前面任何一段抢资源（不用材料、不用舰队），所以排在最后、独立开关。
+    //     在航且没指针时静默到靠港；不在贸易时间时静默到开市 —— 否则 2 小时里白打 120 次探测。
+    const tradeOn = pickAt(conf, 'tradeEnabled', tradeEnabled);
+    const tradeEvery = pickAt(conf, 'tradeEveryMs', tradeEveryMs);
+    const tradeSpeedNow = pickAt(conf, 'tradeAllowSpeed', tradeAllowSpeed) === true;
+    const tradePassNow = pickAt(conf, 'tradePass', tradePass) === true;
+    const tradeSkipping = tradeOn && tradeSkipUntil > tickAt;
+    const tradeDue = tradeOn && !tradeSkipping && gateDue(lastTradeAt, tradeEvery, tickAt);
+    if (halted()) break;
+    if (tradeDue) {
+      try {
+        const tradeSurvey = await linkRetry(() => surveyTradeKing(client, protocol, {
+          learned: tradeLearned,
+          // 复用海面那一段的库存表：商会指针存量就在里面，零额外请求。
+          stock: worldSurvey?.stock ?? null,
+        }));
+        const tradeView = viewTradeKing(tradeSurvey, { config });
+        const tradePlan = planTradeKing(tradeView, {
+          config,
+          allowSpeed: tradeSpeedNow,
+          allowPass: tradePassNow,
+        });
+        summary.trade.planned = tradePlan.actions.length;
+        summary.trade.notes = tradePlan.notes;
+        summary.trade.summary = formatTradeSummary(tradeView);
+        // 学到本港挂哪些货（下次判断「第二件货卖不卖得掉」时用）。
+        if (tradeView.cargo.phase === 'dock' && tradeView.shelf.length > 0) {
+          tradeLearned = mergeLearned(tradeLearned, {
+            period: tradeView.period,
+            cityId: tradeView.cargo.cityId,
+            shelf: tradeView.shelf,
+          });
+        }
+        // 静默窗：在航且没指针 → 等靠港；不在贸易时间 → 等开市。两种都不该每 60 秒探一次。
+        if (tradeView.period === 0) {
+          // 本期没开（活动期间之外）：一天看一次就够，别每 60 秒问一遍。
+          tradeSkipUntil = (tradeView.windowOpen ? tradeView.startAt + 86_400 : tradeView.startAt) * 1000;
+          tradeSkipReason = '本期海商王活动未开启';
+        } else if (tradeView.cargo.phase === 'sail' && !(tradeSpeedNow && tradeView.speed.owned > 0)) {
+          tradeSkipUntil = (tradeView.cargo.moveEndTime + 5) * 1000;
+          tradeSkipReason = `航行中（剩 ${Math.ceil(tradeView.cargo.leftSeconds / 60)} 分钟）`;
+        } else if (!tradeView.windowOpen) {
+          tradeSkipUntil = tradeView.startAt * 1000 + 1_000;
+          tradeSkipReason = `不在贸易时间（${new Date(tradeView.startAt * 1000).getHours()} 点开市）`;
+        } else {
+          tradeSkipUntil = 0;
+          tradeSkipReason = '';
+        }
+        tradeSkipNoticedAt = 0;
+        if (tradePlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, tradePlan, {
+            allowMutate,
+            rejected: rejected.trade,
+            window: 800,
+            onStep: (entry) => onStep?.({ round, phase: 'trade', ...entry }),
+          });
+          rejected.trade = stillRejected;
+          summary.trade.results = results;
+          summary.trade.gain = formatTradeGain(summarizeTrade(results));
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastTradeAt = tickAt;
+      } catch (error) {
+        summary.trade.notes = [`海商王探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan?.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -777,6 +875,9 @@ export async function runLoop(initialClient, protocol, {
     // 贸易港口的静默窗是「船在海上」这一个原因，设窗那一轮印一次就够。
     const cargoSkipNotice = cargoSkipping && tickAt - cargoSkipNoticedAt >= SKIP_NOTICE_MS;
     if (cargoSkipNotice) cargoSkipNoticedAt = tickAt;
+    // 海商王的静默窗有两种原因（在航 / 不在市），同样只在设窗那一轮 + 每 30 分钟报一次。
+    const tradeSkipNotice = tradeSkipping && tickAt - tradeSkipNoticedAt >= SKIP_NOTICE_MS;
+    if (tradeSkipNotice) tradeSkipNoticedAt = tickAt;
     // gates 里必须是**这一轮真正生效**的值（conf），否则网页上改了设置，
     // 状态行还按启动时的旧值算「还差多久」，看起来像改了没用。
     summary.gates = {
@@ -812,6 +913,16 @@ export async function runLoop(initialClient, protocol, {
         skipUntil: cargoSkipping ? Math.floor(cargoSkipUntil / 1000) : null,
         skipNotice: cargoSkipNotice,
       },
+      trade: {
+        ...gateSummary(tradeOn, tradeEvery, lastTradeAt, tickAt),
+        throttled: tradeOn && !tradeDue && !tradeSkipping,
+        skipped: tradeSkipping,
+        skipReason: tradeSkipping ? tradeSkipReason : '',
+        skipForever: false,
+        skipLeftSeconds: tradeSkipping ? Math.max(0, Math.ceil((tradeSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: tradeSkipping ? Math.floor(tradeSkipUntil / 1000) : null,
+        skipNotice: tradeSkipNotice,
+      },
     };
 
     // 本轮耗时：页面上直接能看到「一轮 12 秒」，据此判断间隔是否够用。
@@ -845,6 +956,15 @@ const KIND_TEXT = {
   petFeed: '材料加速',
   cargoFill: '交货',
   cargoReward: '领贸易奖励',
+  tradeSell: '海商王卖货',
+  tradeBuy: '海商王买货',
+  tradeSail: '海商王起航',
+  tradeSpeed: '商会指针加速',
+  tradeShare: '共享商情',
+  tradeAchieve: '领海商王成就',
+  tradeTask: '领联盟任务',
+  tradeReportReward: '领商情奖励',
+  tradePass: '领海商王战令',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -1007,12 +1127,20 @@ export function formatLoopRound(summary) {
         ...(summary.cargo.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
     ...(floater ? [`  ${floater}`] : []),
+    // 海商王同理：探测过就印一行（哪怕是「航行中，还剩 100 分钟」），否则看不出开关是否生效。
+    ...(summary.trade && (summary.trade.summary || (summary.trade.notes ?? []).length > 0)
+      ? [`${line('海商王', summary.trade)}${summary.trade.summary ? `  ${summary.trade.summary}` : ''}`
+          + (summary.trade.gain ? `  ${summary.trade.gain}` : ''),
+        ...detailLines(summary.trade),
+        ...(summary.trade.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
     ...[gateLine('海盗', summary.gates?.pirate)].filter(Boolean),
     ...[gateLine('锻造', summary.gates?.forge)].filter(Boolean),
     ...[gateLine('海兽培育', summary.gates?.pet)].filter(Boolean),
     ...[gateLine('贸易港口', summary.gates?.cargo)].filter(Boolean),
+    ...[gateLine('海商王', summary.gates?.trade)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),

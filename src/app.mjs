@@ -31,6 +31,14 @@ import {
   DEFAULT_COLORS,
 } from './treasure.mjs';
 import {
+  surveyTradeKing,
+  viewTradeKing,
+  planTradeKing,
+  formatTradeSummary,
+  summarizeTrade,
+  formatTradeGain,
+} from './tradeKing.mjs';
+import {
   surveyCargo,
   fetchStock,
   viewCargo,
@@ -922,6 +930,64 @@ async function cargoCli({ allowMutate, dryRun }) {
   }
 }
 
+// 海商王：只读探测 + 计划，「--run」才真执行（会改账号状态，需要 --yes）。
+async function tradeCli({ allowMutate, dryRun, allowSpeed = true }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  try {
+    const response = await client.connect(login);
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const config = getConfig();
+    const stock = await fetchStock(client, protocol);
+    const survey = await surveyTradeKing(client, protocol, { stock });
+    const view = viewTradeKing(survey, { config });
+    const plan = planTradeKing(view, { config, allowSpeed });
+    console.log(`\n${formatTradeSummary(view)}`);
+    if (!view.open) console.log('  本期未开启 / 不在贸易时间（每天 10~22 点）');
+    console.log(`  下次刷新价 ${new Date(view.nextRefreshAt * 1000).toLocaleTimeString()} · 商会指针 ${view.speed.owned} 个`);
+    if (view.shelf.length > 0) {
+      console.log(`\n本港（城市 ${view.cargo.cityId}）货架：`);
+      for (const row of view.shelf) {
+        const mark = row.goodsId === view.specGoodsId ? ' 特产' : (row.goodsId === view.rareGoodsId ? ' 紧缺' : '');
+        const cand = view.candidates.find((c) => c.goodsId === row.goodsId);
+        console.log(`  ${row.name.padEnd(6, ' ')} ${String(row.price).padStart(5)} / 基准 ${row.base}`
+          + ` 系数 ${row.ratio.toFixed(3)} 可买 ${row.avail}${mark}`
+          + (cand ? ` → 城${cand.destCityId} 单件利润 ${cand.unitProfit}` : ''));
+      }
+    }
+    console.log('\n配对表（本港特产 → 该卖到哪个港口）：');
+    for (const pair of view.pairs) {
+      console.log(`  城${String(pair.cityId).padStart(3)} 特产 ${pair.specName.padEnd(6, ' ')} → 城${pair.sellCityId}`);
+    }
+    console.log(`\n计划 ${plan.actions.length} 条`);
+    for (const action of plan.actions) console.log(`  ${action.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+
+    if (dryRun) {
+      console.log('\n--dry：只列计划，未执行');
+      return;
+    }
+
+    console.log('\n执行:');
+    const { results } = await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 900,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+    const gain = formatTradeGain(summarizeTrade(results));
+    if (gain) console.log(`\n${gain}`);
+  } finally {
+    client.stop();
+  }
+}
+
 // 临时验证命令：SetAutoFarmingRequest 到底管什么？// 协议里它只有一个 isOn，配置里却同时有「自动潜水」和「自动拾荒」两个 param，
 // 而海面响应里也有一堆并列的自动开关。所以不猜，发一次，前后各拍一张快照对比：
 // 漂浮物数量掉不掉、autoFarming 变不变 true、三个小游戏等级动不动。
@@ -1093,6 +1159,9 @@ async function loopCli({
   // 贸易港口（建筑「货轮港口」）：3 艘货船逐格交货换 EXP/金币，返航后领藏品奖励。
   cargoEnabled = true,
   cargoEverySeconds = 60,
+  // 海商王（每天 10~22 点的港口贸易）：在港就卖、买本港特产、开去「把这件货当紧缺」的港口。
+  tradeEnabled = true,
+  tradeEverySeconds = 60,
   treasureEnabled = true,
   treasureEverySeconds = 60,
   // 抢哪些货轮等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）；默认只抢万吨。
@@ -1126,6 +1195,7 @@ async function loopCli({
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     console.log(`贸易港口=${cargoEnabled ? (cargoEverySeconds > 0 ? `开(每 ${cargoEverySeconds}s 看一眼：逐格交货换经验金币 + 返航领奖)` : '开(每轮都看)') : '关'}`);
+    console.log(`海商王=${tradeEnabled ? (tradeEverySeconds > 0 ? `开(每 ${tradeEverySeconds}s 跑一段：卖→买特产→起航，指针全用)` : '开(每轮都跑)') : '关'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -1160,13 +1230,15 @@ async function loopCli({
       minPowerRatio,
       cargoEnabled,
       cargoEveryMs: Math.max(0, Number(cargoEverySeconds) || 0) * 1000,
+      tradeEnabled,
+      tradeEveryMs: Math.max(0, Number(tradeEverySeconds) || 0) * 1000,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'pirate' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure' || entry.phase === 'cargo') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'pirate' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure' || entry.phase === 'cargo' || entry.phase === 'trade') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -1385,6 +1457,9 @@ async function main() {
       // 贸易港口：--no-cargo 关，--cargo-every 秒（默认 60）。
       cargoEnabled: !process.argv.includes('--no-cargo'),
       cargoEverySeconds: at('--cargo-every', 60),
+      // 海商王：--no-trade 关，--trade-every 秒（默认 60）。
+      tradeEnabled: !process.argv.includes('--no-trade'),
+      tradeEverySeconds: at('--trade-every', 60),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -1491,6 +1566,15 @@ async function main() {
     await cargoCli({
       dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'trade') {
+    await tradeCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      allowSpeed: !process.argv.includes('--no-speed'),
     });
     return;
   }

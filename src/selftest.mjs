@@ -5,6 +5,13 @@ import { createCodec, HEADER_PREFIX } from './codec.mjs';
 import { compressBlock, decompressBlock, compressBound, makeHashTable } from './lz4.mjs';
 import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
 import { gateDue, humanDuration, formatLoopRound, loopTotal, loopGap, MIN_LOOP_GAP_MS } from './loop.mjs';
+import {
+  tradeParams,
+  tradeWindow,
+  nextRefreshAt,
+  viewTradeKing,
+  planTradeKing,
+} from './tradeKing.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -1202,6 +1209,24 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   // 开关关掉就完全不碰农田（连收都不收）—— 循环按自己的间隔传 farm:false。
   const off = planWorld(surveyFor({ plots: [ripe, idle], seeds: { 小麦种子: 10 } }), { config, farm: false });
   assert.equal(of(off, 'farmHarvest').length + of(off, 'farmPlant').length, 0, 'farm:false touches nothing');
+  checked += 1;
+}
+
+// 地块识别（farmOf）：服务端**只在有作物时才编码 building.farm**，空地那条建筑里压根没有 farm 字段。
+// 旧实现按「有没有 farm 字段」判断是不是农田 → 空地全部变成 null → farms.length === 0 →
+// 整段农田逻辑静默跳过，播种永远不发生（2026-10-27 真实事故：3 块地空了一整天）。
+{
+  const { farmOf } = await import('./world.mjs');
+  const empty = { buildingId: '3农田', level: 1, product: { asset: [] }, skinId: 0 };
+  const planted = { buildingId: '1农田', level: 1, farm: { productId: '小麦', plantTime: 100, ripeTime: 1900 } };
+  const building = { buildingId: '4农田', level: 0, buildStartTime: 90, buildFinishTime: 5000 };
+
+  assert.deepEqual(farmOf(empty, '农田', 1), { productId: '', plantAt: 0, ripeAt: 0 },
+    'a farm plot with no farm field in the payload is an EMPTY plot, not a non-farm building');
+  assert.deepEqual(farmOf(planted, '农田', 1), { productId: '小麦', plantAt: 100, ripeAt: 1900 },
+    'a planted plot keeps productId / plantAt / ripeAt');
+  assert.equal(farmOf(building, '农田', 0), null, 'a farm still under construction is not a plantable plot');
+  assert.equal(farmOf(empty, '食品厂', 1), null, 'other building types are never plots');
   checked += 1;
 }
 
@@ -3116,8 +3141,9 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(archive.dayOf(noon), '2026-10-23', '按本地日期切目录，不是 UTC');
   // 日志时间戳也必须用本地时间：用 toISOString() 的话东八区下比目录日期早 8 小时，
   // 事后再按「今天这一轮」对日志和归档目录就对不上。
+  // 格式固定 `YYYY-MM-DD HH:mm:ss.SSS`：不带 ISO 的 `T` 和 `+08:00`（全机东八区，偏移没信息量）。
   const stamp = archive.stamp(noon);
-  assert.match(stamp, /^2026-10-23T12:00:00\.000[+-]\d{2}:\d{2}$/, '日志时间戳带本地时区偏移');
+  assert.match(stamp, /^2026-10-23 12:00:00\.000$/, '日志时间戳是本地时间，空格分隔且不带时区后缀');
   assert.equal(stamp.slice(0, 10), archive.dayOf(noon), '日志日期与归档目录日期必须是同一天');
   assert.equal(archive.archivePath('AllItemResponse', noon, '/tmp/r'), path.join('/tmp/r', '2026-10-23', 'AllItemResponse.jsonl'));
 
@@ -3905,4 +3931,246 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海盗讨伐 / 日志脱敏与回包归档）`);
+// --- 海商王（活动 Trade） --------------------------------------------------
+// 判据全部来自实盘：city91 特产布匹 44（基准 50）、紧缺海鲜披萨 316（基准 280）；
+// city64 特产海洋球 681（基准 800）、紧缺布匹 56（基准 50）→ 91 买 → 64 卖。
+{
+  const cfg = {
+    tables: {
+      ActivityTradeCfg: { data: [
+        { key: '海商王行驶时间', value: '120' },
+        { key: '海商王加速时长', value: '30' },
+        { key: '海商王加速日购买上限', value: '50' },
+        { key: '海商王初始货币', value: '10000' },
+        { key: '海商王贸易时间', value: '10-22' },
+        { key: '海商王刷新时间', value: '10,12,14,16,18,20' },
+      ] },
+      TradeShipCfg: { data: [
+        { lv: 1, profitMargin: 300, capacity: 1000, upMoney: 0, upCost: [] },
+        { lv: 2, profitMargin: 600, capacity: 3000, upMoney: 10000, upCost: ['RUBY', 300] },
+      ] },
+      TradeGoodsCfg: { data: [
+        { goodsId: 1005, lv: 1, itemId: '布匹', itemName: '布匹', qualityIndex: 1, unitPrice: 50, maxCount: 60000, capacity: 1 },
+        { goodsId: 2007, lv: 2, itemId: '面包', itemName: '面包', qualityIndex: 2, unitPrice: 120, maxCount: 30000, capacity: 2 },
+        { goodsId: 3003, lv: 3, itemId: '海鲜披萨', itemName: '海鲜披萨', qualityIndex: 3, unitPrice: 280, maxCount: 15000, capacity: 4 },
+        { goodsId: 4010, lv: 4, itemId: '海洋球', itemName: '海洋球', qualityIndex: 4, unitPrice: 800, maxCount: 7000, capacity: 10 },
+      ] },
+      TradeAchieveRewardCfg: { data: [
+        { id: 1001, rewardId: 1, target: 5000, rewards: [['GOLD', 50000]] },
+        { id: 1001, rewardId: 2, target: 10000, rewards: [['抽卡券', 10]] },
+      ] },
+      TradeGuildTaskCfg: { data: [
+        { id: 1, day: 1, taskType: 0, tragetCount: 50000, rewards: [['海商王加速', 2]] },
+        { id: 4, day: 1, taskType: 1, tragetCount: 50, rewards: [['海商王加速', 2]] },
+      ] },
+      TradeDayRewardCfg: { data: [{ id: 1, roleNum: 5, rewards: [['海商王加速', 2]] }] },
+    },
+  };
+  // 雷达是一张配对表：91 特产布匹 → 64 的紧缺是布匹；64 特产海洋球 → 97 的紧缺是海洋球。
+  const radar = { radar: [
+    { cityId: 91, specGoodsId: 1005, rareGoodsId: 3003, reportName: '我' },
+    { cityId: 64, specGoodsId: 4010, rareGoodsId: 1005, reportName: '甲' },
+    { cityId: 97, specGoodsId: 3003, rareGoodsId: 4010, reportName: '乙' },
+  ] };
+  const shelf = [
+    { goodsId: 4010, stock: 7, price: 752 },
+    { goodsId: 1005, stock: 1292, price: 44 },
+    { goodsId: 3003, stock: 0, price: 316 },
+    { goodsId: 2007, stock: 0, price: 115 },
+  ];
+  const dockSurvey = (over = {}) => ({
+    now: new Date(2026, 9, 27, 10, 30, 0).getTime(),
+    period: 1001,
+    docked: true,
+    radar,
+    city: { goods: shelf, specGoodsId: 1005, rareGoodsId: 3003, isReport: false },
+    speedItems: 0,
+    info: {
+      period: 1001,
+      player: { coins: 10000, maxCoins: 10000, profit: 0, goods: [], buySpeedTimes: 0 },
+      cargo: { cargoLv: 1, cityId: 91, moveStartTime: 0, moveEndTime: 0, moveToCityId: 0 },
+      gotAchieveRwdId: 0,
+      gotReportRwdId: 0,
+      guildReportNum: 0,
+      guildTask: { profit: 60000, tradeTimes: 10, gotTaskId: [] },
+      ...over,
+    },
+  });
+
+  // 1. 时间闸门：10~22 点开市，下一次开市 / 下一次刷新价都要算对。
+  const params = tradeParams(cfg);
+  assert.equal(params.sailMinutes, 120, '行驶时间 120 是**分钟**');
+  assert.equal(params.speedMinutes, 30, '指针 30 分钟');
+  const openNow = tradeWindow(new Date(2026, 9, 27, 10, 30, 0).getTime(), params);
+  assert.equal(openNow.open, true, '10:30 应该开市');
+  const early = tradeWindow(new Date(2026, 9, 27, 9, 30, 0).getTime(), params);
+  assert.equal(early.open, false, '9:30 未开市');
+  assert.equal(new Date(early.startAt * 1000).getHours(), 10, '未开市时给出今天 10 点');
+  const late = tradeWindow(new Date(2026, 9, 27, 22, 10, 0).getTime(), params);
+  assert.equal(late.open, false, '22:10 已收市');
+  assert.equal(new Date(late.startAt * 1000).getDate(), 28, '收市后给出明天 10 点');
+  assert.equal(new Date(nextRefreshAt(new Date(2026, 9, 27, 10, 30, 0).getTime(), params) * 1000).getHours(), 12,
+    '10:30 之后的下一个刷新点是 12 点');
+
+  // 2. 视图：系数 / 可买量 / 配对 / 特产卖点。
+  const dock = viewTradeKing(dockSurvey(), { config: cfg });
+  assert.equal(dock.cargo.phase, 'dock', '停港时 phase=dock');
+  const cloth = dock.shelf.find((row) => row.goodsId === 1005);
+  assert.ok(Math.abs(cloth.ratio - 0.88) < 1e-9, `布匹系数应是 0.88，实际 ${cloth.ratio}`);
+  assert.equal(cloth.avail, 60000 - 1292, '可买量 = maxCount − 已卖出的 stock');
+  assert.equal(dock.specSellCity, 64, '91 的特产布匹要卖到 64');
+  assert.equal(dock.rareCityOf[4010], 97, '海洋球的紧缺港口是 97');
+  // 紧缺货 3003 的配对港口就是本港（91）→ 不能算可买（货物不能在买入港出售）。
+  const pizza = dock.candidates.find((row) => row.goodsId === 3003);
+  assert.ok(pizza === undefined || pizza.sure === false, '本港紧缺的货不算「有确切卖点」');
+
+  // 3. 计划（在港、开市）：共享商情 + 买特产 + 起航 64。
+  const plan = planTradeKing(dock, { config: cfg });
+  const kinds = plan.actions.map((a) => a.kind);
+  assert.ok(kinds.includes('tradeShare'), '未共享过的港口要共享商情');
+  const buy = plan.actions.find((a) => a.kind === 'tradeBuy');
+  assert.ok(buy, '开市时应该买货');
+  assert.equal(buy.body.goodsId, 1005, '买本港特产布匹');
+  // 10000 商会币 / 44 = 227 件；舱位 1000（每件占 1）也不挡 → 227。
+  assert.equal(buy.body.buyNum, 227, `应该买满 227 件，实际 ${buy.body.buyNum}`);
+  assert.equal(plan.actions.find((a) => a.kind === 'tradeSail').body.mvToCityId, 64, '起航去 64 卖布匹');
+  assert.ok(!kinds.includes('tradeSpeed'), '没有指针就不发加速');
+
+  // 4. 10 点前：只领奖，买卖与起航都不发（实盘 09:3x 买入返回 `not trade time`）。
+  const preopen = viewTradeKing({ ...dockSurvey(), now: new Date(2026, 9, 27, 9, 30, 0).getTime() }, { config: cfg });
+  const prePlan = planTradeKing(preopen, { config: cfg });
+  assert.ok(prePlan.actions.every((a) => a.kind !== 'tradeBuy' && a.kind !== 'tradeSail' && a.kind !== 'tradeSell'),
+    '10 点前不发买卖/起航');
+  assert.ok(prePlan.notes.some((note) => note.includes('不在贸易时间')), '要说明不在贸易时间');
+
+  // 5. 卖货：客户端同款算法 ceil(buyPrice*n + ceil((price-buyPrice)*n*(1+margin/1e4)))。
+  // 到港后的货架：布匹 56（64 的紧缺货）、海洋球 681（64 的特产）、海鲜披萨 253。
+  const arriveSurvey = () => ({
+    now: new Date(2026, 9, 27, 12, 30, 0).getTime(),
+    period: 1001,
+    docked: true,
+    radar,
+    city: {
+      goods: [
+        { goodsId: 1005, stock: 0, price: 56 },
+        { goodsId: 4010, stock: 0, price: 681 },
+        { goodsId: 3003, stock: 0, price: 253 },
+      ],
+      specGoodsId: 4010,
+      rareGoodsId: 1005,
+      isReport: true,
+    },
+    speedItems: 8,
+    info: {
+      period: 1001,
+      player: {
+        coins: 3200, maxCoins: 10000, profit: 0, buySpeedTimes: 0,
+        goods: [{ pid: 7, goodsId: 1005, num: 100, buyPrice: 44, cityId: 91 }],
+      },
+      cargo: { cargoLv: 1, cityId: 64, moveStartTime: 1, moveEndTime: 0, moveToCityId: 0 },
+      gotAchieveRwdId: 0,
+      gotReportRwdId: 0,
+      guildReportNum: 0,
+      guildTask: { profit: 0, tradeTimes: 0, gotTaskId: [] },
+    },
+  });
+  const holding = viewTradeKing(arriveSurvey(), { config: cfg });
+  const sellPlan = planTradeKing(viewTradeKing(arriveSurvey(), { config: cfg }), { config: cfg });
+  const sell = sellPlan.actions.find((a) => a.kind === 'tradeSell');
+  assert.ok(sell, '有盈利持仓时要卖');
+  assert.equal(sell.body.pid, 7, '卖货要带 pid');
+  assert.equal(sell.body.sellNum, 100, '一次全卖');
+  // 100 × (56−44) × 1.03 = 1236 利润；收入 = 4400 + 1236 = 5636。
+  const soldRow = holding.sellable[0];
+  assert.equal(soldRow.profit, 1236, `利润应是 1236，实际 ${soldRow.profit}`);
+  assert.equal(soldRow.revenue, 5636, `收入应是 5636，实际 ${soldRow.revenue}`);
+  // 卖完的商会币 3200+5636=8836 → 买 64 的特产海洋球 681/件 = 12 件（舱位 120）。
+  const rebuy = sellPlan.actions.find((a) => a.kind === 'tradeBuy');
+  assert.ok(rebuy, '卖完要接着买');
+  assert.equal(rebuy.body.goodsId, 4010, '在 64 买特产海洋球');
+  assert.equal(rebuy.body.buyNum, 12, `8836 / 681 应买 12 件，实际 ${rebuy.body.buyNum}`);
+  assert.equal(sellPlan.actions.find((a) => a.kind === 'tradeSail').body.mvToCityId, 97, '海洋球要卖到 97');
+  // 8 个指针 → 4 个把 2 小时航程直接抹平。
+  const speed = sellPlan.actions.find((a) => a.kind === 'tradeSpeed');
+  assert.ok(speed && speed.body.useNum === 4, '指针够就一次用满 4 个（客户端滑块上限就是 4）');
+
+  // 6. 亏本不卖：本港只卖 30，低于买入价 44 → 留着，不发 TradeSellRequest。
+  const losing = viewTradeKing({
+    ...dockSurvey({
+      player: {
+        coins: 100, maxCoins: 10000, profit: 0, buySpeedTimes: 0,
+        goods: [{ pid: 9, goodsId: 1005, num: 10, buyPrice: 44, cityId: 91 }],
+      },
+      cargo: { cargoLv: 1, cityId: 64, moveStartTime: 1, moveEndTime: 0, moveToCityId: 0 },
+    }),
+    // 64 这一天布匹只卖 30（低于买入价 44）→ 亏本，留着等贵的港口。
+    city: { goods: [{ goodsId: 1005, stock: 0, price: 30 }, { goodsId: 4010, stock: 0, price: 681 }], specGoodsId: 4010, rareGoodsId: 1005, isReport: true },
+  }, { config: cfg });
+  assert.equal(losing.sellable[0].profitable, false, '低于买入价不算可卖');
+  const losingPlan = planTradeKing(losing, { config: cfg });
+  assert.ok(!losingPlan.actions.some((a) => a.kind === 'tradeSell'), '亏本不卖');
+  assert.ok(losingPlan.notes.some((note) => note.includes('留着')), '要说清为什么留着');
+
+  // 7. 在航：只发加速，不发买卖/起航。
+  const sailing = viewTradeKing({
+    now: new Date(2026, 9, 27, 13, 0, 0).getTime(),
+    period: 1001,
+    docked: false,
+    radar,
+    city: null,
+    speedItems: 3,
+    info: {
+      period: 1001,
+      player: { coins: 500, maxCoins: 10000, profit: 0, goods: [], buySpeedTimes: 0 },
+      // moveEndTime 是**秒级**；这里取「现在 + 1 小时」，保证判成在航。
+      cargo: {
+        cargoLv: 1,
+        cityId: 64,
+        moveStartTime: Math.floor(new Date(2026, 9, 27, 13, 0, 0).getTime() / 1000) - 60,
+        moveEndTime: Math.floor(new Date(2026, 9, 27, 13, 0, 0).getTime() / 1000) + 3600,
+        moveToCityId: 97,
+      },
+      gotAchieveRwdId: 0,
+      gotReportRwdId: 0,
+      guildReportNum: 0,
+      guildTask: { profit: 0, tradeTimes: 0, gotTaskId: [] },
+    },
+  }, { config: cfg });
+  const sailPlan = planTradeKing(sailing, { config: cfg });
+  assert.equal(sailPlan.actions.filter((a) => a.kind === 'tradeSpeed').length, 1, '在航只发加速');
+  assert.ok(!sailPlan.actions.some((a) => a.kind === 'tradeBuy' || a.kind === 'tradeSail'), '在航不买卖不起航');
+
+  // 8. 领奖：成就（profit > target 才领，客户端同款严格大于）/ 联盟任务 / 商情奖励。
+  const richPlan = planTradeKing(viewTradeKing(dockSurvey({
+    player: { coins: 5000, maxCoins: 60000, profit: 12000, goods: [], buySpeedTimes: 0 },
+    guildReportNum: 6,
+  }), { config: cfg }), { config: cfg });
+  assert.ok(richPlan.actions.some((a) => a.kind === 'tradeAchieve'), '利润过线要领成就');
+  assert.ok(richPlan.actions.some((a) => a.kind === 'tradeTask' && a.body.taskId === 1), '联盟利润过线要领任务 1');
+  assert.ok(richPlan.actions.some((a) => a.kind === 'tradeReportReward'), '商情共享 6/5 要领奖励');
+
+  // 9. 循环日志：这一段真的探测过就印一行「海商王」，被静默时印原因。
+  const tradeRound = formatLoopRound({
+    round: 9, startedAt: 0,
+    tasks: { planned: 0, results: [] },
+    dailies: { planned: 0, results: [] },
+    world: { planned: 0, results: [], notes: [], population: '10/20', floaterLoot: null },
+    trade: {
+      planned: 1,
+      notes: [],
+      summary: '利润 12000 · 商会币 5000/60000 · 船 lv1（舱位 1000，+3%） · 停在城市 91 · 下一站 城市 64',
+      results: [{
+        step: { kind: 'tradeBuy', label: '买 布匹×227 @44（→ 城市 64 卖出，预计利润 2497）', items: [['布匹', 227]] },
+        ok: true,
+      }],
+    },
+    gates: { trade: { enabled: true, everyMs: 60_000, lastAt: 1_700_000_000, waitSeconds: 0, throttled: false, skipped: true, skipReason: '航行中（剩 100 分钟）', skipLeftSeconds: 6000, skipNotice: true } },
+  });
+  assert.ok(tradeRound.includes('海商王 计划 1'), `要有海商王概览行，实际：\n${tradeRound}`);
+  assert.ok(tradeRound.includes('成功 海商王买货 布匹×227'), `成功行要带具体货物，实际：\n${tradeRound}`);
+  assert.ok(tradeRound.includes('海商王 暂停探测：航行中'), `静默要说明原因，实际：\n${tradeRound}`);
+
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 海盗讨伐 / 日志脱敏与回包归档）`);

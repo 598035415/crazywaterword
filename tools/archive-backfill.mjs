@@ -25,8 +25,12 @@ const fileArg = args.indexOf('--file');
 const source = fileArg >= 0 ? path.resolve(args[fileArg + 1]) : PROTOCOL_LOG;
 const STATE_PATH = path.join(ARCHIVE_ROOT, '.backfill.json');
 
-const RE_OUT = /^(\S+) \[(\w+)\] -> \[(\w+)\] seq=(-?\d+) (\d+)B(?: (.*))?$/;
-const RE_IN = /^(\S+) \[(\w+)\] \[(\w+)\] seq=(-?\d+) (.*)$/;
+// 行首时间戳两种格式都收：新 `2026-10-27 09:28:14.350`、旧 `2026-10-27T09:28:14.350+08:00`。
+// 老日志里两种会混着出现（改格式前后各写一半），所以不能只认一种，也不能用 `\S+` 抓
+// —— 空格分隔的话 `\S+` 只吃到日期就断了，整行会被当成「旧格式」悄悄跳过。
+const TS = String.raw`(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:[+-]\d{2}:\d{2})?)`;
+const RE_OUT = new RegExp(String.raw`^${TS} \[(\w+)\] -> \[(\w+)\] seq=(-?\d+) (\d+)B(?: (.*))?$`);
+const RE_IN = new RegExp(String.raw`^${TS} \[(\w+)\] \[(\w+)\] seq=(-?\d+) (.*)$`);
 
 if (!fs.existsSync(ARCHIVE_ROOT)) fs.mkdirSync(ARCHIVE_ROOT, { recursive: true });
 

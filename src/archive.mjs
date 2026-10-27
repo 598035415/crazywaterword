@@ -163,18 +163,17 @@ export function record({ dir, name, seq, body, tag = null, t = Date.now(), parti
   return appendLine(archivePath(name, t), line);
 }
 
-// 日志时间戳用**本地时间 + 时区偏移**，跟 dayOf() 按本地日期切目录保持一致。
-// 之前用 toISOString()（UTC），东八区下日志时间比目录日期早 8 小时 ——
-// 事后按「今天这一轮」对日志和归档目录时两边对不上。
+// 日志时间戳用**本地时间**（`2026-10-27 09:28:14.350`），跟 dayOf() 按本地日期切目录保持一致。
+// 两个坑：
+// ① 早先用 toISOString()（UTC），东八区下日志时间比目录日期早 8 小时，事后对不上；
+// ② 后来带上了 ISO 的 `T` 和 `+08:00`（`2026-10-27T09:28:14.350+08:00`），
+//    grep / awk / Excel / 肉眼看都嫌吵，而全机都是东八区，偏移量没有信息量 → 去掉。
+// 毫秒保留：一轮 2000 多行（约 33 行/秒），去掉毫秒同一秒内的先后就分不出来了。
 export function stamp(ms = Date.now()) {
   const d = new Date(ms);
   const pad = (n) => String(n).padStart(2, '0');
-  const offset = -d.getTimezoneOffset();
-  const sign = offset >= 0 ? '+' : '-';
-  const abs = Math.abs(offset);
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
-    + `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+    + ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
 // 时序流水。tag 是账号前缀，CW_DEBUG=1 时同时打到终端。
