@@ -236,6 +236,18 @@ export function attach(client, { tag = null, log = true } = {}) {
     if (state.log) traceLine(state.tag, `[${name}] seq=${seq} ${clipBody(body)}`);
   });
 
+  // 本地 proto 落后于服务端时会收到没定义的帧（2026-10-28 FarmHarvestResponse 卡死了整条下行流）。
+  // 这类帧的 body 解不出来，但**原始字节**是补 proto 的唯一依据 —— 落一行 hex 到 protocol.log，
+  // 下次游戏更新新增消息时可以直接照着补定义。只留前 256 字节，够看字段和 tag。
+  client.on('unknown', ({ seq, name, bytes }) => {
+    if (!archiveEnabled() || !state.log) return;
+    const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+    const head = raw.subarray(0, 256);
+    const hex = Buffer.from(head).toString('hex');
+    const suffix = raw.byteLength > head.byteLength ? '…' : '';
+    traceLine(state.tag, `? [${name}] seq=${seq} ${raw.byteLength}B hex=${hex}${suffix}`);
+  });
+
   return state;
 }
 

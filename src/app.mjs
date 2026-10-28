@@ -733,7 +733,7 @@ async function idleCli({ allowMutate, dryRun }) {
 // --dry 只列判定；--yes 才真的派兵（战败会掉舰船耐久，所以默认要求 1.2 倍战力余量）。
 // --power-ratio 0.8 可以放宽到「八折战力也上」，自己承担战损。
 // --max N 限制最多派几艘（默认不限制 = 有多少空闲船就派多少）。
-async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinity }) {
+async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinity, repairBelowPercent = 80 }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -742,14 +742,17 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
 
   const response = await client.connect(login);
   const config = loadConfigSafe();
+  // 百分数 -> 比例（radar 模块内部统一用比例）。
+  const repairBelow = Math.min(1, Math.max(0, Number(repairBelowPercent) || 0) / 100);
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
-    const survey = await surveyRadar(client, protocol, { config });
-    const view = viewRadar(survey, { config, minPowerRatio });
-    const plan = planRadar(view, { minPowerRatio, maxDispatch });
+    const survey = await surveyRadar(client, protocol, { config, repairBelow });
+    const view = viewRadar(survey, { config, minPowerRatio, repairBelow });
+    const plan = planRadar(view, { minPowerRatio, maxDispatch, repairBelow });
     console.log(`\n${formatRadarPlan(view, plan)}\n`);
     const capText = Number.isFinite(Number(maxDispatch)) ? `一次最多派 ${maxDispatch} 艘` : '空闲船全派';
-    console.log(`共 ${plan.actions.length} 个动作（战力余量 ${minPowerRatio}×，${capText}）`);
+    const repairText = repairBelow > 0 ? `耐久 <${Math.round(repairBelow * 100)}% 就修` : '不修船';
+    console.log(`共 ${plan.actions.length} 个动作（战力余量 ${minPowerRatio}×，${capText}，${repairText}）`);
 
     if (dryRun) {
       console.log('--dry：只列计划，未执行');
@@ -768,9 +771,9 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
 
     // 只认重新探测的结果：舰队状态、事件状态都是服务端说了算。
     await new Promise((resolve) => setTimeout(resolve, 1500));
-    const after = await surveyRadar(client, protocol, { config });
-    const afterView = viewRadar(after, { config, minPowerRatio });
-    console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
+    const after = await surveyRadar(client, protocol, { config, repairBelow });
+    const afterView = viewRadar(after, { config, minPowerRatio, repairBelow });
+    console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}(${Math.round(fleet.duraPct * 100)}%)`).join(' ') || '无'}`);
     console.log(`  待领奖 ${view.rewards.length} -> ${afterView.rewards.length}，可派 ${view.events.filter((e) => e.dispatchable).length} -> ${afterView.events.filter((e) => e.dispatchable).length}`);
     console.log(`  汽油 ${after.petrol}`);
   } finally {
@@ -782,7 +785,9 @@ async function radar({ allowMutate, dryRun, minPowerRatio, maxDispatch = Infinit
 // 跟每日任务里的「免战扫荡」（PirateSweepRequest，一天 10 次、不动舰队）是两码事。
 // --dry 只列计划；--yes 才真派（每次烧 300 汽油，不掉耐久）。
 // --repeat 连已通关等级也刷（只剩固定掉落）；--power-ratio 改战力余量；--max N 限制派几艘。
-async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Infinity, repeat = false }) {
+async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Infinity, repeat = false, repairBelowPercent = 80 }) {
+  // 耐久闸（百分数 -> 比例）：低于它的船不出战（打野怪不掉耐久，但耐久低会降输出）。
+  const duraFloor = Math.min(1, Math.max(0, Number(repairBelowPercent) || 0) / 100);
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -796,7 +801,7 @@ async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Inf
   try {
     console.log(`login ok: ${describeRole(player)?.nickname} lv${describeRole(player)?.level}`);
     const survey = await surveyPirates(client, protocol, { config, player });
-    const view = viewPirates(survey, { config, minPowerRatio, repeat });
+    const view = viewPirates(survey, { config, minPowerRatio, repeat, duraFloor });
     const plan = planPirates(view, { maxPerRound });
     console.log(`\n${formatPiratePlan(view, plan)}\n`);
     const capText = Number.isFinite(Number(maxPerRound)) ? `一次最多派 ${maxPerRound} 艘` : '空闲船全派';
@@ -823,7 +828,7 @@ async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Inf
     // 只认重新探测的结果：舰队状态和击杀进度都是服务端说了算。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const after = await surveyPirates(client, protocol, { config, player });
-    const afterView = viewPirates(after, { config, minPowerRatio, repeat });
+    const afterView = viewPirates(after, { config, minPowerRatio, repeat, duraFloor });
     const progress = (one) => one.types.map((type) => `${type.name.replace('海盗', '')}${type.killedLevel}`).join('/');
     console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
     console.log(`  击杀进度 ${progress(view)} -> ${progress(afterView)}`);
@@ -834,7 +839,9 @@ async function pirateCli({ allowMutate, dryRun, minPowerRatio, maxPerRound = Inf
 }
 
 // 搁浅的货轮（世界宝藏）：按勾选的等级挑货轮（无人占领的优先，被占着的也派）→ 一条请求把空闲舰队压上去。
-async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
+async function treasureCli({ allowMutate, dryRun, maxFleets, colors, repairBelowPercent = 80 }) {
+  // 耐久闸（百分数 -> 比例）：低于它的船不派去抢（要打守军，耐久低会降输出、挨打更疼）。
+  const duraFloor = Math.min(1, Math.max(0, Number(repairBelowPercent) || 0) / 100);
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
@@ -847,7 +854,7 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
   try {
     console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
     const survey = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
-    const view = viewTreasure(survey, { config, colors: wanted, maxFleets });
+    const view = viewTreasure(survey, { config, colors: wanted, maxFleets, duraFloor });
     const plan = planTreasure(view, { maxFleets });
     console.log(`\n${formatTreasureSummary(view)}`);
     console.log(`\n${formatTreasurePlan(view, plan)}\n`);
@@ -871,7 +878,7 @@ async function treasureCli({ allowMutate, dryRun, maxFleets, colors }) {
     // 只认重新探测的结果：货轮归属和舰队状态都是服务端说了算。
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const after = await surveyTreasure(client, protocol, { config, player: response.playerInfo });
-    const afterView = viewTreasure(after, { config, colors: wanted, maxFleets });
+    const afterView = viewTreasure(after, { config, colors: wanted, maxFleets, duraFloor });
     console.log(`\n对照: 舰队 ${afterView.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '无'}`);
     console.log(`  可抢 ${view.targets.length} -> ${afterView.targets.length}，${rewardCountText(afterView)}，汽油 ${after.petrol}`);
   } finally {
@@ -1157,6 +1164,8 @@ async function loopCli({
   farmEverySeconds = 120,
   radarEnabled = true,
   radarEverySeconds = 60,
+  // 修船门槛（百分数，默认 80）：耐久低于它就把船留在港里修，不派出去打情报。0 = 关。
+  radarRepairBelow = 80,
   pirateEnabled = true,
   pirateEverySeconds = 60,
   pirateRepeat = false,
@@ -1201,7 +1210,7 @@ async function loopCli({
     console.log(`开关: 加速=${allowSpeedUp ? '开(只花' + SPEED_UP_ITEM + ')' : '关'} 拒绝重刷=${allowReroll ? '开' : '关'}`);
     console.log(`拾荒=${pickUpFloaters ? (pickEverySeconds > 0 ? `开(每 ${pickEverySeconds}s 最多一次)` : '开(每轮都试)') : '关'}`);
     console.log(`农田=${farmEnabled ? (farmEverySeconds > 0 ? `开(每 ${farmEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
-    console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×)` : `开(每轮都看，战力余量 ${minPowerRatio}×)`) : '关'}`);
+    console.log(`情报=${radarEnabled ? (radarEverySeconds > 0 ? `开(每 ${radarEverySeconds}s 扫一次，战力余量 ${minPowerRatio}×` : `开(每轮都看，战力余量 ${minPowerRatio}×`) : '关'}` + (radarEnabled ? `，${radarRepairBelow > 0 ? `耐久<${radarRepairBelow}% 就修` : '不修船'})` : ''));
     console.log(`海盗=${pirateEnabled ? (pirateEverySeconds > 0 ? `开(每 ${pirateEverySeconds}s 讨伐一次，${pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${minPowerRatio}×)` : `开(每轮都讨伐，${pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${minPowerRatio}×)`) : '关'}`);
     console.log(`锻造=${forgeEnabled ? (forgeEverySeconds > 0 ? `开(每 ${forgeEverySeconds}s 看一眼)` : '开(每轮都看)') : '关'}`);
     console.log(`海兽培育=${petEnabled ? (petEverySeconds > 0 ? `开(每 ${petEverySeconds}s 看一眼，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})` : `开(每轮都看，品质上限 ${petMaxQuality}，材料加速${petFeed ? '开' : '关'})`) : '关'}`);
@@ -1227,6 +1236,7 @@ async function loopCli({
       farmEveryMs: Math.max(0, Number(farmEverySeconds) || 0) * 1000,
       radarEnabled,
       radarEveryMs: Math.max(0, Number(radarEverySeconds) || 0) * 1000,
+      radarRepairBelow: Math.min(100, Math.max(0, Number(radarRepairBelow) || 0)),
       pirateEnabled,
       pirateEveryMs: Math.max(0, Number(pirateEverySeconds) || 0) * 1000,
       pirateRepeat,
@@ -1449,6 +1459,9 @@ async function main() {
       farmEverySeconds: at('--farm-every', 120),
       radarEnabled: !process.argv.includes('--no-radar'),
       radarEverySeconds: at('--radar-every', 60),
+      // 修船门槛（百分数）：--repair-below 80 默认（--radar-repair 是旧别名）；
+      // 0 = 不修船（耐久再低也照派）。
+      radarRepairBelow: at('--repair-below', at('--radar-repair', 80)),
       pirateEnabled: !process.argv.includes('--no-pirate'),
       pirateEverySeconds: at('--pirate-every', 60),
       // 默认只打「没打过的下一个等级」，--pirate-repeat 才刷已通关的。
@@ -1525,6 +1538,9 @@ async function main() {
       // 战力余量：默认 1.2（舰队战力要比敌方高 20% 才派），--power-ratio 可改。
       minPowerRatio: numericArg('--power-ratio') ?? DEFAULT_MIN_POWER_RATIO,
       maxDispatch: numericArg('--max') ?? Infinity,
+      // 修船门槛（百分数，默认 80）：耐久低于它就把船留在港里修，不派出去。
+      // --repair-below 0 = 关掉修船。
+      repairBelowPercent: numericArg('--repair-below') ?? 80,
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;

@@ -1,5 +1,5 @@
 // 主战英雄养成（主线出战阵容，GetFormationResponse）：在 heroes.mjs 的「等级 / 升星 / 技能」之外，补上
-// **勋章（强化、替换）** 与 **装备（升级、精炼、升星、替换）**。
+// **勋章（强化、替换）**、**装备（升级、精炼、升星、替换）** 与 **专武（升级、升星）**。
 //
 // 事实来源（反编译客户端 `subpackages/main/game.js` + 生产回包双向核对，无推测）：
 // - 徽章数据在 `AllHeroResponse.heroes[].badges[]`（含 pos 1..4 与随机属性 attr），
@@ -23,6 +23,31 @@
 //   精炼石 ×costItem2，上限 `EquipAttrCfg[id_star].maxRefineLv`）；
 //   升星 `EquipStarUpRequest{uid}`（`EquipUpStarCfg[star+1].upCosts`，上限 5 星）。
 //   前两条与升星都**没有 Response**，成功静默 / 被拒推 PromptResponse，所以走 sendWatch。
+// - 专武（英雄专属武器）数据**不在 AllHeroResponse 的独立列表里**，而在每个英雄自己的
+//   `heroes[].exclusive = { level, star }`（`DisplayHero.exclusive`，protobuf 默认值不编码，
+//   所以 0 级英雄这条字段整个不出现 → 一律按 level=0/star=0 处理，不能当成「没专武系统」）。
+//   有没有专武系统只看配置：`ExclusiveWeaponCfg` 里存在 `heroId_1` 这一行（客户端
+//   `exclusiveWeapon(heroId,1)` 就是查这个 key）。本服 39 个英雄有专武。
+// - 升级 `HeroExclusiveLevelUpRequest { heroId }` 一次 +1 级（客户端 `_onBtnLevelUp` 点一下发一条），
+//   **没有专属 Response**，成功推 `HeroExclusiveNextUpResponse { nextHero }`。
+//   每级消耗 `ExclusiveUpgradeCfg[目标级].cost[s]`，`s` 由英雄品质决定：RED → 1，其它 → 0
+//   （实证客户端 `heroExcluseiveUpgradeRedDot`：`"RED"==quality && (s=1)` + `cost[s]`）。
+//   也就是说那一对材料是「按品质二选一」，不是两条都要。
+//   无专武时第一次升级就是激活：客户端用 `exclusive ? 下一级.cost : 当前(1级).cost`，
+//   所以 level=0 取 1 级的成本，正好等于「目标级 = level+1」这一条通式，不用特判。
+// - 升级有**双门槛**（同一个红点函数）：英雄星级 >= 当前级配置的 `heroStar`（全表恒 15），
+//   且当前等级 < 当前专武星级配置的 `unlockLv`（0 星封顶 50 级、1 星 52、……、25 星 100）。
+//   所以「先升星放开等级上限、再升级」是唯一顺的做法。
+// - 升星 `HeroExclusiveStarUpRequest { heroId, universal }` 上限 25 星，每星消耗
+//   `ExclusiveStarCfg[目标星].cost[s]`（橙/红升星石，同样按品质二选一）+ **英雄碎片**
+//   `piece` 个（60~100，道具名就是 `heroId+碎片`，客户端 `heroFragItemId`）。
+//   `universal` = 客户端那个「自动兑换」开关，true 才允许用 `HeroCfg.universalItemId`
+//   补碎片；本模块**恒发 false**，只花英雄自己的碎片 —— 万能碎片是通兑货币，替这里垫掉
+//   等于偷偷挪用别处的进度。
+//   升星要求英雄 25 星（`heroStar` 全表恒 25），而此时英雄已满星，碎片本来就没有别的用途，
+//   不会和 heroes.mjs 的英雄升星抢同一批碎片（那边最多花到满星为止）。
+// - 专武升星**必须已有专武**（客户端 `if (!hero.exclusive) return false`）：0 级时先把
+//   等级升到 1，再谈升星。
 // - 执行器直接复用 world.mjs 的 `runWorld`（它认 request/response/body/key/group/transient），
 //   不另写一套 —— 那是本仓库唯一一份「失败隔离 + 跳过被拒动作」的实现。
 
@@ -34,12 +59,19 @@ export const BADGE_STAR_ITEM = '徽章升星石';
 export const EQUIP_IRON = '精铁';
 export const EQUIP_REFINE_ITEM = '精炼石';
 export const EQUIP_STAR_ITEM = '装备升星石';
+// 专武升星石按英雄品质二选一（橙英雄吃橙石、红英雄吃红石），两样都要列进材料栏。
+export const EXCLUSIVE_STONE_ORANGE = '橙专武升星石';
+export const EXCLUSIVE_STONE_RED = '红专武升星石';
+export const EXCLUSIVE_LV_MATERIALS = ['初级专武材料', '中级专武材料', '高级专武材料', '特级专武材料'];
 export const GOLD = 'GOLD';
 
 // 装备部位。顺序固定，用于「空位先穿哪件」这类确定性输出。
 export const EQUIP_SLOTS = ['武器', '防具', '饰品'];
 
 export const MAX_EQUIP_STAR = 5;
+
+// 专武星级上限（ExclusiveStarCfg 最大 star）。写死是为了「到顶就不再排」的判据不依赖配置表末尾。
+export const MAX_EXCLUSIVE_STAR = 25;
 
 // 一次执行的上限：每条升级请求只涨 1 级，不封顶会在精铁充足时一次发出几百条。
 export const MAX_ACTIONS_PER_HERO = 80;
@@ -53,6 +85,8 @@ export const GROW_SWITCHES = {
   equipRefine: true,
   equipStar: true,
   equipReplace: true,
+  exclusiveStar: true,
+  exclusiveLevel: true,
 };
 
 export const SWITCH_LABELS = {
@@ -62,6 +96,8 @@ export const SWITCH_LABELS = {
   equipRefine: '装备精炼',
   equipStar: '装备升星',
   equipReplace: '装备替换',
+  exclusiveStar: '专武升星',
+  exclusiveLevel: '专武升级',
 };
 
 function num(value) {
@@ -97,7 +133,35 @@ function buildIndex(config) {
     equipUpLevel: new Map(rowsOf(config, 'EquipUpDecomposeCfg').map((row) => [num(row.level), row])),
     equipRefine: new Map(rowsOf(config, 'EquipRefineCfg').map((row) => [num(row.level), row])),
     equipUpStar: new Map(rowsOf(config, 'EquipUpStarCfg').map((row) => [num(row.star), row])),
+    // 专武：等级表按 level（1..100），星级表按 star（0..25），
+    // 有专武系统的英雄 = ExclusiveWeaponCfg 里存在 heroId_1（客户端 exclusiveWeapon(id,1) 同款判据）。
+    exclusiveUpgrade: new Map(rowsOf(config, 'ExclusiveUpgradeCfg').map((row) => [num(row.level), row])),
+    exclusiveStar: new Map(rowsOf(config, 'ExclusiveStarCfg').map((row) => [num(row.star), row])),
+    exclusiveHeroes: new Set(
+      rowsOf(config, 'ExclusiveWeaponCfg')
+        .filter((row) => num(row.skillLv) === 1)
+        .map((row) => row.heroId),
+    ),
   };
+}
+
+// 专武材料按英雄品质二选一：RED 取 cost[1]，其它取 cost[0]（客户端红点里那个 `s`）。
+// 返回 null 表示这条配置没有可用的消耗（星级表的 star0 就是空数组）。
+export function exclusiveCostOf(row, quality) {
+  const costs = Array.isArray(row?.cost) ? row.cost : [];
+  const pick = quality === 'RED' ? costs[1] : costs[0];
+  if (Array.isArray(pick) && pick[0] && num(pick[1]) > 0) return [pick[0], num(pick[1])];
+  const fallback = costs.find((one) => Array.isArray(one) && one[0] && num(one[1]) > 0);
+  return fallback ? [fallback[0], num(fallback[1])] : null;
+}
+
+// 专武等级当前被「专武星级」封到几级：0 星 50、1 星 52 …… 25 星 100（ExclusiveStarCfg.unlockLv）。
+export function exclusiveLevelCap(index, star) {
+  return num(index.exclusiveStar.get(num(star))?.unlockLv);
+}
+
+export function exclusiveHasWeapon(index, heroId) {
+  return index.exclusiveHeroes.has(heroId);
 }
 
 export function badgeMaxLevel(index, badgeId, star) {
@@ -209,6 +273,10 @@ export async function surveyHeroGrowth(client, protocol, { config, playerLevel =
       // 是否在主线出战阵容里 —— 页面上「主战英雄」就是这一批。
       front: frontSet.has(hero.heroId),
       skillLevels: (hero.skillLevels ?? []).map(num),
+      // 专武：`exclusive` 是 protobuf 默认值不编码的字段，0 级英雄整条缺失 → 归零处理。
+      // hasExclusive 才是「这个英雄有没有专武系统」（配置里有没有 heroId_1）。
+      exclusive: hero.exclusive ? { level: num(hero.exclusive.level), star: num(hero.exclusive.star) } : { level: 0, star: 0 },
+      hasExclusive: exclusiveHasWeapon(index, hero.heroId),
       badges: (hero.badges ?? []).filter((one) => one && one.badgeId).map((one) => describeBadge(one, num(one.pos))),
       equips: (hero.equips ?? []).filter((one) => one && one.equipId).map(describeEquip),
     };
@@ -269,6 +337,18 @@ function makeBudget(stock) {
 
 function costText(pairs) {
   return pairs.filter(([, n]) => num(n) > 0).map(([id, n]) => `${id}×${num(n)}`).join(' + ');
+}
+
+// 专武一次会连升几十级，材料种类还会跨档（初→中→高→特），所以按「材料 → 累计数量」
+// 边升边记账，页面那一行显示的是整轮总量，而不是最后一级那一档。
+function addSpent(map, id, n) {
+  const value = num(n);
+  if (!id || value <= 0) return;
+  map.set(id, (map.get(id) ?? 0) + value);
+}
+
+function spentText(map) {
+  return [...map].filter(([, n]) => n > 0).map(([id, n]) => `${id}×${n}`).join(' + ');
 }
 
 function goldText(n) {
@@ -336,6 +416,12 @@ function finalizeItems(items) {
     if (item.kind === 'equipRefine') {
       return { kind: item.kind, text: `${item.title} ${item.from}→${item.to}${item.cost ? `（精铁 ${item.cost}）` : ''}` };
     }
+    if (item.kind === 'exclusiveLevel') {
+      return { kind: item.kind, text: `${item.title} ${item.from}→${item.to} 级${item.materials ? `（${item.materials}）` : ''}` };
+    }
+    if (item.kind === 'exclusiveStar') {
+      return { kind: item.kind, text: `${item.title} ${item.from}→${item.to} 星${item.materials ? `（${item.materials}）` : ''}` };
+    }
     return { kind: item.kind, text: `${item.title} ${item.from}→${item.to} 星` };
   });
 }
@@ -355,6 +441,8 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
   // onlyFront：默认只养当前出战阵容（GetFormationResponse 的 5 个位置）。拉不到阵型
   // （heroIds 为空）时退化成「全部英雄」，否则整页会一条动作都排不出来。
   const hasFormation = (survey.formation?.heroIds ?? []).length > 0;
+  // 专武门槛按「原因」聚合：5 个主战都卡在英雄 25 星时，逐人说一遍会把日志刷成 5 行噪声。
+  const exclusiveBlocked = { starUp: [], levelUp: [] };
   const picked = survey.heroes
     .filter((hero) => (heroIds ? heroIds.includes(hero.heroId) : true))
     .filter((hero) => (heroIds || !onlyFront || !hasFormation ? true : hero.front))
@@ -579,6 +667,91 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
       }
     }
 
+    // ---- 专武：先升星（放开等级上限），再升级 ----
+    // 材料与勋章/装备完全不重叠；唯一共享的是「英雄碎片」，而专武升星要求英雄 25 星 ——
+    // 那时英雄碎片已经没有别的去处（heroes.mjs 的英雄升星最多花到满星），所以不会互相抢。
+    if (hero.hasExclusive && (on.exclusiveStar || on.exclusiveLevel)) {
+      let exclusiveLevel = num(hero.exclusive?.level);
+      let exclusiveStar = num(hero.exclusive?.star);
+      const fragId = `${hero.heroId}碎片`;
+      const starSpent = new Map();
+      const levelSpent = new Map();
+
+      // 升星的前置是「已有专武」（客户端 `if (!hero.exclusive) return false`）：0 级时本轮只做激活，
+      // 升星留到下一轮 —— 不能拿还没发出去的升级当已生效，否则会先发一条必被拒的升星。
+      if (on.exclusiveStar && exclusiveLevel > 0) {
+        while (exclusiveStar < MAX_EXCLUSIVE_STAR && heroActions.length < MAX_ACTIONS_PER_HERO) {
+          const next = index.exclusiveStar.get(exclusiveStar + 1);
+          if (!next) break;
+          const needHeroStar = num(next.heroStar);
+          if (hero.star < needHeroStar) {
+            exclusiveBlocked.starUp.push(`${hero.heroId}（${hero.star}星）`);
+            break;
+          }
+          const stone = exclusiveCostOf(next, hero.quality);
+          const piece = num(next.piece);
+          if (!stone) break;
+          // 碎片与升星石必须同时够：只扣一半的话，石头花掉了碎片却不够，等于白扔。
+          if (budget.have(fragId) < piece || budget.have(stone[0]) < stone[1]) break;
+          budget.take(fragId, piece);
+          budget.take(stone[0], stone[1]);
+          addSpent(starSpent, fragId, piece);
+          addSpent(starSpent, stone[0], stone[1]);
+          const from = exclusiveStar;
+          exclusiveStar += 1;
+          push({
+            kind: 'exclusiveStar',
+            // universal 恒 false：不拿万能碎片替这里的英雄碎片垫（通兑货币留给英雄升星）。
+            body: { heroId: hero.heroId, universal: false },
+            request: 'HeroExclusiveStarUpRequest',
+            response: null,
+            key: `exclusiveStar:${hero.heroId}:${exclusiveStar}`,
+            group: `hero:${hero.heroId}:exclusiveStar`,
+            transient: true,
+            label: `${hero.heroId} 专武升到 ${exclusiveStar} 星（${fragId}×${piece} + ${stone[0]}×${stone[1]}）`,
+          }, { mergeKey: `exclusiveStar:${hero.heroId}`, title: '专武升星', from, to: exclusiveStar, materials: spentText(starSpent) });
+        }
+      }
+
+      if (on.exclusiveLevel) {
+        // 等级上限由**当前专武星级**决定（0 星 50 级），所以上面先把星级抬起来。
+        const cap = exclusiveLevelCap(index, exclusiveStar);
+        const gate = index.exclusiveUpgrade.get(exclusiveLevel || 1);
+        if (gate && hero.star < num(gate.heroStar)) {
+          // 这里不能 break：外层是「遍历英雄」的循环，break 会把后面的英雄一起跳过。
+          exclusiveBlocked.levelUp.push(`${hero.heroId}（${hero.star}星）`);
+        } else if (gate) {
+          let level = exclusiveLevel;
+          if (!cap) notes.push(`${hero.heroId} 专武星级异常（${exclusiveStar} 星没有等级上限配置）`);
+          while (cap && level < cap && heroActions.length < MAX_ACTIONS_PER_HERO) {
+            // level=0 时取的是 1 级的成本，正好等于「无专武 → 首次激活」客户端用的那条，
+            // 不需要为激活单独写一个分支。
+            const row = index.exclusiveUpgrade.get(level + 1);
+            if (!row) break;
+            const cost = exclusiveCostOf(row, hero.quality);
+            if (!cost || !budget.take(cost[0], cost[1])) break;
+            addSpent(levelSpent, cost[0], cost[1]);
+            const from = level;
+            level += 1;
+            push({
+              kind: 'exclusiveLevel',
+              body: { heroId: hero.heroId },
+              request: 'HeroExclusiveLevelUpRequest',
+              response: null,
+              // 每级一条请求，key 必须带目标等级，否则第 2 级起会被当同一条去重。
+              key: `exclusiveLevel:${hero.heroId}:${level}`,
+              group: `hero:${hero.heroId}:exclusiveLevel`,
+              transient: true,
+              label: `${hero.heroId} 专武升到 ${level} 级（${cost[0]}×${cost[1]}）`,
+            }, { mergeKey: `exclusiveLevel:${hero.heroId}`, title: '专武升级', from, to: level, materials: spentText(levelSpent) });
+          }
+          exclusiveLevel = level;
+        }
+      }
+
+      hero.exclusive = { level: exclusiveLevel, star: exclusiveStar };
+    }
+
     actions.push(...heroActions);
     heroes.push({
       heroId: hero.heroId,
@@ -594,8 +767,22 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
       equips: hero.equips.map((one) => ({
         type: one.type, equipId: one.equipId, level: one.level, star: one.star, refineLv: one.refineLv,
       })),
+      // 专武：level/star 是「计划执行后」的值，页面照它显示；hasExclusive=false 的英文本就没有专武系统。
+      exclusive: { ...hero.exclusive },
+      hasExclusive: hero.hasExclusive,
       items: finalizeItems(items),
     });
+  }
+
+  // 专武门槛：只有开关开着、且真有英雄卡住时才说一句，别在没开专武的账号上刷屏。
+  // 星级门槛从配置里读（两处现都恒 25 / 15），不写死数字，改版后不会说错话。
+  if (on.exclusiveStar && exclusiveBlocked.starUp.length) {
+    const need = num(index.exclusiveStar.get(1)?.heroStar);
+    notes.push(`专武升星要英雄 ${need} 星：${exclusiveBlocked.starUp.join('、')}`);
+  }
+  if (on.exclusiveLevel && exclusiveBlocked.levelUp.length) {
+    const need = num(index.exclusiveUpgrade.get(1)?.heroStar);
+    notes.push(`专武升级要英雄 ${need} 星：${exclusiveBlocked.levelUp.join('、')}`);
   }
 
   return { actions, notes, heroes, switches: on };
@@ -637,6 +824,9 @@ export function buildHeroRows(survey, plan, growth, { onlyFront = true } = {}) {
         skillLevels: hero.skillLevels,
         badges: hero.badges,
         equips: hero.equips,
+        // 专武当前值来自 survey（探测时的真实值），计划里的变化看 exclusiveItems。
+        exclusive: hero.exclusive ?? null,
+        hasExclusive: Boolean(hero.hasExclusive),
         // 英雄本体：等级 / 升星 / 技能各一行口径。
         kpi: {
           level: levelStep ? `lv${levelStep.from}→${levelStep.to}（+${levelStep.count}）` : null,
@@ -645,6 +835,7 @@ export function buildHeroRows(survey, plan, growth, { onlyFront = true } = {}) {
         },
         badgeItems: items.filter((one) => one.kind.startsWith('badge')).map((one) => one.text),
         equipItems: items.filter((one) => one.kind.startsWith('equip')).map((one) => one.text),
+        exclusiveItems: items.filter((one) => one.kind.startsWith('exclusive')).map((one) => one.text),
         actions: items.length,
       };
     })

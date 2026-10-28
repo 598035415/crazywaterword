@@ -32,7 +32,7 @@
 // （客户端 `isUniteWorldsForbidTime()` 依赖合服计划数据，我们拿不到 —— 服务端会拒，被拒的动作记 rejected 即可）。
 
 import { normalize } from './worlds.mjs';
-import { rowsOf, assetCount } from './world.mjs';
+import { rowsOf, assetCount, fleetDuraOk, fleetDuraPct } from './world.mjs';
 
 // 三种海盗类型。配置表里 showName 是「海盗先锋/精锐/头目」，但表可能缺行，所以留一份兜底文案。
 export const PIRATE_TYPES = [1, 2, 3];
@@ -195,13 +195,21 @@ export function viewPirates(survey, {
   config = null,
   minPowerRatio = 1.2,
   repeat = false,
+  // 耐久闸（比例）：低于它的船不出战。打野怪本身「消耗耐久 = 0」（WorldParamCfg），
+  // 但耐久 <1600 会「降低输出、增加受到的伤害」（LoadingTipsCfg），
+  // 也就是更容易打输、白烧 300 汽油 —— 所以先修再打更划算。0 = 不拦（旧行为）。
+  duraFloor = 0,
 } = {}) {
   const cfg = config ?? survey.config ?? null;
   const season = Number(survey.season) || 0;
   const ratio = Number(minPowerRatio) > 0 ? Number(minPowerRatio) : 1.2;
   const fleets = survey.fleets ?? [];
-  const idle = fleets
-    .filter((fleet) => fleet.state === 1)
+  const idleAll = fleets.filter((fleet) => fleet.state === 1);
+  // 耐久不够的留在港里（由情报段统一修）：它们不参与战力评估，否则会算出「能打」却没人去。
+  const groundedFleets = (Number(duraFloor) > 0 ? idleAll.filter((fleet) => !fleetDuraOk(fleet, duraFloor)) : [])
+    .map((fleet) => ({ ...fleet, duraPct: fleetDuraPct(fleet) }));
+  const idle = idleAll
+    .filter((fleet) => !groundedFleets.some((one) => one.buildingId === fleet.buildingId))
     .slice()
     .sort((a, b) => b.power - a.power);
   // 舰队战力取「最强的那艘空闲船」：派兵是一艘一艘派的，`powerNeeded` 的判定同理。
@@ -300,11 +308,16 @@ export function viewPirates(survey, {
     fleets: fleets.map((fleet) => ({
       ...fleet,
       stateText: FLEET_STATE_TEXT[fleet.state] ?? `状态 ${fleet.state}`,
+      duraPct: fleetDuraPct(fleet),
     })),
     idleFleets: idle.map((fleet) => ({
       ...fleet,
       stateText: FLEET_STATE_TEXT[fleet.state] ?? `状态 ${fleet.state}`,
+      duraPct: fleetDuraPct(fleet),
     })),
+    // 因为耐久不够被留下的空闲船（由情报段修）。
+    groundedFleets,
+    duraFloor: Number(duraFloor) > 0 ? Math.min(1, Number(duraFloor)) : 0,
     bestIdlePower: bestPower,
     types,
     targets,
@@ -327,7 +340,14 @@ export function planPirates(view, { maxPerRound = Infinity } = {}) {
     return { actions, notes };
   }
   if (view.idleFleets.length === 0) {
-    notes.push(`没有空闲舰队（${view.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '一艘都没有'}）`);
+    const grounded = view.groundedFleets ?? [];
+    if (grounded.length > 0) {
+      // 全被耐久闸留下：这是新增的一层，必须说清楚，否则看着像「开关没生效」。
+      notes.push(`${grounded.length} 艘空闲船耐久低于 ${Math.round((Number(view.duraFloor) || 0) * 100)}%，`
+        + `先去修再出战：${grounded.map((fleet) => `${fleet.buildingId}(${Math.round((fleet.duraPct ?? 0) * 100)}%)`).join('、')}`);
+    } else {
+      notes.push(`没有空闲舰队（${view.fleets.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '一艘都没有'}）`);
+    }
     return { actions, notes };
   }
   if (view.petrol < cost) {
@@ -400,7 +420,9 @@ export function planPirates(view, { maxPerRound = Infinity } = {}) {
 export function formatPirateSummary(view) {
   const head = `S${view.season || '?'}${view.seasonExact ? '' : '（赛季未知，战力取各赛季最高，偏保守）'}`
     + ` · 汽油 ${view.petrol}（每次 ${view.petrolCost}）`
-    + ` · 空闲船 ${view.idleFleets.length}/${view.fleets.length}（最强 ${powerText(view.bestIdlePower)}）`;
+    + ` · 空闲船 ${view.idleFleets.length}/${view.fleets.length}（最强 ${powerText(view.bestIdlePower)}）`
+    // 被耐久闸留下的船单独标出来：否则「空闲船 0/2」看着像船都在航行。
+    + ((view.groundedFleets ?? []).length > 0 ? ` · 耐久<${Math.round((Number(view.duraFloor) || 0) * 100)}% ${view.groundedFleets.length} 艘待修` : '');
   const progress = view.types.map((type) => `${type.name.replace('海盗', '')} ${type.killedLevel}`).join(' / ');
   return `${head} · 击杀 ${progress}`;
 }

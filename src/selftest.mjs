@@ -389,6 +389,47 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 服务端新增了本地 proto 表里没有的消息（2026-10-28 的 FarmHarvestResponse）时，这一帧必须能
+// 跳过并继续：recvSeqNo 照常推进、照常 ack。旧实现在 decode 抛错处直接 return，坏帧永远不 ack，
+// 之后每帧都判 gap → Nack → 服务端重发同一帧 → ResendFailed，整条下行流卡死了 6 小时 17 分。
+{
+  const { GameClient } = await import('./client.mjs');
+
+  // codec.encode 走严格 typeOf（发包写错名字要立刻炸），所以未知帧只能手工拼。
+  function rawFrame(name, seq, payload = new Uint8Array(0)) {
+    const headerLength = HEADER_PREFIX + name.length + 1;
+    const frame = new Uint8Array(headerLength + payload.byteLength);
+    const view = new DataView(frame.buffer);
+    view.setInt32(0, frame.byteLength - 4);
+    view.setInt8(4, 2);
+    view.setInt32(5, seq);
+    view.setInt8(9, name.length);
+    for (let i = 0; i < name.length; i += 1) view.setUint8(10 + i, name.charCodeAt(i));
+    view.setInt8(HEADER_PREFIX + name.length, 0);
+    frame.set(payload, headerLength);
+    return frame;
+  }
+
+  const client = new GameClient({ protocol });
+  client.sendNoSeq = () => {};
+  client.recvSeqNo = 100;
+  const unknown = [];
+  let dropped = 0;
+  client.on('unknown', (info) => unknown.push(info));
+  client.on('drop', () => { dropped += 1; });
+
+  client.onMessage(rawFrame('FarmHarvestResponse', 101, new Uint8Array([8, 1])));
+  assert.equal(client.recvSeqNo, 101, '未知消息帧要照常推进 recvSeqNo');
+  assert.equal(unknown.length, 1, '未知消息帧发一次 unknown 事件');
+  assert.match(unknown[0].error, /Unknown message type: FarmHarvestResponse/);
+
+  client.onMessage(codec.encode('OkResponse', 102, {}));
+  assert.equal(dropped, 0, '未知帧之后的正常帧不能被判成 gap');
+  assert.equal(client.recvSeqNo, 102, '未知帧之后 seq 继续推进');
+  if (client.ackTimer !== null) clearTimeout(client.ackTimer);
+  checked += 1;
+}
+
 // 配置表来自 CDN 的 config_cn bundle，本地是微信缓存或 work/cdn 的快照。缺了就跳过，
 // 但在快照存在时必须能解出表并完成资源名映射。
 {
@@ -573,6 +614,102 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   function describeThinEquip() {
     return { uid: 0, equipId: '蓝武器1', type: '武器', quality: 'BLUE', qualityName: '蓝', qualityIndex: 1, level: 1, star: 0, refineLv: 0, score: 10000 };
   }
+  checked += 1;
+}
+
+// 专武（英雄专属武器）：数据在 heroes[].exclusive、材料按品质二选一、等级被星级封顶。
+// 这一组钉三件事：① 橙/红各自取 cost[0]/cost[1]；② 0 星封顶就升不动、先升星才放开；
+// ③ universal 恒 false（不拿万能碎片垫英雄碎片）。
+{
+  const { surveyHeroGrowth, planHeroGrowth, exclusiveCostOf } = await import('./heroGrow.mjs');
+
+  // 客户端红点 `heroExcluseiveUpgradeRedDot` 里的 `s`：RED 取 1，其它取 0；star0 的 cost 是空数组。
+  assert.deepEqual(exclusiveCostOf({ cost: [['橙专武升星石', 5], ['红专武升星石', 7]] }, 'ORANGE'), ['橙专武升星石', 5]);
+  assert.deepEqual(exclusiveCostOf({ cost: [['橙专武升星石', 5], ['红专武升星石', 7]] }, 'RED'), ['红专武升星石', 7]);
+  assert.equal(exclusiveCostOf({ cost: [] }, 'ORANGE'), null, 'star 0 has no cost and must not crash');
+
+  const config = { tables: {
+    HeroCfg: { data: [
+      { id: 'A', career: '法师', quality: 'ORANGE', qualityIndex: 3 },
+      { id: 'B', career: '法师', quality: 'RED', qualityIndex: 4 },
+      { id: 'C', career: '法师', quality: 'ORANGE', qualityIndex: 3 },
+    ] },
+    // 只有 A/B 有专武系统（ExclusiveWeaponCfg 里存在 heroId_1）；C 没有 → 一条动作都不该排。
+    ExclusiveWeaponCfg: { data: [{ heroId: 'A', skillLv: 1 }, { heroId: 'B', skillLv: 1 }, { heroId: 'A', skillLv: 2 }] },
+    ExclusiveUpgradeCfg: { data: [1, 2, 3, 4, 5, 6].map((level) => ({
+      level, heroStar: 15, cost: [['初级专武材料', 10], ['中级专武材料', 40]],
+    })) },
+    // 上限比真表小：0 星封顶 2 级、1 星 4 级，测的就是「先升星放开上限、再升级」这条链。
+    ExclusiveStarCfg: { data: [
+      { star: 0, heroStar: 0, piece: 0, unlockLv: 2, cost: [] },
+      { star: 1, heroStar: 25, piece: 5, unlockLv: 4, cost: [['橙专武升星石', 2], ['红专武升星石', 9]] },
+      { star: 2, heroStar: 25, piece: 5, unlockLv: 6, cost: [['橙专武升星石', 2], ['红专武升星石', 9]] },
+    ] },
+  } };
+  const responses = {
+    AllHeroResponse: { heroes: [
+      { heroId: 'A', level: 100, star: 15, power: { low: 300, high: 0 }, skillLevels: [], badges: [], equips: [] },
+      // B 已有 2 级专武，0 星 —— 先升星才有 4 级的上限。
+      { heroId: 'B', level: 100, star: 25, power: { low: 200, high: 0 }, skillLevels: [], badges: [], equips: [], exclusive: { level: 2, star: 0 } },
+      { heroId: 'C', level: 100, star: 25, power: { low: 100, high: 0 }, skillLevels: [], badges: [], equips: [] },
+    ] },
+    GetFormationResponse: { formation: { heroPositions: [
+      { heroId: 'A', pos: { x: 1, y: 1 } }, { heroId: 'B', pos: { x: 2, y: 1 } }, { heroId: 'C', pos: { x: 3, y: 1 } },
+    ], presetId: 11 } },
+    BadgesResponse: { badge: [] },
+    EquipsResponse: { equip: [] },
+    AllItemResponse: { items: [
+      { itemId: '初级专武材料', num: { low: 100, high: 0 } },
+      { itemId: '中级专武材料', num: { low: 200, high: 0 } },
+      { itemId: '橙专武升星石', num: { low: 10, high: 0 } },
+      { itemId: '红专武升星石', num: { low: 10, high: 0 } },
+      { itemId: 'B碎片', num: { low: 5, high: 0 } },
+    ] },
+    AllResourceResponse: { list: [] },
+  };
+  const fake = { request: async (name, body, response) => responses[response] };
+  // protocol 里必须同时有请求名和响应名：surveyHeroGrowth 的 get() 两端都查，缺一个就当这个探针不可用。
+  const protocol = Object.fromEntries(
+    Object.keys(responses)
+      .concat(['AllHeroRequest', 'BadgesRequest', 'EquipsRequest', 'AllItemRequest', 'AllResourceRequest', 'GetFormationRequest'])
+      .map((name) => [name, 1]),
+  );
+
+  const survey = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 100 });
+  const heroA = survey.heroes.find((hero) => hero.heroId === 'A');
+  assert.equal(heroA.hasExclusive, true, 'A has an exclusive-weapon config');
+  assert.equal(heroA.exclusive.level, 0, 'protobuf drops the field at level 0: that means 0, not "no weapon"');
+  assert.equal(survey.heroes.find((hero) => hero.heroId === 'C').hasExclusive, false, 'C has no exclusive config');
+
+  const plan = planHeroGrowth(survey, { onlyFront: false });
+  const aLevels = plan.actions.filter((one) => one.kind === 'exclusiveLevel' && one.body.heroId === 'A');
+  assert.equal(aLevels.length, 2, '0-star caps the weapon at level 2');
+  assert.equal(aLevels[0].request, 'HeroExclusiveLevelUpRequest');
+  assert.deepEqual(aLevels[0].body, { heroId: 'A' }, 'level-up only carries the hero id');
+  assert.notEqual(aLevels[0].key, aLevels[1].key, 'one key per level, or level 2 gets deduped away');
+
+  // B：先升 1 星（B碎片 ×5 + 红石 ×9），上限从 2 级放开到 4 级，再把 2→4 级升满（中级 ×40/级）。
+  const bStar = plan.actions.filter((one) => one.kind === 'exclusiveStar');
+  assert.equal(bStar.length, 1, 'a 25-star hero can star up the weapon');
+  assert.equal(bStar[0].request, 'HeroExclusiveStarUpRequest');
+  assert.deepEqual(bStar[0].body, { heroId: 'B', universal: false }, 'universal stays false: never spend universal shards here');
+  const bLevels = plan.actions.filter((one) => one.kind === 'exclusiveLevel' && one.body.heroId === 'B');
+  assert.equal(bLevels.length, 2, 'the new star raises the level cap from 2 to 4');
+  assert.equal(plan.heroes.find((hero) => hero.heroId === 'B').exclusive.star, 1, 'the planned star is written back');
+
+  // C 没专武系统：一条动作都不能有（不能因为「有英雄」就排专武）。
+  assert.equal(plan.actions.filter((one) => one.kind.startsWith('exclusive') && one.body.heroId === 'C').length, 0);
+
+  // 英雄星级不够 15 时一级都不升，并且 note 说清原因（多个英雄卡住时合成一条）。
+  const low = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 100 });
+  low.heroes = low.heroes.map((hero) => ({ ...hero, star: 14 }));
+  const lowPlan = planHeroGrowth(low, { onlyFront: false });
+  assert.equal(lowPlan.actions.filter((one) => one.kind.startsWith('exclusive')).length, 0, '15 hero stars is a hard gate');
+  assert.ok(lowPlan.notes.some((note) => note.includes('15 星')), 'the blocked exclusive says why');
+
+  // 两个新开关关掉后一条都不排（页面勾选走的同一个 switches）。
+  const offPlan = planHeroGrowth(survey, { onlyFront: false, switches: { exclusiveLevel: false, exclusiveStar: false } });
+  assert.equal(offPlan.actions.filter((one) => one.kind.startsWith('exclusive')).length, 0, 'the two switches really turn it off');
   checked += 1;
 }
 
@@ -1230,10 +1367,76 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 播种的两道「别撞墙」保护（2026-10-27 事故：土豆堆到 265，服务端每轮回
+// `item limit reached`，4 块地空了一个多小时、日志每轮刷一条失败）：
+//   ① 单种库存到上限 → 换别的种子种；
+//   ② 被拒过的作物在解禁前不种；
+//   ③ 一种作物一条请求 —— 土豆被拒不会连累小麦。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '农田' }] },
+    BuildingProduceCfg: { data: [] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    FarmlandPlantCfg: { data: [
+      { id: '土豆', time: 2400, produceNum: 5, material: ['土豆种子', 1] },
+      { id: '小麦', time: 1800, produceNum: 5, material: ['小麦种子', 1] },
+    ] },
+  } };
+  const surveyFor = (stockObj) => {
+    const stock = new Map(Object.entries(stockObj));
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6, autoFarming: false,
+      buildings: [1, 2].map((i) => ({
+        buildingId: `${i}农田`, type: '农田', level: 1, product: [], buildFinishTime: 0,
+        factory: null, farm: { productId: '', plantAt: 0, ripeAt: 0 },
+      })),
+      factories: [], orders: [], produce: { reduce: 0, instant: [] },
+    };
+  };
+  const plants = (plan) => plan.actions.filter((a) => a.kind === 'farmPlant');
+
+  // 土豆 265（实测 245 能种、260 起被拒）→ 跳过土豆，改种小麦。
+  const capped = planWorld(surveyFor({ 土豆: 265, 小麦: 12, 土豆种子: 9, 小麦种子: 9 }), { config });
+  assert.equal(plants(capped).length, 1, 'the capped crop is skipped, the other one still gets planted');
+  assert.deepEqual(plants(capped)[0].body.args.map((a) => a.productId), ['小麦', '小麦'],
+    'crops at their stock cap are never planted again');
+  assert.ok(capped.notes.some((note) => note.includes('土豆') && note.includes('上限')),
+    'it explains why the crop was skipped');
+
+  // cap 传 0 就关掉这条保护（回到「能种就种」）。
+  const noCap = planWorld(surveyFor({ 土豆: 265, 土豆种子: 9 }), { config, farmCropCap: 0 });
+  assert.equal(plants(noCap).length, 1, 'farmCropCap:0 disables the stock-cap guard');
+  assert.equal(plants(noCap)[0].body.args[0].productId, '土豆', 'without the guard the valuable crop wins');
+
+  // 软线（cap 的 8 成）：土豆 210 还没到上限但已越过软线 → 先种小麦，避免撞线后反复横跳。
+  const rotated = planWorld(surveyFor({ 土豆: 210, 小麦: 12, 土豆种子: 9, 小麦种子: 9 }), { config });
+  assert.equal(plants(rotated)[0].body.args[0].productId, '小麦',
+    'a crop close to its cap gives way to the low-stock one (natural rotation)');
+
+  // 两种作物各一条请求：group 不同，失败隔离才能生效。
+  const mixed = planWorld(surveyFor({ 土豆种子: 1, 小麦种子: 1 }), { config });
+  assert.equal(plants(mixed).length, 2, 'one FarmPlantRequest per crop');
+  assert.deepEqual(plants(mixed).map((a) => a.group).sort(), ['farmPlant:土豆', 'farmPlant:小麦'],
+    'each crop gets its own group so one rejection cannot block the other');
+
+  // 刚被拒过（还没解禁）的作物一律不种，哪怕库存很低。
+  const blocked = planWorld(surveyFor({ 土豆种子: 5 }), {
+    config,
+    farmBlocked: new Map([['土豆', 1000 * 1000 + 60_000]]),
+  });
+  assert.equal(plants(blocked).length, 0, 'a crop rejected by the server is skipped until it expires');
+  assert.ok(blocked.notes.some((note) => note.includes('刚被服务端拒过')),
+    'the loop explains the temporary skip');
+  checked += 1;
+}
+
 // 联盟情报：按舰队战力筛事件，先领奖再把每艘空闲船各派一个事件。
 // 战力比是安全线 —— 战败掉舰船耐久，宁可少打一个也别拿船去赌。
 {
-  const { viewRadar, planRadar, uidKey } = await import('./radar.mjs');
+  const { viewRadar, planRadar, uidKey, formatRadarPlan } = await import('./radar.mjs');
   const config = { tables: {
     WorldPirateCfg: { data: [
       { type: 1, level: 1, power: 100000, showName: '海盗先锋' },
@@ -1247,6 +1450,8 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     RadarFixedEventCfg: { data: [
       { eventId: 2, eventName: '路易斯的行踪·{0}', eventNameParams: ['2'], power: 500000 },
     ] },
+    // 派兵要烧汽油（本服 500/艘）—— 维修预算必须先把这笔扣掉，否则会排出超支计划。
+    WorldParamCfg: { data: [{ paramName: '情报事件消耗汽油', paramValue: 500 }] },
   } };
 
   const event = (over) => ({
@@ -1255,9 +1460,9 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     reward: [{ id: 'GOLD', num: 100 }],
     ...over,
   });
-  const surveyFor = ({ events = [], fleets = [], stock = new Map() } = {}) => ({
+  const surveyFor = ({ events = [], fleets = [], stock = new Map(), petrol = 1000, repairParams = new Map(), repairBelow = 0.8 } = {}) => ({
     now: 1000, level: 3, exp: 10, storedNum: 1, nextRefreshTime: 0,
-    petrol: 1000, stock, events, fleets,
+    petrol, stock, events, fleets, repairParams, repairBelow,
   });
   const fleet = (over) => ({ buildingId: '1远征船', state: 1, power: 500000, durability: 2000, maxDurability: 2000, ...over });
 
@@ -1290,6 +1495,124 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(repairingPlan.actions.filter((a) => a.kind === 'radarReward').length, 1, 'finished events are collected anyway');
   assert.equal(repairingPlan.actions[0].request, 'RadarGetAllRewardsRequest', 'one request collects every finished event');
   assert.equal(repairingPlan.actions[0].body && Object.keys(repairingPlan.actions[0].body).length, 0, 'the collect-all request has an empty body');
+
+  // ---- 修船（2026-10-27）:耐久低于阈值 -> 不派兵、留在港里修满 ----
+  // 事实口径全部来自客户端：RepairFleetRequest{buildingId} 无 Response、只有 IDLE 能修、
+  // 花费 = ceil(缺口 × unitRepairCost) 汽油（服务端下发，不硬编码）。
+  const repairParams = new Map([
+    ['1远征船', { unitRepairTime: 0.2, unitRepairCost: 0.006 }],
+    ['2远征船', { unitRepairTime: 0.2, unitRepairCost: 0.006 }],
+  ]);
+  const damaged = viewRadar(surveyFor({
+    events: [event({ key: 'a', uid: 71 })],
+    fleets: [
+      fleet({ buildingId: '1远征船', durability: 0, maxDurability: 2000 }),
+      fleet({ buildingId: '2远征船', durability: 2000, maxDurability: 2000 }),
+    ],
+    petrol: 100000,
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  assert.equal(damaged.fleets[0].needRepair, true, '耐久 0/2000 低于 80%，要修');
+  assert.equal(damaged.fleets[0].duraPct, 0);
+  assert.equal(damaged.fleets[1].needRepair, false, '满耐久不修');
+  // 2000 点缺口 × 0.006 = 12 汽油；0.2 秒/点 = 400 秒。
+  assert.equal(damaged.fleets[0].repairCost, 12, '花费 = ceil(缺口 × unitRepairCost)');
+  assert.equal(damaged.fleets[0].repairSeconds, 400, '时长 = 缺口 × unitRepairTime');
+
+  const damagedPlan = planRadar(damaged, { repairBelow: 0.8 });
+  const damagedDispatch = damagedPlan.actions.filter((a) => a.kind === 'radarDispatch');
+  assert.equal(damagedDispatch.length, 1, '只有耐久达标的那艘去派兵');
+  assert.deepEqual(damagedDispatch[0].body.fleetBuildingIds, ['2远征船'], '低耐久的船留在港里，不出去打');
+  const repairAction = damagedPlan.actions.find((a) => a.kind === 'radarRepair');
+  assert.ok(repairAction, '耐久低于阈值的空闲船要发维修请求');
+  assert.equal(repairAction.request, 'RepairFleetRequest');
+  assert.deepEqual(repairAction.body, { buildingId: '1远征船' }, '维修请求只有 buildingId（客户端同款）');
+  assert.equal(repairAction.response, null, 'RepairFleetRequest 没有 Response');
+  assert.equal(repairAction.transient, true, '维修失败多是汽油不足这类可恢复状态，不能被永久 rejected');
+  assert.ok(String(repairAction.group).includes('1远征船'), '维修按船隔离，一条失败不连累别的船');
+  assert.ok(damagedPlan.actions.indexOf(repairAction) > damagedPlan.actions.indexOf(damagedDispatch[0]),
+    '派兵排在维修前面（先派，再修留下的船）');
+
+  // 汽油不够修满就不发请求（服务端会不会「部分修」没验证过，不拿必失败请求去骚扰）。
+  const poor = viewRadar(surveyFor({
+    fleets: [fleet({ buildingId: '1远征船', durability: 0, maxDurability: 2000 })],
+    petrol: 5,
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  const poorPlan = planRadar(poor, { repairBelow: 0.8 });
+  assert.equal(poorPlan.actions.filter((a) => a.kind === 'radarRepair').length, 0, '汽油不够修满就先不修');
+  assert.ok(poorPlan.notes.some((note) => note.includes('汽油')), '要说明是汽油不够');
+
+  // 拿不到 unitRepairCost（FleetRepairParamRequest 失败）就不修，也不瞎算花费。
+  const noParam = viewRadar(surveyFor({
+    fleets: [fleet({ buildingId: '1远征船', durability: 0 })],
+    petrol: 100000,
+  }), { config, repairBelow: 0.8 });
+  const noParamPlan = planRadar(noParam, { repairBelow: 0.8 });
+  assert.equal(noParamPlan.actions.filter((a) => a.kind === 'radarRepair').length, 0, '没参数不修');
+  assert.ok(noParamPlan.notes.some((note) => note.includes('维修参数')), '要说明拿不到维修参数');
+
+  // 只有 IDLE 能修：航行/战斗中修不了（客户端 _onBtnAmend 的 state == IDLE 判定）。
+  const moving = viewRadar(surveyFor({
+    fleets: [fleet({ buildingId: '1远征船', durability: 0, state: 2 })],
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  assert.equal(moving.fleets[0].needRepair, true);
+  assert.equal(moving.fleets[0].repairable, false, '航行中的船修不了');
+  const movingPlan = planRadar(moving, { repairBelow: 0.8 });
+  assert.equal(movingPlan.actions.filter((a) => a.kind === 'radarRepair').length, 0);
+  assert.ok(movingPlan.notes.some((note) => note.includes('暂时修不了')), '要说明为什么没修');
+
+  // 已经在修（repairing 有值 / state=4）的船不能重复发维修请求。
+  const underRepair = viewRadar(surveyFor({
+    fleets: [fleet({ buildingId: '1远征船', durability: 0, state: 4, repairing: { startTs: 1000, endTs: 1600, endDura: 2000 } })],
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  assert.equal(underRepair.fleets[0].repairable, false, '正在修的船不重复修');
+  assert.equal(planRadar(underRepair, { repairBelow: 0.8 }).actions.filter((a) => a.kind === 'radarRepair').length, 0);
+
+  // 阈值 0 = 关掉修船（也放开了「按耐久拦派兵」，回到旧行为）。
+  const repairOff = viewRadar(surveyFor({
+    events: [event({ key: 'off', uid: 72 })],
+    fleets: [fleet({ buildingId: '1远征船', durability: 0 })],
+    petrol: 100000,
+    repairParams,
+  }), { config, repairBelow: 0 });
+  assert.equal(repairOff.fleets[0].needRepair, false, '阈值 0 时不做耐久判断');
+  const repairOffPlan = planRadar(repairOff, { repairBelow: 0 });
+  assert.equal(repairOffPlan.actions.filter((a) => a.kind === 'radarRepair').length, 0, '阈值 0 = 不修船');
+  assert.equal(repairOffPlan.actions.filter((a) => a.kind === 'radarDispatch').length, 1, '关掉修船后耐久低也照派（旧行为）');
+
+  // 文本视图要把耐久与维修动作写出来，否则「这轮为什么没派兵」看不出来。
+  const damagedText = formatRadarPlan(damaged, damagedPlan);
+  assert.ok(damagedText.includes('舰队耐久'), '计划文本要列出每艘船的耐久');
+  assert.ok(damagedText.includes('维修 1远征船'), '计划文本要有维修动作');
+
+  // 一艘空闲船都没有时（全在航行/修理），判定要说「没空闲船」而不是「战力不够」：
+  // 修船那 5 分钟里每轮都写「战力不够」看起来像配置过期了。
+  const noIdle = viewRadar(surveyFor({
+    events: [event({ key: 'noIdle', uid: 74 })],
+    fleets: [fleet({ buildingId: '1远征船', state: 4, durability: 0, repairing: { startTs: 1, endTs: 999999, endDura: 2000 } })],
+  }), { config });
+  assert.equal(noIdle.events[0].verdict, '没空闲船', '没空闲船不能说成战力不够');
+  assert.equal(noIdle.events[0].verdictChip, 'waiting', '船会回来的：用等待色，不是阻塞色');
+
+  // 派兵烧的汽油要从维修预算里扣掉：汽油刚好够派兵时，维修不能照着满池汽油去排。
+  assert.equal(damaged.dispatchFuel, 500, '派一艘兵烧 500 汽油（WorldParamCfg.情报事件消耗汽油）');
+  const squeezed = viewRadar(surveyFor({
+    events: [event({ key: 's', uid: 73 })],
+    fleets: [
+      fleet({ buildingId: '1远征船', durability: 2000, maxDurability: 2000 }),
+      fleet({ buildingId: '2远征船', durability: 0, maxDurability: 2000 }),
+    ],
+    petrol: 400, // 连派兵那 500 都不够，扣完维修预算就是 0
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  const squeezedPlan = planRadar(squeezed, { repairBelow: 0.8 });
+  assert.equal(squeezedPlan.actions.filter((a) => a.kind === 'radarDispatch').length, 1, '耐久达标的船照派');
+  assert.equal(squeezedPlan.actions.filter((a) => a.kind === 'radarRepair').length, 0,
+    '汽油被派兵占掉后不够修满，就不能排维修');
+  assert.ok(squeezedPlan.notes.some((note) => note.includes('扣掉派兵')), 'note 要说明汽油被派兵占了一部分');
 
   // 排序：颜色高的优先（紫 4 > 蓝 3 > 绿 2）；同色才看战力需求。
   const mixed = viewRadar(surveyFor({
@@ -3394,6 +3717,15 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     seasonWindowOf, seasonDaysOf, MAX_GUILD_FLEETS, SEASON_CLOSE_GUARD_SECONDS,
     DEFAULT_COLORS, colorsOf, colorsText, skipUntilOf, rewardCountText, SKIP_MAX_MS,
   } = await import('./treasure.mjs');
+  // 耐久口径本身也钉一下：三个玩法共用这一套，写错边界会全段一起错。
+  const { fleetDuraPct, fleetDuraOk, DURABILITY_WARN_RATIO } = await import('./world.mjs');
+  assert.equal(DURABILITY_WARN_RATIO, 0.8, '官方提示线 1600 / 2000 = 80%');
+  assert.equal(fleetDuraPct({ durability: 1600, maxDurability: 2000 }), 0.8);
+  assert.equal(fleetDuraPct({ durability: 0, maxDurability: 0 }), 1, '拿不到上限就当满耐久（否则整块玩法被关掉）');
+  // 严格小于：官方提示是「低于 1600 才降输出」，所以 1600 本身仍可派、1599 才修。
+  assert.equal(fleetDuraOk({ durability: 1600, maxDurability: 2000 }, 0.8), true, '刚好 1600 可以用');
+  assert.equal(fleetDuraOk({ durability: 1599, maxDurability: 2000 }, 0.8), false, '1599 < 1600 要修');
+  assert.equal(fleetDuraOk({ durability: 0, maxDurability: 2000 }, 0), true, 'floor=0 表示不拦');
   const config = { tables: {
     TreasureLootCfg: { data: [
       { quality: 'BLUE', qualityIndex: 1, name: '小型货轮', score: 900 },
@@ -3578,6 +3910,35 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   }), ALL);
   assert.equal(ours.treasures[0].ourFleets, 2, '按 treasureLootUid 数出我方在抢的舰队');
   assert.ok(formatTreasureSummary(ours).includes('我方 2 支在抢'), '概览要写明我方在抢');
+
+  // 耐久闸（2026-10-27）：配置表 LoadingTipsCfg 的原话是「耐久低于 1600 会降低输出、增加受到的伤害」，
+  // 本账号 maxDura 2000 → 1600/2000 = 80%。抢被占的货轮要打守军，耐久不够就先留在港里修。
+  const lowDura = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 40, color: 5, name: '万吨货轮' })],
+    fleets: [fleet({ durability: 0 }), fleet({ buildingId: '2远征船', durability: 1600 })],
+  }), { ...ALL, duraFloor: 0.8 });
+  assert.equal(lowDura.groundedFleets.length, 1, '0/2000 的船被耐久闸留下');
+  assert.equal(lowDura.groundedFleets[0].buildingId, '1远征船');
+  assert.deepEqual(lowDura.idleFleets.map((one) => one.buildingId), ['2远征船'], '1600/2000 刚好 80%，可以派');
+  const lowDuraPlan = planTreasure(lowDura, {});
+  assert.deepEqual(lowDuraPlan.actions[0].body.fleetBuildingIds, ['2远征船'], '只派耐久达标的船');
+  assert.ok(lowDuraPlan.notes.some((note) => note.includes('耐久低于 80%')), '要说明有一艘被耐久闸留下');
+
+  // 全被耐久闸留下：不派船，且原因要写成「先修再抢」（不能静默成「没有空闲舰队」）。
+  const allLow = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 41, color: 5, name: '万吨货轮' })],
+    fleets: [fleet({ durability: 200 })],
+  }), { ...ALL, duraFloor: 0.8 });
+  assert.equal(planTreasure(allLow, {}).actions.length, 0, '耐久不够就不派');
+  assert.ok(planTreasure(allLow, {}).notes.some((note) => note.includes('先修再抢')), '说明是先修再抢');
+
+  // duraFloor = 0 = 不拦（旧行为）—— 保证这个闸真能关掉。
+  const noFloor = viewTreasure(surveyFor({
+    treasures: [treasure({ uid: 42, color: 5, name: '万吨货轮' })],
+    fleets: [fleet({ durability: 0 })],
+  }), { ...ALL, duraFloor: 0 });
+  assert.deepEqual(planTreasure(noFloor, {}).actions[0].body.fleetBuildingIds, ['1远征船'],
+    'floor=0 时 0 耐久也照派（旧行为）');
 
   // 每天 3 次奖励：满了就不派（再派等于白烧 500 汽油/船）。
   const full = viewTreasure(surveyFor({
@@ -3975,6 +4336,31 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   }), { config }));
   assert.equal(dry.actions.length, 0, '汽油不够一次就不派');
 
+  // 耐久闸（2026-10-27）：打野怪本身「消耗耐久 = 0」（WorldParamCfg），但耐久 <80% 会
+  // 「降低输出、增加受到的伤害」（LoadingTipsCfg），也就是更容易打输、白烧 300 汽油 → 先修再打。
+  const lowDura = viewPirates(survey({
+    pirates: [pirate({ uid: 1 }), pirate({ uid: 2, type: 3, level: 6 })],
+    killed: new Map([[1, 7], [3, 5]]),
+    fleets: [fleet({ buildingId: '1远征船', durability: 200 }), fleet({ buildingId: '2远征船', durability: 2000 })],
+  }), { config, duraFloor: 0.8 });
+  assert.equal(lowDura.groundedFleets.length, 1, '200/2000 = 10% 的船被耐久闸留下');
+  assert.equal(lowDura.groundedFleets[0].buildingId, '1远征船');
+  assert.deepEqual(lowDura.idleFleets.map((one) => one.buildingId), ['2远征船'], '只有耐久达标的船算空闲');
+  assert.equal(lowDura.bestIdlePower, 3000000, '最强空闲船要排除被留下的船（否则误判「打得起」）');
+  const lowDuraPlan = planPirates(lowDura);
+  assert.equal(lowDuraPlan.actions.length, 1, '只派耐久达标的那艘');
+  assert.deepEqual(lowDuraPlan.actions[0].body.fleetBuildingIds, ['2远征船']);
+
+  // 全被耐久闸留下：不派，并且说明是「先去修」，不能说成「没有空闲舰队」。
+  const allLow = viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ durability: 0 })],
+  }), { config, duraFloor: 0.8 });
+  const allLowPlan = planPirates(allLow);
+  assert.equal(allLowPlan.actions.length, 0, '耐久不够就不出战');
+  assert.ok(allLowPlan.notes.some((note) => note.includes('先去修')), `要说清是先去修，实际：${allLowPlan.notes.join(' / ')}`);
+
   // 概览行：赛季、汽油单价、空闲船、三种 type 的击杀进度都要能看见。
   const summaryText = formatPirateSummary(noRepeat);
   assert.ok(summaryText.includes('S1') && summaryText.includes('每次 300') && summaryText.includes('击杀'),
@@ -4339,4 +4725,102 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 海盗讨伐 / 日志脱敏与回包归档）`);
+// 今日收益统计：数据全是从归档回包重算的（stats.mjs），口径错页面上就是错的数字，
+// 而且难得有第二处能交叉验证 —— 所以这里造一份"一天的回包"，逐项卡住：
+// 只算 in 不算 out、int64 要能读、另一个账号的不能混进来、邮件只算今天且已领取。
+{
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const stats = await import('./stats.mjs');
+  const { dayOf } = await import('./archive.mjs');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-stats-'));
+  const day = dayOf();
+  const dir = path.join(root, day);
+  fs.mkdirSync(dir, { recursive: true });
+  const ACC = 'c06ad6ea';
+  const OTHER = 'bbbbbbbb';
+  const now = Date.now();
+  const i64 = (n) => ({ low: n, high: 0, unsigned: false });
+  const write = (name, entries) => fs.writeFileSync(
+    path.join(dir, `${name}.jsonl`),
+    entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+  );
+  const inFrame = (name, body, acc = ACC, t = now) => ({ t, dir: 'in', seq: 1, acc, body });
+  const outFrame = (name, body, acc = ACC, t = now) => ({ t, dir: 'out', seq: 2, acc, body });
+
+  // 制造：三条回包（淡水 6 + 4、粗铁 1），另有一条别的账号、一条 out 都不该算。
+  write('GainFactoryProduceResponse', [
+    inFrame('GainFactoryProduceResponse', { products: { asset: [{ type: 0, id: '淡水', num: i64(6) }] } }),
+    inFrame('GainFactoryProduceResponse', { products: { asset: [{ type: 0, id: '粗铁', num: i64(1) }] } }),
+    inFrame('GainFactoryProduceResponse', { products: { asset: [{ type: 0, id: '淡水', num: i64(4) }] } }),
+    inFrame('GainFactoryProduceResponse', { products: { asset: [{ type: 0, id: '淡水', num: i64(99) }] } }, OTHER),
+    outFrame('GainFactoryProduceResponse', { products: { asset: [{ type: 0, id: '淡水', num: i64(50) }] } }),
+  ]);
+  // 建筑产出：reward 数组里嵌一层 product.asset。
+  write('CollectBuildingProductResponse', [
+    inFrame('CollectBuildingProductResponse', {
+      reward: [
+        { buildingId: '1训练营', product: { asset: [{ type: 0, id: '英雄经验', num: i64(469) }] } },
+        { buildingId: '1精铁厂', product: { asset: [{ type: 0, id: '精铁', num: i64(5) }] } },
+      ],
+    }),
+  ]);
+  // 活动次数：只数 out；in 混一条进来也不该被计。
+  write('GainFactoryProduceRequest', [outFrame('GainFactoryProduceRequest', { buildingId: '1海水厂' }), outFrame('GainFactoryProduceRequest', { buildingId: '1材料厂' }), inFrame('GainFactoryProduceRequest', {})]);
+
+  // 邮件：两行快照，只有最后一行算数；里面塞一封今天的已领、一封今天没领、一封昨天的。
+  const todaySec = Math.floor(now / 1000);
+  const mailOf = (subject, sendTime, got, gold) => ({
+    subject,
+    sendTime,
+    got,
+    attachment: { assets: { asset: [{ type: 1, id: 'GOLD', num: i64(gold) }] } },
+  });
+  write('EmailBoxResponse', [
+    inFrame('EmailBoxResponse', { email: [mailOf('旧的快照', todaySec - 60, true, 1)] }),
+    inFrame('EmailBoxResponse', {
+      email: [
+        mailOf('今天的已领', todaySec, true, 15000),
+        mailOf('今天的没领', todaySec, false, 500),
+        mailOf('昨天的', todaySec - 86400, true, 700),
+      ],
+    }),
+  ]);
+
+  const view = stats.collectStats({ day, acc: ACC, root });
+  assert.equal(view.kpi.made, 11, '制造只算本账号的 in 回包（6+1+4），out 与别的账号都不算');
+  assert.equal(view.kpi.madeKinds, 2, '制造是 2 种产品');
+  const factory = view.sources.find((entry) => entry.key === 'factory');
+  assert.equal(factory.count, 3, '制造批次 = 回包条数');
+  assert.deepEqual(factory.items, [{ id: '淡水', num: 10 }, { id: '粗铁', num: 1 }], '同类要合并，并按数量降序');
+  assert.equal(factory.hours.reduce((sum, n) => sum + n, 0), 11, '小时分布的总和要等于件数');
+
+  assert.equal(view.kpi.produced, 474, '建筑产出要把 reward[].product.asset 全部摊平（469+5）');
+  assert.equal(view.kpi.mails, 1, '邮件只算「今天发出 + 已领取」的那封');
+  const mail = view.sources.find((entry) => entry.key === 'mail');
+  assert.deepEqual(mail.items, [{ id: 'GOLD', num: 15000 }], '邮件数量取附件里的值');
+
+  const gain = view.activity.find((entry) => entry.key === 'gain');
+  assert.equal(gain.count, 2, '活动次数只数请求（out），不受回包影响');
+  assert.equal(view.kpi.acts, 2, '示例里只有收成品这一类活动');
+
+  // 跨天：历史日期不该有「邮件奖励」这一栏（邮件快照永远是当前状态，反推不了昨天）。
+  const pastDay = dayOf(Date.now() - 86400000);
+  const past = stats.collectStats({ day: pastDay, acc: ACC, root });
+  assert.equal(past.isToday, false);
+  assert.equal(past.sources.some((entry) => entry.key === 'mail'), false, '查历史日期时不显示邮件那一栏');
+  assert.equal(past.kpi.made, 0, '那天没有归档就是 0，不能借当天的数');
+  assert.equal(past.trend.length, 7, '趋势固定 7 根柱子');
+
+  // 趋势：今天这一格必须是刚才造的数（走的是同一条聚合路径）。
+  const tail = view.trend[view.trend.length - 1];
+  assert.equal(tail.day, day);
+  assert.equal(tail.total, 11, `趋势最后一天要等于今天的制造量，实际 ${tail.total}`);
+
+  fs.rmSync(root, { recursive: true, force: true });
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);

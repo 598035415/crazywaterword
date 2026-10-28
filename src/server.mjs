@@ -11,7 +11,7 @@ import { collectState, summarize, formatState } from './game.mjs';
 import { getConfig, APPID } from './config.mjs';
 import { qrSvg } from './vendor/qrcode.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
-import { surveyHeroGrowth, planHeroGrowth, formatHeroGrowth, buildHeroRows, GROW_SWITCHES, SWITCH_LABELS, BADGE_EXP_ITEM, EQUIP_IRON, EQUIP_REFINE_ITEM, EQUIP_STAR_ITEM } from './heroGrow.mjs';
+import { surveyHeroGrowth, planHeroGrowth, formatHeroGrowth, buildHeroRows, GROW_SWITCHES, SWITCH_LABELS, BADGE_EXP_ITEM, EQUIP_IRON, EQUIP_REFINE_ITEM, EQUIP_STAR_ITEM, EXCLUSIVE_LV_MATERIALS, EXCLUSIVE_STONE_ORANGE, EXCLUSIVE_STONE_RED } from './heroGrow.mjs';
 import { surveyDailies, runDailies, formatSurvey } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
@@ -34,6 +34,7 @@ import {
 import { surveyFactories, viewFactories, factoryRecipes, startProduce, gainAllProducts, packCoverPlan, exchangePacks } from './factories.mjs';
 import { runAction } from './actions.mjs';
 import { loadStore, saveStore, upsertAccount, removeAccount, setActive, pickAccount, describeAccount, revealAccount, DATA_DIR } from './accounts.mjs';
+import { collectStats } from './stats.mjs';
 import { startCapture, stopCapture, captureState, DEFAULT_PROXY_PORT } from './capture.mjs';
 import { iconIndex, atlasFile, itemIcon, resourceIcon, materialIcon, heroIcon, heroCard, buildingIcon } from './art.mjs';
 
@@ -62,6 +63,12 @@ function packGapArg(value) {
   if (value === undefined || value === null || value === '') return undefined;
   const num = Number(value);
   return Number.isFinite(num) && num >= 0 ? num : undefined;
+}
+
+// 页面上是百分数（默认 80），三个世界玩法（货轮/情报/海盗）内部统一用比例（0.8）。
+// 放在一处算：分开算迟早出现「情报按 0.8 拦、货轮按 0.5 派」的漂移。
+function duraFloorOf(loop) {
+  return Math.min(1, Math.max(0, Number(loop?.radarRepairBelow ?? 80) / 100));
 }
 
 export function createConsole({ host = '127.0.0.1', port = 17321 }) {
@@ -127,6 +134,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         radarEnabled: true,
         radarEveryMs: 60_000,
         lastRadarAt: null,
+        // 修船门槛（百分数）：耐久低于它就留在港里修，不派出去打情报。0 = 关。
+        radarRepairBelow: 80,
         // 海盗讨伐（真出战 ChallengePirateRequest）：跟免战扫荡（dailies 1010）不是一回事。
         // 每次烧 300 汽油、不掉耐久，收益是首杀奖励 + 固定掉落。它排在货轮和情报之后，只捡剩船。
         pirateEnabled: true,
@@ -208,7 +217,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     instance.on('state', ({ state, detail }) => emit(session, 'state', STATE_TEXT[state] ?? state, detail ? { detail } : undefined));
     instance.on('drop', ({ name, reason }) => emit(session, 'warn', `漏收了一条 ${name} 的应答（${reason}），本轮跳过`));
     instance.on('warn', (message) => emit(session, 'warn', message === 'ping timeout' ? '服务器心跳超时，连接可能已经断了' : message));
-    instance.on('fatal', ({ reason }) => emit(session, 'error', reason === 'SCChannelExpired' ? '这个账号在别处登录了，本条连接被顶掉' : `连接被服务器中断（${reason}）`));
+    // 本地 proto（反编译客户端 bundle）落后于服务端时会收到没定义的消息。
+    // 这类帧已经按「跳过 body、照常推进 seq」处理，不影响后续收发 —— 用 warn 不用 error，避免误判成断线。
+    instance.on('unknown', ({ name, seq }) => emit(session, 'warn', `收到本地 proto 未定义的消息 ${name}（seq=${seq}），已跳过该帧并继续`));
+    instance.on('fatal', ({ reason, seqNo }) => emit(session, 'error', reason === 'SCChannelExpired'
+      ? '这个账号在别处登录了，本条连接被顶掉'
+      : `下行序号召回失败（${reason} seqNo=${seqNo}），这条连接已作废，需要重连`));
     instance.on('error', (error) => emit(session, 'error', error.message));
     instance.on('close', () => emit(session, 'state', '连接已断开'));
   }
@@ -436,10 +450,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
   async function radar(session, account) {
     const instance = await ensureConnected(session, account);
     const config = loadConfigSafe();
-    const survey = await surveyRadar(instance, protocol, { config });
     const ratio = Number(session.loop.minPowerRatio) || DEFAULT_MIN_POWER_RATIO;
-    const view = viewRadar(survey, { config, minPowerRatio: ratio });
-    const plan = planRadar(view, { minPowerRatio: ratio });
+    // 页面上的 radarRepairBelow 是百分数（80），radar 模块内部用比例（0.8）。
+    const repairBelow = duraFloorOf(session.loop);
+    const survey = await surveyRadar(instance, protocol, { config, repairBelow });
+    const view = viewRadar(survey, { config, minPowerRatio: ratio, repairBelow });
+    const plan = planRadar(view, { minPowerRatio: ratio, repairBelow });
     const fleetIcon = (buildingId) => buildingIcon(String(buildingId).replace(/^\d+[A-Z]?/, ''));
     return {
       level: view.level,
@@ -449,6 +465,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       petrol: view.petrol,
       bestIdlePower: view.bestIdlePower,
       minPowerRatio: ratio,
+      repairBelow,
       fleets: view.fleets.map((fleet) => ({ ...fleet, icon: fleetIcon(fleet.buildingId) })),
       events: view.events.map((event) => ({
         ...event,
@@ -467,7 +484,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const config = loadConfigSafe();
     const ratio = Number(session.loop.minPowerRatio) || DEFAULT_MIN_POWER_RATIO;
     const survey = await surveyPirates(instance, protocol, { config, player: session.player });
-    const view = viewPirates(survey, { config, minPowerRatio: ratio, repeat: session.loop.pirateRepeat === true });
+    const view = viewPirates(survey, { config, minPowerRatio: ratio, repeat: session.loop.pirateRepeat === true, duraFloor: duraFloorOf(session.loop) });
     const plan = planPirates(view, { maxPerRound: session.loop.pirateMaxPerRound });
     // 舰队 id 形如「1远征船」，去掉前缀数字就是建筑类型，拿来取图标（与情报那屏一致）。
     const fleetIcon = (buildingId) => buildingIcon(String(buildingId).replace(/^\d+[A-Z]?/, ''));
@@ -570,7 +587,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
     const colors = colorsOf(session.loop.treasureColors);
     const maxFleets = session.loop.treasureMaxFleets;
     const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
-    const view = viewTreasure(survey, { config, colors, maxFleets });
+    const view = viewTreasure(survey, { config, colors, maxFleets, duraFloor: duraFloorOf(session.loop) });
     const plan = planTreasure(view, { maxFleets });
     // 顺手把奖励次数记到 session 上：网页的「已领 x/N」读的就是这一份，
     // 手动抢完立刻就能看到新数字，不用等下一轮挂机。
@@ -768,6 +785,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           徽章经验: survey.stock.get(BADGE_EXP_ITEM) ?? 0,
           精炼石: survey.stock.get(EQUIP_REFINE_ITEM) ?? 0,
           装备升星石: survey.stock.get(EQUIP_STAR_ITEM) ?? 0,
+          // 专武材料有 4 档（初/中/高/特），哪一档是 0 就说明专武升到哪一级会断；
+          // 升星石按英雄品质二选一，两种都列出来（橙英雄只吃橙石）。
+          ...Object.fromEntries(EXCLUSIVE_LV_MATERIALS.map((id) => [id.replace('专武材料', '专武'), survey.stock.get(id) ?? 0])),
+          橙专武升星石: survey.stock.get(EXCLUSIVE_STONE_ORANGE) ?? 0,
+          红专武升星石: survey.stock.get(EXCLUSIVE_STONE_RED) ?? 0,
           GOLD: survey.stock.get('GOLD') ?? 0,
         },
         heroes,
@@ -1016,6 +1038,22 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         json({ root: ARCHIVE_ROOT, day, days: listDays(), entries: summarizeDay(ARCHIVE_ROOT, day) });
         return;
       }
+      // 今日收益统计：不从内存拿，直接按归档回包重算（口径见 src/stats.mjs 顶部注释）。
+      // 所以刷新页面、重启进程、下午才开页面都能看到从 0 点起的完整数据，不依赖挂机是否一直在跑。
+      // 只读文件、不连网关，但**要账号** —— 归档里的 acc 是 openId 前 8 位，多账号时得分开算。
+      if (route === 'GET /api/stats') {
+        const { account } = scoped_(parsed);
+        const wanted = parsed.searchParams.get('day') ?? '';
+        const day = /^\d{4}-\d{2}-\d{2}$/.test(wanted) ? wanted : dayOf();
+        const view = collectStats({ day, acc: String(account.id).slice(0, 8) });
+        // 图标在 server 这层补：stats.mjs 只认 id，不碰图集，免得两边互相拉依赖。
+        for (const source of view.sources) {
+          source.items = source.items.map((item) => ({ ...item, icon: materialIcon(item.id) }));
+        }
+        view.days = listDays();
+        json(view);
+        return;
+      }
       if (route === 'GET /api/overview') {
         const { account, session } = scoped_(parsed);
         json(await overview(session, account));
@@ -1059,11 +1097,14 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const { account, session } = scoped_(parsed);
         const instance = await ensureConnected(session, account);
         const config = loadConfigSafe();
-        const survey = await surveyRadar(instance, protocol, { config });
         const ratio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : (Number(session.loop.minPowerRatio) || DEFAULT_MIN_POWER_RATIO);
-        const view = viewRadar(survey, { config, minPowerRatio: ratio });
+        // 修船门槛同样吃页面上的百分数；payload 显式传了就用它（不写回 loop）。
+        const repairBelow = Math.min(1, Math.max(0, Number(payload.repairBelow ?? duraFloorOf(session.loop) * 100) / 100));
+        const survey = await surveyRadar(instance, protocol, { config, repairBelow });
+        const view = viewRadar(survey, { config, minPowerRatio: ratio, repairBelow });
         const plan = planRadar(view, {
           minPowerRatio: ratio,
+          repairBelow,
           // 默认不限：有多少空闲船就派多少（每艘船打一个事件）。传 max 才限制。
           maxDispatch: Number(payload.max) > 0 ? Number(payload.max) : Infinity,
         });
@@ -1101,7 +1142,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 页面上勾了「刷已通关等级」就落进 session.loop，之后的挂机也按这个口径走。
         if (payload.repeat !== undefined) session.loop.pirateRepeat = payload.repeat === true;
         const survey = await surveyPirates(instance, protocol, { config, player: session.player });
-        const view = viewPirates(survey, { config, minPowerRatio: ratio, repeat: session.loop.pirateRepeat === true });
+        const view = viewPirates(survey, { config, minPowerRatio: ratio, repeat: session.loop.pirateRepeat === true, duraFloor: duraFloorOf(session.loop) });
         const plan = planPirates(view, {
           maxPerRound: Number(payload.max) > 0 ? Number(payload.max) : session.loop.pirateMaxPerRound,
         });
@@ -1288,7 +1329,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const colors = colorsOf(session.loop.treasureColors);
         const maxFleets = session.loop.treasureMaxFleets;
         const survey = await surveyTreasure(instance, protocol, { config, player: session.player });
-        const view = viewTreasure(survey, { config, colors, maxFleets });
+        const view = viewTreasure(survey, { config, colors, maxFleets, duraFloor: duraFloorOf(session.loop) });
         const plan = planTreasure(view, { maxFleets });
         const { results } = await runWorld(instance, protocol, plan, {
           allowMutate: true,
@@ -1669,6 +1710,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 情报默认开；powerRatio 前端可调（默认 1.2，越大越保守）；间隔默认 60 秒。
         loop.radarEnabled = payload.radar !== false;
         loop.radarEveryMs = secondsArg(payload.radarEverySeconds, 60) * 1000;
+        // 修船门槛（百分数，默认 80）：耐久低于它就留在港里修、不派出去。
+        // 0 或负数 = 关掉修船（连「按耐久拦派兵」一起关，回到旧行为）。
+        loop.radarRepairBelow = Number.isFinite(Number(payload.radarRepairBelow))
+          ? Math.min(100, Math.max(0, Number(payload.radarRepairBelow)))
+          : 80;
         // 海盗讨伐默认开，间隔默认 60 秒。它排在货轮与情报之后，只捡两段都没带走的空闲船，
         // 所以常出现「0 艘空闲船、这轮不派」—— 那是正常的，不是开关没生效。
         loop.pirateEnabled = payload.pirate !== false;
@@ -1734,7 +1780,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           ? (loop.farmEveryMs > 0 ? `农田每 ${Math.round(loop.farmEveryMs / 1000)} 秒看一眼` : '农田每轮都看')
           : '农田关';
         const radarText = loop.radarEnabled
-          ? `情报${loop.radarEveryMs > 0 ? `每 ${Math.round(loop.radarEveryMs / 1000)} 秒一次` : '每轮都看'}（战力余量 ${loop.minPowerRatio}×）`
+          ? `情报${loop.radarEveryMs > 0 ? `每 ${Math.round(loop.radarEveryMs / 1000)} 秒一次` : '每轮都看'}（战力余量 ${loop.minPowerRatio}×`
+            + `${loop.radarRepairBelow > 0 ? `，耐久 <${loop.radarRepairBelow}% 就修` : '，不修船'}）`
           : '情报关';
         const forgeText = loop.forgeEnabled
           ? (loop.forgeEveryMs > 0 ? `锻造每 ${Math.round(loop.forgeEveryMs / 1000)} 秒看一眼` : '锻造每轮都看')
@@ -1782,6 +1829,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           farmEveryMs: loop.farmEveryMs,
           radarEnabled: loop.radarEnabled,
           radarEveryMs: loop.radarEveryMs,
+          radarRepairBelow: loop.radarRepairBelow,
           pirateEnabled: loop.pirateEnabled,
           pirateEveryMs: loop.pirateEveryMs,
           pirateRepeat: loop.pirateRepeat,
@@ -1905,6 +1953,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       lastFarmAt: loop.lastFarmAt,
       radarEnabled: loop.radarEnabled,
       radarEveryMs: loop.radarEveryMs,
+      radarRepairBelow: loop.radarRepairBelow,
       lastRadarAt: loop.lastRadarAt,
       // 海盗讨伐（真出战）：开关 / 间隔 / 上次执行 / 是否刷已通关等级。
       pirateEnabled: loop.pirateEnabled !== false,

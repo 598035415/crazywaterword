@@ -271,11 +271,20 @@ export class GameClient extends EventEmitter {
     try {
       decoded = this.codec.decode(data);
     } catch (error) {
+      // 走到这里是帧头本身坏了（版本 / 长度对不上），seq 都拿不到，只能等心跳超时重连。
       this.emit('error', new Error(`decode failed: ${error.message}`));
       return;
     }
     this.lastResponseAt = Date.now();
-    const { seq, name, body } = decoded;
+    const { seq, name, body, decodeError } = decoded;
+    // body 解不出来但帧头是好的（服务端新增了本地 proto 没有的消息，或字段结构变了）：
+    // 必须照样推进 seq 并 ack，body 当空对象吞掉。不推进的话 recvSeqNo 永远停在坏帧上，
+    // 之后每帧都判 gap → Nack → 服务端重发同一帧 → ResendFailed 死循环，整条下行流废掉。
+    if (decodeError) {
+      this.handleSeqNo(seq, name);
+      this.emit('unknown', { seq, name, error: decodeError, bytes: data });
+      return;
+    }
     if (name === 'PingResponse' && this.tryHandlePong(body)) return;
 
     if (!this.handleSeqNo(seq, name)) return;

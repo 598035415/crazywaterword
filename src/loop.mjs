@@ -48,6 +48,11 @@ import {
 // 「暂停探测」这条日志的重复间隔：货轮静默窗可能长达 10 小时（22:00 收摊 → 次日 8:00），
 // 每轮都印一句会把有用的记录挤没，所以只每 30 分钟报一次。
 const SKIP_NOTICE_MS = 30 * 60 * 1000;
+// 某一种作物的播种被服务端拒（典型 `item limit reached` = 该作物库存到上限）后，
+// 这种作物歇多久再试。半小时足够工厂/订单吃掉一批农产品，也不至于白等一整场挂机。
+const FARM_BLOCK_MS = 30 * 60 * 1000;
+// 失败原因里出现这些字样就说明「这类作物先别种了」，换成数量少的那种。
+const FARM_LIMIT_HINT = /item limit|storage full|limit reached|上限/i;
 // 「领奖」类海商王动作：成功后可能带回「海商王加速」（商人指针），会影响下一轮要不要继续探测。
 const TRADE_REWARD_KINDS = new Set(['tradePass', 'tradeTask', 'tradeReportReward', 'tradeAchieve']);
 // 本轮有没有「成功领到奖」。领奖常带回「海商王加速」= 商会指针，而探测时的 owned 是旧快照，
@@ -150,6 +155,10 @@ export async function runLoop(initialClient, protocol, {
   // 时间没到就整段跳过（省掉 RadarInfo + MyFleets + AllItem 三个请求）。
   radarEnabled = true,
   radarEveryMs = 60_000,
+  // 修船门槛（**百分数**，方便页面上直接填 80）：耐久低于这个百分比就把船留在港里修，
+  // 不派出去打情报。实测出现过 0/2000 的船照样被派出去（服务端不拦），所以这条是硬保护。
+  // 0 = 关掉修船（也等于不按耐久拦派兵）；100 = 不满就修。
+  radarRepairBelow = 80,
   // 海盗讨伐：派空闲舰队**真出战**打世界地图上的海盗（ChallengePirateRequest）。
   // 跟免战扫荡（dailies 1010 的 PirateSweepRequest，一天 10 次、不动舰队）是两码事：
   // 真出战每次烧 300 汽油、不掉耐久，收益是首杀奖励 + 固定掉落。
@@ -233,6 +242,9 @@ export async function runLoop(initialClient, protocol, {
   let lastPickAt = 0;
   // 农田同理：只有真的排了收/种动作才计时，没熟也没空地时不占用间隔。
   let lastFarmAt = 0;
+  // 被服务端拒过的作物 → 解禁时间戳(ms)。撞一次 `item limit reached`（该作物库存到上限）
+  // 就歇 30 分钟，别每轮拿同一条请求去撞墙刷日志；这期间换别的种子顶上。
+  const farmBlocked = new Map();
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
@@ -467,6 +479,8 @@ export async function runLoop(initialClient, protocol, {
           cargoOrderDemand = null;
         }
       }
+      // 解禁到期的作物（撞上限歇 30 分钟），过期的条目顺手清掉，别让表一直长。
+      for (const [crop, until] of farmBlocked) if (until <= tickAt) farmBlocked.delete(crop);
       worldPlan = planWorld(worldSurvey, {
         config,
         allowSpeedUp: pickAt(conf, 'allowSpeedUp', allowSpeedUp),
@@ -476,6 +490,8 @@ export async function runLoop(initialClient, protocol, {
         packGapMax: pickAt(conf, 'packGapMax', packGapMax),
         pickUpFloaters: pickDue,
         farm: farmDue,
+        // 撞过上限的作物：到期的已经在下面清掉，没到期的就在 planWorld 里跳过。
+        farmBlocked,
         // 工厂排产的额外需求：货船缺的货（空 Map = 只按订单缺口排）。
         cargoDemand: cargoOn ? cargoOrderDemand : null,
       });
@@ -491,6 +507,18 @@ export async function runLoop(initialClient, protocol, {
         rejected.world = stillRejected;
         summary.world.results = results;
         summary.world.floaterLoot = summarizeFloaters(results);
+        // 播种被拒 = 这种作物的库存已经到服务端上限（`item limit reached`）。
+        // 记进 farmBlocked 歇 30 分钟，并把原因写进本轮 notes ——
+        // 否则日志里只有一行「失败：server prompt: item limit reached」，看不出是哪种作物、
+        // 也看不出已经换成别的作物在种（2026-10-27 事故现场就是这样，每轮刷一条，地一直空着）。
+        for (const entry of results) {
+          if (entry.ok !== false || entry.skipped) continue;
+          if (entry.step?.kind !== 'farmPlant' || !FARM_LIMIT_HINT.test(String(entry.error ?? ''))) continue;
+          const crops = [...new Set((entry.step.items ?? []).map(([id]) => id))];
+          for (const crop of crops) farmBlocked.set(crop, tickAt + FARM_BLOCK_MS);
+          summary.world.notes.push(`${crops.join('、')} 播种被拒（${entry.error}）：`
+            + `该作物库存到上限，${humanDuration(FARM_BLOCK_MS / 1000)} 内改种别的种子`);
+        }
       }
     } catch (error) {
       summary.world.notes = [...summary.world.notes, `海面探测失败，本轮跳过：${error.message}`];
@@ -538,6 +566,11 @@ export async function runLoop(initialClient, protocol, {
     //    复用 world 那一段的库存（汽油），所以这一轮只多 Stats + List + MyFleets 三个只读请求。
     // 已经确定「这段时间不可能有动作」就整段跳过 —— 一个请求都不发。
     // 探测要打 4 个只读请求（Stats + List + MyFleets + 赛季），奖满后每 60 秒打一遍纯属浪费。
+    // 舰队耐久闸（比例）：页面上是百分数（默认 80），模块内部统一用比例。
+    // 货轮 / 情报 / 海盗**三段共用这一个值** —— 它来自配置表 LoadingTipsCfg 的官方提示
+    // 「城战中舰船耐久度低于 1600 会降低输出，增加受到的伤害」（本账号 maxDura 2000 → 80%），
+    // 所以低于它的船一律先留在港里修（维修请求由情报那一段发），不派去打架。
+    const repairBelowNow = Math.min(1, Math.max(0, Number(pickAt(conf, 'radarRepairBelow', radarRepairBelow)) || 0) / 100);
     const treasureOn = pickAt(conf, 'treasureEnabled', treasureEnabled);
     const treasureEvery = pickAt(conf, 'treasureEveryMs', treasureEveryMs);
     // 勾选等级 / 派船数也走 conf：网页上改「抢哪些」不用停掉重开。
@@ -553,6 +586,8 @@ export async function runLoop(initialClient, protocol, {
           config,
           colors: treasureColorsNow,
           maxFleets: treasureFleetsNow,
+          // 耐久不够的船不派去抢（要打守军）—— 留在港里等情报段修。
+          duraFloor: repairBelowNow,
         });
         const treasurePlan = planTreasure(treasureView, {
           maxFleets: treasureFleetsNow,
@@ -605,20 +640,31 @@ export async function runLoop(initialClient, protocol, {
     if (halted()) break;
     if (radarDue) {
       try {
-        const radarSurvey = await linkRetry(() => surveyRadar(client, protocol, { config, stock: worldSurvey.stock }));
-        const radarView = viewRadar(radarSurvey, { config, minPowerRatio: ratioNow });
-        const radarPlan = planRadar(radarView, { minPowerRatio: ratioNow });
+        const radarSurvey = await linkRetry(() => surveyRadar(client, protocol, {
+          config,
+          stock: worldSurvey.stock,
+          repairBelow: repairBelowNow,
+        }));
+        const radarView = viewRadar(radarSurvey, { config, minPowerRatio: ratioNow, repairBelow: repairBelowNow });
+        const radarPlan = planRadar(radarView, { minPowerRatio: ratioNow, repairBelow: repairBelowNow });
         summary.radar.planned = radarPlan.actions.length;
         summary.radar.notes = radarPlan.notes;
         // 事件为 0 时把「下次刷新」一起说出来 —— 否则日志里连续几十轮「事件 0 个」，
         // 看不出是没刷出来还是刷不出来。
         const refreshLeft = Number(radarView.nextRefreshTime) > 0
           ? Number(radarView.nextRefreshTime) - Math.floor(tickAt / 1000) : 0;
+        const repairs = radarPlan.actions.filter((action) => action.kind === 'radarRepair').length;
+        const lowest = (radarView.fleets ?? []).filter((fleet) => fleet.maxDurability > 0)
+          .sort((a, b) => a.duraPct - b.duraPct)[0];
         summary.radar.summary = `Lv${radarView.level} · 事件 ${radarView.events.length} 个`
           + (radarView.events.length === 0
             ? (refreshLeft > 0 ? `（下次刷新 ${humanDuration(refreshLeft)}后）` : '（等刷新）')
             : '')
-          + ` · 空闲舰队 ${radarView.idleFleets.length}`;
+          + ` · 空闲舰队 ${radarView.idleFleets.length}`
+          // 耐久里报「最低那艘」，比列全部船短；要全量看刷新情报页。
+          + (lowest ? ` · 最低耐久 ${Math.round(lowest.duraPct * 100)}%` : '')
+          + (radarView.repairBelow > 0 ? `（低于 ${Math.round(radarView.repairBelow * 100)}% 就修）` : '')
+          + (repairs > 0 ? ` · 本轮修 ${repairs} 艘` : '');
         if (radarPlan.actions.length > 0) {
           const { results, rejected: stillRejected } = await runWorld(client, protocol, radarPlan, {
             allowMutate,
@@ -660,6 +706,9 @@ export async function runLoop(initialClient, protocol, {
           config,
           minPowerRatio: ratioNow,
           repeat: pirateRepeatNow,
+          // 耐久不够的船不出战：打野怪本身不掉耐久（WorldParamCfg = 0），
+          // 但耐久 <80% 会降输出、挨打更疼，输了白烧 300 汽油。
+          duraFloor: repairBelowNow,
         });
         const piratePlan = planPirates(pirateView, { maxPerRound: pirateCapNow });
         summary.pirate.planned = piratePlan.actions.length;
@@ -966,6 +1015,7 @@ const KIND_TEXT = {
   farmPlant: '播种',
   radarReward: '领情报奖励',
   radarDispatch: '派舰队',
+  radarRepair: '维修舰队',
   pirateChallenge: '讨伐海盗',
   treasureDispatch: '抢货轮',
   equipPick: '收装备',
@@ -1047,7 +1097,8 @@ function detailLines(part, limit = 4) {
 
 // 海面备注：以前一个都印不出来，工厂为什么空着全靠猜。这里最多印 4 条，
 // 并且先印「排产相关」的（空闲/缺料/自选包/存量上限），其余（拾荒额度、农田、订单保留）排后面。
-const WORLD_NOTE_HOT = /空闲|缺料|自选包|排产|存量上限/;
+// 农田相关的放进热名单：撞了单种上限、被服务端拒过之后，这 4 条就是你唯一能看到原因的出口。
+const WORLD_NOTE_HOT = /空闲|缺料|自选包|排产|存量上限|单种上限|播种|被服务端拒/;
 function worldNoteLines(world) {
   const notes = (world?.notes ?? []).filter((note) => typeof note === 'string' && note);
   if (notes.length === 0) return [];

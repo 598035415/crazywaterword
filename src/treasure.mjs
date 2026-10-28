@@ -40,7 +40,7 @@
 //   输赢交给战报（进邮件，由 idle 模块一键领）。
 
 import { normalize } from './worlds.mjs';
-import { rowsOf, assetCount } from './world.mjs';
+import { rowsOf, assetCount, fleetDuraOk, fleetDuraPct } from './world.mjs';
 
 // 兜底值：配置表读不到时用（数值都来自游戏内说明，不是猜的）。
 const FALLBACK_DAILY_LIMIT = 3;
@@ -350,6 +350,10 @@ export function viewTreasure(survey, {
   config = null,
   colors,
   maxFleets = DEFAULT_MAX_FLEETS,
+  // 耐久闸（比例，0.8 = 80%）：低于它的船不派去抢货轮 —— 抢占要打守军，
+  // 耐久 <1600 时输出降低、挨打更疼（配置表 LoadingTipsCfg），输了白掉耐久。
+  // 0 = 不拦（旧行为）。
+  duraFloor = 0,
 } = {}) {
   const config_ = config ?? survey.config ?? null;
   const limit = Number(survey.dailyLimit) || FALLBACK_DAILY_LIMIT;
@@ -378,7 +382,14 @@ export function viewTreasure(survey, {
   };
 
   // 空闲 = state IDLE 且没有正在抢的货轮（客户端同款判据）。
-  const idleFleets = (survey.fleets ?? []).filter((fleet) => fleet.state === 1 && fleet.treasureLootUid === 0);
+  const idleAll = (survey.fleets ?? []).filter((fleet) => fleet.state === 1 && fleet.treasureLootUid === 0);
+  // 耐久不够的船留在港里等修（由「联盟情报」那一段真的发维修请求）：
+  // 抢被占的货轮要先打赢守军，耐久低于 80% 时输出降低、挨打更疼，输了白掉耐久。
+  const groundedFleets = (Number(duraFloor) > 0 ? idleAll.filter((fleet) => !fleetDuraOk(fleet, duraFloor)) : [])
+    .map((fleet) => ({ ...fleet, duraPct: fleetDuraPct(fleet) }));
+  const idleFleets = idleAll
+    .filter((fleet) => !groundedFleets.some((one) => one.buildingId === fleet.buildingId))
+    .map((fleet) => ({ ...fleet, duraPct: fleetDuraPct(fleet) }));
 
   // 我方已经在抢哪个货轮：`MyFleet.treasureLootUid` 在**航行途中就有值**（实测派兵后立刻回 34，
   // 船还是 MOVING），所以这个计数包含"在路上"和"已经在推"两种。
@@ -469,8 +480,12 @@ export function viewTreasure(survey, {
     fleets: (survey.fleets ?? []).map((fleet) => ({
       ...fleet,
       stateText: FLEET_STATE_TEXT[fleet.state] ?? `状态 ${fleet.state}`,
+      duraPct: fleetDuraPct(fleet),
     })),
     idleFleets,
+    // 因为耐久不够被留下的空闲船（由情报段修）。0 耐久也照派是旧行为，现在默认拦。
+    groundedFleets,
+    duraFloor: Number(duraFloor) > 0 ? Math.min(1, Number(duraFloor)) : 0,
     notes,
   };
 }
@@ -549,11 +564,22 @@ export function planTreasure(view, {
       // 两种「不能派」要分开说：在航行/修理，和「已经在抢别的货轮」（treasureLootUid > 0）。
       const away = fleets.filter((fleet) => fleet.state !== 1);
       const onWay = fleets.filter((fleet) => fleet.state === 1 && fleet.treasureLootUid > 0);
+      const grounded = view.groundedFleets ?? [];
       const parts = [];
       if (away.length > 0) parts.push(away.map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' '));
       if (onWay.length > 0) parts.push(`${onWay.map((fleet) => fleet.buildingId).join('、')} 正在抢别的货轮`);
+      // 耐久不够被留下的船：以前会被当成「空闲」直接派出去打守军。
+      if (grounded.length > 0) {
+        parts.push(`${grounded.map((fleet) => `${fleet.buildingId}(${Math.round((fleet.duraPct ?? 0) * 100)}%)`).join('、')}`
+          + ` 耐久低于 ${Math.round((Number(view.duraFloor) || 0) * 100)}%，先修再抢`);
+      }
       notes.push(`没有空闲舰队（${parts.join('，')}）`);
     }
+  } else if ((view.groundedFleets ?? []).length > 0) {
+    // 还有船能派，但有船因为耐久被留下 —— 不能静默，否则看不出为什么派得比往轮少。
+    const grounded = view.groundedFleets;
+    notes.push(`${grounded.length} 艘空闲船耐久低于 ${Math.round((Number(view.duraFloor) || 0) * 100)}%，`
+      + `留在港里等修，不参与抢占：${grounded.map((fleet) => `${fleet.buildingId}(${Math.round((fleet.duraPct ?? 0) * 100)}%)`).join('、')}`);
   }
 
   const target = (view.targets ?? [])[0];
@@ -636,6 +662,10 @@ export function formatTreasureSummary(view) {
   // 「抢哪些」每轮都印：等级是多选的，日志里要能一眼确认当前配置（默认只抢万吨）。
   parts.push(view.colors?.length ? `抢 ${view.colorText}` : '未勾等级（不派船）');
   parts.push(`空闲舰队 ${(view.idleFleets ?? []).length}/${(view.fleets ?? []).length}`);
+  // 被耐久闸留下的船单独标出来，否则「空闲 0/2」看着像船都在航行。
+  if ((view.groundedFleets ?? []).length > 0) {
+    parts.push(`耐久<${Math.round((Number(view.duraFloor) || 0) * 100)}% ${view.groundedFleets.length} 艘待修`);
+  }
   const ourFleetCount = (view.treasures ?? []).reduce((sum, treasure) => sum + (treasure.ourFleets ?? 0), 0);
   if (ourFleetCount > 0) parts.push(`我方 ${ourFleetCount} 支在抢`);
   if (Number(view.petrol) > 0) parts.push(`汽油 ${view.petrol}`);

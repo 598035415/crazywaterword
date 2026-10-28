@@ -110,6 +110,29 @@ export const PAGE = `<!doctype html>
   .grow-line { font-size: 12px; color: #b9c2ce; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .grow-more { font-size: 11px; color: #7c8695; }
   .hero-stock { font-variant-numeric: tabular-nums; }
+  /* 统计页：一日收益的大数字 + 每种东西的占比条 + 近 7 天柱子。
+     .track 故意不叫 .bar —— 全局 .bar 是「一行控件」的样式（flex + margin-bottom），
+     同名会把占比条撑成两行。 */
+  .kpi { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-end; }
+  .kpi .item { display: flex; flex-direction: column; min-width: 88px; }
+  .kpi .item .k { font-size: 11px; color: #7c8695; }
+  .kpi .item .v { font-size: 20px; line-height: 1.3; font-variant-numeric: tabular-nums; }
+  .kpi .item .s { font-size: 11px; color: #7c8695; }
+  .share { display: flex; align-items: center; gap: 8px; min-width: 130px; }
+  .share .track { flex: 1; height: 6px; min-width: 50px; border-radius: 3px; background: #262a31; overflow: hidden; }
+  .share .track i { display: block; height: 100%; background: #4f8a5c; }
+  .share .pct { font-size: 11px; color: #7c8695; font-variant-numeric: tabular-nums; min-width: 30px; text-align: right; }
+  .acts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .acts .act { border: 1px solid #262a31; border-radius: 5px; background: #12151a; padding: 4px 10px; font-size: 12px; }
+  .acts .act b { font-size: 13px; font-variant-numeric: tabular-nums; }
+  .trend { display: flex; gap: 10px; align-items: flex-end; justify-content: flex-start; height: 104px; margin-top: 4px; }
+  .trend .col { flex: 1 1 0; max-width: 58px; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 3px; }
+  .trend .col i { display: block; width: 100%; background: #4f8a5c; border-radius: 2px 2px 0 0; min-height: 2px; }
+  .trend .col.today i { background: #6fd08c; }
+  /* 那天没有归档（新装的、或者那天没挂机）：画成一根暗色刻度，别用亮绿横条抢眼 */
+  .trend .col.flat i { background: #3a4150; width: 40%; }
+  .trend .col .val { font-size: 10px; color: #b9c2ce; font-variant-numeric: tabular-nums; }
+  .trend .col .lab { font-size: 10px; color: #7c8695; }
 </style>
 </head>
 <body>
@@ -129,6 +152,7 @@ export const PAGE = `<!doctype html>
     <button data-tab="dailies">日常</button>
     <button data-tab="account">账号</button>
     <button data-tab="factory">工厂</button>
+    <button data-tab="stats">统计</button>
   </nav>
 </header>
 <main>
@@ -192,7 +216,10 @@ export const PAGE = `<!doctype html>
 **等级是多选的**（协议 color：3 蓝小型 / 4 紫中型 / 5 橙万吨），默认只抢**万吨（大货轮）**；
 想顺手把中型/小型也扫掉就勾上，三个都不勾 = 不派船（日志里会说明）。
 **已经有人占领的也派**：打赢守军就换成我们占（协议里没有守军战力，输赢看战报，进了邮件会一起领）。
-代价是赌输会掉舰船耐久（维修 6 汽油/点）—— 所以无人占领的排在前面优先派，被占着的排后面。
+代价是赌输会掉舰船耐久（维修按服务端下发的单价，本服 5.76 汽油/点）—— 所以无人占领的排在前面优先派，被占着的排后面。
+**耐久低于「挂机」页设的阈值（默认 80%）的船不参与抢占**：配置表 LoadingTipsCfg 明确「耐久低于 1600 会降低输出、
+增加受到的伤害」（本账号 2000 上限 = 80%），打守军是拿低输出去挨打，输了白掉耐久。这类船留在港里，
+由「自动情报」那一段统一发维修请求（修满再派）。阈值填 0 = 不拦（旧行为）。
 一次只打一个货轮（优先级：等级高的先派 → 同等级里 无人占领 → 我方在推 → 别人占着；
 同档再按物品件数 → 资源），把空闲船压上去推快 —— 同联盟最多 10 支能占同一个，默认派 3 支。
 单支消耗汽油 500（WorldParamCfg「进攻宝藏消耗汽油」），汽油不够会自动少派。奖励没有领取请求，结算后进邮件，
@@ -214,11 +241,16 @@ export const PAGE = `<!doctype html>
       </label>
       <label class="dim">时间间隔 <input id="radar-every" value="60" style="width:64px"> 秒</label>
       <label class="dim" title="战力余量 1.2 = 舰队战力要比敌方高 20% 才派，战败会掉舰船耐久">战力余量 <input id="radar-ratio" value="1.2" style="width:48px"></label>
+      <label class="dim" title="耐久低于这个百分比就不派去打架（货轮/情报/海盗三段共用），留在港里修满再派。依据：配置表 LoadingTipsCfg「耐久低于 1600 会降低输出、增加受到的伤害」，本账号 2000 上限 = 80%。填 0 = 不修也不拦（旧行为）">耐久 &lt; <input id="radar-repair" value="80" style="width:48px"> %</label>
       <span id="radar-state" class="dim">还没跑过</span>
     </div>
     <pre id="radar-gate-view">跟拾荒、农田同一套节奏：自动循环每轮都会看一眼，只有「距上次执行」超过间隔才真的跑一次
-「读取情报 → 领已完成奖励 → 每艘空闲船各打一个战力够的事件」，其余轮次整段跳过（连探测请求都不发）。
+「读取情报 → 领已完成奖励 → 派兵（耐久达标的船）→ 修船（耐久低于阈值的船）」，其余轮次整段跳过（连探测请求都不发）。
 战力余量越大越保守：1.2 表示舰队战力至少是敌方的 1.2 倍才派；战败会掉舰船耐久，修船要资源。
+耐久阈值（默认 80%）是**三段共用**的：货轮（抢被占的要打守军）、情报派兵、海盗讨伐都先过这道闸，
+低于它的船不派出去，改成在港里修满（花汽油，耗时按服务端下发的单位代价算）。
+依据是配置表 LoadingTipsCfg 的官方提示「城战中舰船耐久度低于 1600 会降低输出，增加受到的伤害」（本账号 2000 上限 = 80%）。
+修船要船是空闲的（航行/战斗中修不了），修理期间这艘船也派不出去 —— 这就是留余量的意义。
 状态「上次 3 分钟前 · 还差 20 秒」里的时间只在这轮真的探测成功后才更新 —— 探测失败不占用间隔，下一轮立刻重试。</pre>
 
     <h2>自动海盗讨伐</h2>
@@ -238,6 +270,8 @@ export const PAGE = `<!doctype html>
 在「日常」页里自动做）；这里是真的把船开出去打。
 **跟「联盟情报」也不是一回事**：情报事件是雷达里刷出来的，有 6 小时时效；这里打的是地图上常驻的海盗部队。
 成本 300 汽油/次（WorldParamCfg「打野怪消耗汽油」），**不掉耐久**（「打野怪消耗耐久」= 0）。
+但耐久 <80% 会「降低输出、增加受到的伤害」（LoadingTipsCfg）—— 打起来更容易输、白烧 300 汽油，
+所以**耐久低于「挂机」页设的阈值（默认 80%）的船不出战**，留在港里由「自动情报」那一段修满再派（阈值 0 = 不拦）。
 收益 = 首杀奖励（firstKillReward + 首件装备）+ 每次固定掉落（GOLD 250 + 材料），所以**默认只打没打过的下一个等级**，
 照客户端自动讨伐的口径：每种类型从「已击杀最高等级 + 1」往上找，地图上没有这一级就等刷新。
 勾上「刷已通关等级」才会去打打过的那几级 —— 那种只剩固定掉落，值不值自己判断。
@@ -257,7 +291,7 @@ export const PAGE = `<!doctype html>
 
     <h2>农田</h2>
     <div class="bar">
-      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（价值高的种子优先）">
+      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（离库存上限越远的越先种）">
         <input type="checkbox" id="world-farm" checked> 自动农田
       </label>
       <label class="dim">时间间隔 <input id="farm-every" value="120" style="width:64px"> 秒</label>
@@ -265,8 +299,11 @@ export const PAGE = `<!doctype html>
     </div>
     <pre id="farm-view">农田跟拾荒一样按自己的节奏跑，但方向相反：默认就开着，只有命令行加 --no-farm 才关。
 作物最快 30 分钟成熟，所以默认 120 秒看一眼就够；只有**真的排出了收/种动作**才记时间，地里没熟、也没空地时不占用间隔。
-收：熟一片全收（一条 FarmHarvestRequest）；种：空地和刚收的地同一轮补种（一条 FarmPlantRequest），种子按库存从**价值高的先用**（成熟时间长的更值钱），不够的地块会逐块列出原因。
-游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。</pre>
+收：熟一片全收（一条 FarmHarvestRequest）；种：空地和刚收的地同一轮补种，**一种作物一条 FarmPlantRequest**（土豆被拒不会连累小麦）。
+选种顺序：离库存上限越远的越先种 → 同档按价值（成熟时长长的更贵）→ 订单/货船缺的优先。
+服务端对单种作物有库存上限（实测土豆 245 能种、260 起回 item limit reached），而**收获不校验上限**，
+所以播种前会先卡一道 250 的线：到线的作物直接跳过、让位给库存少的；真被拒过的作物歇 30 分钟再试。
+地不够种子时逐块列出原因。游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。</pre>
 
     <h2>挂机收益 / 邮件</h2>
     <div class="bar">
@@ -432,10 +469,11 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
     <h2>联盟情报</h2>
     <div class="bar">
       <button id="radar-refresh">读取情报</button>
-      <button id="radar-run" class="primary">领奖 + 派兵</button>
+      <button id="radar-run" class="primary">领奖 + 派兵 + 修船</button>
       <span id="radar-hint" class="warn"></span>
     </div>
     <pre id="radar-view">按舰队战力筛情报事件：每艘空闲船各派去打一个能打过的，打完的领奖励。战力余量取「挂机」页那个（默认 1.2），越大越保守 —— 战败会掉舰船耐久。
+耐久低于「挂机」页设的阈值（默认 80%）的船不派出去，改成留在港里修满（花汽油，修船期间这艘船派不出去）；阈值填 0 = 不修船。
 自动挂机里也有这套（「挂机」页的「自动联盟情报」，默认每 60 秒跑一次），这里点按钮是不等间隔、立刻跑一次。</pre>
     <div id="radar-events"></div>
   </section>
@@ -485,6 +523,49 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 一键收成：把每座工厂囤积的成品一次收完（逐座发 GainFactoryProduceRequest，收益按产品名合并显示）。
 非工厂建筑（民居、指标楼）的产物不在这里收，那些走「挂机 → 执行一轮」。</pre>
     <div id="factory-list"><span class="dim">还没读。点「刷新工厂」，或先在右上角「连接」。</span></div>
+  </section>
+
+  <section id="tab-stats" class="hidden">
+    <div class="bar">
+      <button id="stats-refresh" class="primary">刷新</button>
+      <button id="stats-prev" class="tiny">前一天</button>
+      <input id="stats-day" type="date" style="width:150px">
+      <button id="stats-next" class="tiny">后一天</button>
+      <button id="stats-today" class="tiny">回到今天</button>
+      <label class="dim"><input type="checkbox" id="stats-auto" checked> 停在这一页时每 30 秒自动刷新</label>
+      <span id="stats-hint" class="warn"></span>
+      <span id="stats-stamp" class="dim"></span>
+    </div>
+    <div class="kpi" id="stats-kpi"><span class="dim">还没读。点「刷新」。</span></div>
+
+    <h2><span id="stats-made-title">今日制造</span> <span class="dim" id="stats-made-note"></span></h2>
+    <div id="stats-made"><span class="dim">连接后显示</span></div>
+
+    <h2>建筑产出 <span class="dim" id="stats-building-note"></span></h2>
+    <div id="stats-building"><span class="dim">连接后显示</span></div>
+
+    <h2>其他收益</h2>
+    <div id="stats-other"><span class="dim">连接后显示</span></div>
+
+    <h2>今日活动次数</h2>
+    <div id="stats-acts"><span class="dim">连接后显示</span></div>
+
+    <h2>近 7 天制造</h2>
+    <div class="trend" id="stats-trend"><span class="dim">连接后显示</span></div>
+
+    <pre id="stats-view">数据不是从内存里读的，而是每次打开这一页都重新扫一遍归档回包 data/responses/&lt;日期&gt;/：
+所以刷新页面、重启进程、下午才打开，看到的都是当天从 0 点起的完整统计，跟挂机当时在不在跑无关。
+
+「制造」= 今天从工厂收走的成品（GainFactoryProduceResponse.products）。还堆在工厂里没收的不算 ——
+那是待收，不是到手。同一张表也能回答「这些料够不够交订单」，因为交单扣的就是这份仓库。
+「建筑产出」是训练营的英雄经验、精铁厂的精铁、民居的金币这些非工厂建筑（CollectBuildingProductResponse）。
+
+拾荒、居民订单、挂机收益、邮件奖励各有各的回包，逐条加起来的。邮件那栏是反推的：
+QuickGotReadEmailRequest 没有回包，只能从当前邮件快照里挑「今天发出且已领取」的邮件，所以它只在查「今天」时出现。
+货轮 / 情报 / 海盗的奖励都走邮件，落到那一栏里；农田收获、海兽这两段协议只有请求没有回包，只能在「今日活动次数」里看做了几次。
+
+「今日活动次数」数的是请求条数，不是收益 —— 服务端拒了的请求也在里面，它说明的是「挂机试过几次」。
+查历史日期时，趋势图仍然按那一天往前数 7 天，方便跟今天对比。</pre>
   </section>
 </main>
 
@@ -717,6 +798,7 @@ $('account').onchange = async () => {
   clear(logEl);
   subscribe();
   refreshOverview();
+  if (activeTab === 'stats') refreshStats();
 };
 
 $('connect').onclick = async () => {
@@ -950,7 +1032,7 @@ const loopDirty = new Set();
 const LOOP_FIELDS = [
   'loop-rounds', 'loop-every', 'world-speedup', 'world-reroll',
   'world-pick', 'pick-every', 'world-farm', 'farm-every',
-  'loop-radar', 'radar-every', 'radar-ratio',
+  'loop-radar', 'radar-every', 'radar-ratio', 'radar-repair',
   'pirate-on', 'pirate-every', 'pirate-repeat',
   'forge-on', 'forge-every', 'pet-on', 'pet-every', 'pet-quality', 'pet-feed',
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
@@ -988,6 +1070,11 @@ function renderLoop(data) {
   syncInterval('pick-every', data.pickEveryMs);
   syncInterval('farm-every', data.farmEveryMs);
   syncInterval('radar-every', data.radarEveryMs);
+  // 修船阈值是百分数（不是毫秒），单独回填：跟间隔一样，用户刚改过（标脏）就不覆盖。
+  if (data.running && typeof data.radarRepairBelow === 'number' && !loopDirty.has('radar-repair')
+    && document.activeElement !== $('radar-repair')) {
+    $('radar-repair').value = String(Math.round(data.radarRepairBelow));
+  }
   syncInterval('pirate-every', data.pirateEveryMs);
   syncInterval('forge-every', data.forgeEveryMs);
   syncInterval('pet-every', data.petEveryMs);
@@ -1067,6 +1154,8 @@ $('loop-start').onclick = async () => {
         // 情报默认开，跟拾荒/农田一样有独立间隔（默认 60 秒）；战力余量越小越激进（战败掉耐久）。
         radar: $('loop-radar').checked,
         radarEverySeconds: Number($('radar-every').value || 0),
+        // 修船阈值（百分数，默认 80）：耐久低于它就留在港里修，不派出去。0 = 不修船。
+        radarRepairBelow: Number($('radar-repair').value || 0),
         // 海盗讨伐（真出战）：默认开，60 秒看一眼；只打首杀等级，勾了才刷已通关的。
         pirate: $('pirate-on').checked,
         pirateEverySeconds: Number($('pirate-every').value || 0),
@@ -1339,14 +1428,21 @@ function renderRadar(data) {
   const box = clear($('radar-events'));
   const fleets = data.fleets || [];
   if (fleets.length) {
-    box.appendChild(el('h2', null, '舰队'));
+    const below = Number(data.repairBelow) || 0;
+    box.appendChild(el('h2', null, below > 0 ? '舰队（耐久 <' + Math.round(below * 100) + '% 就留在港里修）' : '舰队'));
     // cell 分支要的是资产对象 {icon, id}（服务端已经把 icon 一起返回了），
     // 之前只传了 cell: fleet.icon（只是个图标对象，没有 id），名字就渲染成 undefined。
-    box.appendChild(table(['舰队', '状态', '战力', '耐久'], fleets.map((fleet) => [
+    box.appendChild(table(['舰队', '状态', '战力', '耐久', '维修'], fleets.map((fleet) => [
       { cell: { icon: fleet.icon, id: fleet.buildingId } },
       fleet.stateText,
       fmt(fleet.power),
-      fleet.maxDurability ? fmt(fleet.durability) + '/' + fmt(fleet.maxDurability) : '—',
+      fleet.maxDurability > 0
+        ? fmt(fleet.durability) + '/' + fmt(fleet.maxDurability) + '（' + Math.round((fleet.duraPct || 0) * 100) + '%）'
+        : '—',
+      // 维修列只报「这轮会做什么」：要修但船不在港（航行/战斗）时如实说，别让人以为排漏了。
+      fleet.repairable
+        ? '要修（汽油 ' + (fleet.repairCost == null ? '?' : fmt(fleet.repairCost)) + '）'
+        : fleet.repairing ? '修理中' : (fleet.needRepair ? '等船回港' : ''),
     ])));
   }
   box.appendChild(el('h2', null, '情报事件'));
@@ -1381,15 +1477,19 @@ async function refreshRadar() {
 $('radar-refresh').onclick = refreshRadar;
 $('radar-run').onclick = () => {
   const ratio = Number($('radar-ratio').value || 1.2);
-  openConfirm('联盟情报：领奖 + 派兵', [
+  const repairBelow = Number($('radar-repair').value || 0);
+  openConfirm('联盟情报：领奖 + 派兵 + 修船', [
     el('div', null, '先把已完成（待领奖）的情报奖励一次领掉，再把**每一艘空闲船**各派去打一个能打的事件（船有几艘就派几个，互不重复）。'),
     el('div', null, '战力余量 ' + ratio + '×：舰队战力 ≥ 敌方 × ' + ratio + ' 才派。战败会掉舰船耐久，调小就是拿船去赌。'),
+    el('div', null, repairBelow > 0
+      ? '耐久 <' + repairBelow + '% 的船不派出去，改成留在港里**修满**（花汽油，耗时按服务端下发的单位代价算；修船期间这艘船派不出去）。'
+      : '修船已关闭（阈值 0）：耐久再低也照派，自己承担战损。'),
     el('div', null, '派兵会消耗汽油（余量见下方舰队表）；同一时刻只有一艘船能打一个点。'),
     el('div', null, '不想手动点：回「挂机」页把「自动情报」勾上，它会按设定的间隔自己跑这一套。'),
   ], async () => {
     $('radar-hint').textContent = '执行中 ...';
     try {
-      const data = await call('/api/radar/run', { method: 'POST', body: JSON.stringify({ confirm: true, powerRatio: ratio }) });
+      const data = await call('/api/radar/run', { method: 'POST', body: JSON.stringify({ confirm: true, powerRatio: ratio, repairBelow }) });
       const failed = data.results.filter((r) => r.ok === false).length;
       $('radar-hint').textContent = '执行 ' + data.results.length + ' 个动作，失败 ' + failed;
       renderRadar(data);
@@ -1481,6 +1581,15 @@ function heroKpiLines(hero) {
   return out;
 }
 
+// 专武那一格：第一行永远是「当前等级 · 星级」（这才是判断卡在哪的依据 ——
+// 0 星封顶 50 级、升级还要英雄 15 星），后面才是本轮能升什么。
+// hasExclusive=false 的英雄压根没有专武系统，直接显示 —，不要显示成 0 级。
+function heroExclusiveLines(hero) {
+  if (!hero.hasExclusive) return null;
+  const cur = hero.exclusive || { level: 0, star: 0 };
+  return ['lv' + (cur.level || 0) + ' · ' + (cur.star || 0) + ' 星'].concat(hero.exclusiveItems || []);
+}
+
 // 一格最多两行，剩下的收成「另 N 项」；完整内容挂在 title 上，鼠标停一下能看全。
 function heroLines(list, limit) {
   const wrap = el('div', 'grow-lines');
@@ -1532,10 +1641,11 @@ function renderHeroes(data) {
       heroLines(heroKpiLines(hero), 3),
       heroLines(hero.badgeItems),
       heroLines(hero.equipItems),
+      heroLines(heroExclusiveLines(hero), 3),
       btn,
     ];
   });
-  box.appendChild(table(['英雄', '等级', '星级', { label: '战力', num: true }, '英雄本体', '勋章', '装备', '操作'], rows));
+  box.appendChild(table(['英雄', '等级', '星级', { label: '战力', num: true }, '英雄本体', '勋章', '装备', '专武', '操作'], rows));
 }
 
 // 执行：单个英雄 or 全部主战（战力从高到低吃材料，后端按这个顺序算）。
@@ -1545,8 +1655,9 @@ function growHeroes(target) {
     ? '「' + (target.name || target.heroId) + '」'
     : (bench ? '全部英雄' : '全部主战英雄');
   openConfirm('英雄养成：' + who, [
-    el('div', null, '会对' + who + '执行上方勾选的养成项：勋章强化/替换、装备升级/精炼/升星/替换，以及英雄等级、升星、技能。'),
+    el('div', null, '会对' + who + '执行上方勾选的养成项：勋章强化/替换、装备升级/精炼/升星/替换、专武升级/升星，以及英雄等级、升星、技能。'),
     el('div', 'dim', '材料不够的项不会执行；执行前会重新探测一遍。替换类操作会把身上那件换下来（服务端返还材料），不要把「装备替换」「勋章替换」当成只读开关。'),
+    el('div', 'dim', '专武：升级一次一级，最高被「专武星级」卡住（0 星 50 级）；升星只花本英雄自己的碎片，不动万能碎片。'),
     el('div', 'dim', '恒定不做：不花钻石、不分解勋章、不用加速器。'),
   ], async () => {
     $('hero-hint').textContent = '执行中 ...';
@@ -1920,6 +2031,164 @@ setInterval(() => {
   refreshFactories();
 }, 5000);
 
+// ---- 统计 ------------------------------------------------------------------
+// 数全部在服务端按归档回包算好（src/stats.mjs），这里只负责摆位置。
+// statsDay 空串 = 今天：这样跨 0 点不用手动改，仍然是"当前这天"。
+let statsDay = '';
+
+function dayString(ms) {
+  const d = new Date(ms);
+  const pad = (n) => (n < 10 ? '0' + n : String(n));
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+// 占比条：数量 / 这一类合计。全是 0 时给 0%，不留一根满格的假条。
+function shareCell(num, total) {
+  const wrap = el('div', 'share');
+  const track = el('div', 'track');
+  const fill = el('i');
+  fill.style.width = total > 0 ? Math.max(1, Math.round((num / total) * 100)) + '%' : '0%';
+  track.appendChild(fill);
+  wrap.appendChild(track);
+  wrap.appendChild(el('span', 'pct', total > 0 ? Math.round((num / total) * 100) + '%' : '-'));
+  return wrap;
+}
+
+// 一种东西一行：图标+名字 / 数量 / 占比。数量单独一列，不然「淡水 x346」看不出排序感。
+function lootTable(source) {
+  return table(
+    ['物品', { label: '数量', num: true }, '占比'],
+    source.items.map((entry) => [
+      { cell: { id: entry.id, icon: entry.icon } },
+      { num: true, text: fmt(entry.num) },
+      shareCell(entry.num, source.total),
+    ]),
+  );
+}
+
+function renderStatsSource(id, noteId, source, emptyText) {
+  const box = clear($(id));
+  const note = $(noteId);
+  if (note) note.textContent = source ? '（' + source.count + ' 次 · ' + source.items.length + ' 种）' : '';
+  if (!source || !source.items.length) {
+    box.appendChild(el('span', 'dim', emptyText));
+    return;
+  }
+  box.appendChild(lootTable(source));
+}
+
+function renderStats(data) {
+  const kpi = clear($('stats-kpi'));
+  const kpiItem = (key, value, sub) => {
+    const box = el('div', 'item');
+    box.appendChild(el('span', 'k', key));
+    box.appendChild(el('span', 'v', value));
+    if (sub) box.appendChild(el('span', 's', sub));
+    return box;
+  };
+  const of = (key) => (data.sources || []).find((entry) => entry.key === key);
+  const made = of('factory');
+  const building = of('building');
+  const floater = of('floater');
+  const mail = of('mail');
+  kpi.appendChild(kpiItem('制造件数', fmt(data.kpi.made), data.kpi.madeKinds + ' 种产品'));
+  kpi.appendChild(kpiItem('收成品', fmt(made ? made.count : 0) + ' 次', '工厂逐座收取'));
+  kpi.appendChild(kpiItem('建筑产出', fmt(data.kpi.produced), (building ? building.items.length : 0) + ' 种'));
+  kpi.appendChild(kpiItem('拾荒', fmt(data.kpi.looted), floater ? floater.items.length + ' 种' : ''));
+  // 邮件是"当前快照反推"的，只有今天这一份说得通；看历史日期时这条不显示，免得写成 0。
+  if (data.isToday) kpi.appendChild(kpiItem('邮件奖励', fmt(data.kpi.mails) + ' 封', '含货轮/情报/海盗'));
+  kpi.appendChild(kpiItem('活动', fmt(data.kpi.acts) + ' 次', '挂机请求条数'));
+
+  $('stats-made-title').textContent = data.isToday ? '今日制造' : data.day + ' 制造';
+  renderStatsSource('stats-made', 'stats-made-note', made, data.day + ' 没有收到成品');
+  renderStatsSource('stats-building', 'stats-building-note', building, data.day + ' 没有建筑产出');
+
+  // 其他收益：每类一行图标格 —— 拾荒品种多但每样就几个，用表格反而占满一屏。
+  const other = clear($('stats-other'));
+  for (const source of data.sources.filter((entry) => ['floater', 'order', 'afk', 'mail'].includes(entry.key))) {
+    if (!source.items.length) continue;
+    const group = el('div', 'mat-group');
+    group.appendChild(el('div', 'gname', source.label + ' · ' + source.count + ' 笔 · ' + fmt(source.total) + ' 件'));
+    const row = el('div', 'icons');
+    for (const entry of source.items) row.appendChild(cell(entry.icon, 30, entry.id, fmt(entry.num)));
+    group.appendChild(row);
+    group.title = source.note || '';
+    other.appendChild(group);
+  }
+  if (!other.childElementCount) other.appendChild(el('span', 'dim', '这一天没有拾荒 / 订单 / 挂机 / 邮件收益'));
+
+  const acts = clear($('stats-acts'));
+  if (!data.activity.length) {
+    acts.appendChild(el('span', 'dim', '这一天没有活动记录'));
+  } else {
+    const row = el('div', 'acts');
+    for (const act of data.activity) {
+      const node = el('div', 'act');
+      node.appendChild(document.createTextNode(act.label + ' '));
+      node.appendChild(el('b', null, fmt(act.count)));
+      node.appendChild(document.createTextNode(' 次'));
+      row.appendChild(node);
+    }
+    acts.appendChild(row);
+  }
+
+  // 趋势：柱高按本次最大值归一，最高 68px。数量为 0 也画 2px 底线，看得出"这天没跑"。
+  const trendBox = clear($('stats-trend'));
+  const trend = data.trend || [];
+  const max = Math.max(1, ...trend.map((entry) => entry.total));
+  const today = dayString(Date.now());
+  for (const entry of trend) {
+    const col = el('div', 'col' + (entry.day === today ? ' today' : '') + (entry.total ? '' : ' flat'));
+    col.appendChild(el('span', 'val', entry.total ? fmt(entry.total) : '-'));
+    const bar = el('i');
+    bar.style.height = Math.round((entry.total / max) * 68) + 'px';
+    col.appendChild(bar);
+    col.appendChild(el('span', 'lab', entry.day.slice(5)));
+    col.title = entry.day + '：制造 ' + fmt(entry.total) + ' 件（收 ' + fmt(entry.count) + ' 次）';
+    trendBox.appendChild(col);
+  }
+}
+
+async function refreshStats() {
+  try {
+    const query = statsDay ? '?day=' + encodeURIComponent(statsDay) : '';
+    const data = await call('/api/stats' + query);
+    renderStats(data);
+    $('stats-hint').textContent = data.isToday ? '' : '看的是历史（' + data.day + '），邮件那栏只有今天才有';
+    $('stats-stamp').textContent = '数据截至 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  } catch (error) {
+    $('stats-hint').textContent = error.message;
+  }
+}
+
+function statsSetDay(day) {
+  const today = dayString(Date.now());
+  statsDay = day && day !== today ? day : '';
+  if ($('stats-day').value !== day) $('stats-day').value = day || today;
+  refreshStats();
+}
+
+function shiftStatsDay(delta) {
+  const base = $('stats-day').value || dayString(Date.now());
+  const [y, m, d] = base.split('-').map(Number);
+  const next = new Date(y, (m || 1) - 1, (d || 1) + delta);
+  // 往后翻不能翻过今天：以后的日期归档里根本没有，翻过去只会看到一页 0。
+  if (next.getTime() > Date.now()) return;
+  statsSetDay(dayString(next.getTime()));
+}
+
+$('stats-day').value = dayString(Date.now());
+$('stats-refresh').onclick = () => refreshStats();
+$('stats-prev').onclick = () => shiftStatsDay(-1);
+$('stats-next').onclick = () => shiftStatsDay(1);
+$('stats-today').onclick = () => statsSetDay(dayString(Date.now()));
+$('stats-day').onchange = () => { if ($('stats-day').value) statsSetDay($('stats-day').value); };
+setInterval(() => {
+  if (activeTab !== 'stats' || !$('stats-auto').checked) return;
+  refreshStats();
+}, 30000);
+
+
 // ---- 表格 ------------------------------------------------------------------
 // 单元格可以是字符串、{num}、{chip}、{cell: 图标项}、{cells: [图标项]}
 function putCell(td, spec) {
@@ -2237,6 +2506,7 @@ document.querySelectorAll('#tabs button').forEach((button) => {
     }
     if (activeTab === 'idle') refreshLoop();
     if (activeTab === 'factory') refreshFactories();
+    if (activeTab === 'stats') refreshStats();
   };
 });
 

@@ -21,6 +21,23 @@ export function createCodec(protocol) {
     return type;
   }
 
+  // 只给 decode 用：名字在 proto 表里查不到（或字段结构变了）时，不能把异常抛到上层。
+  // 帧头里的 seq 是好的，只有 body 解不出来 —— 上层必须还能推进 seq / ack，
+  // 否则一条未知消息就会让整条下行流永久卡死（2026-10-28 服务端新增 FarmHarvestResponse，
+  // 卡在 seq=4742 上 6 小时 17 分，期间所有请求全部超时）。
+  // encode 仍走 typeOf：发包时名字写错要立刻炸，不能静默发空包。
+  function decodeBody(name, payload) {
+    const type = protocol[name];
+    if (!type || typeof type.decode !== 'function') {
+      return { body: {}, decodeError: `Unknown message type: ${name}` };
+    }
+    try {
+      return { body: type.decode(Reader.create(payload)), decodeError: null };
+    } catch (error) {
+      return { body: {}, decodeError: error.message };
+    }
+  }
+
   function encode(name, seq, body) {
     if (!name) throw new Error('Message name cannot be empty');
     const nameLength = name.length;
@@ -72,8 +89,8 @@ export function createCodec(protocol) {
       const payloadOffset = flagOffset + 1;
       payload = new Uint8Array(view.buffer, view.byteOffset + payloadOffset, view.byteLength - payloadOffset);
     }
-    const body = typeOf(name).decode(Reader.create(payload));
-    return { seq, name, body };
+    const { body, decodeError } = decodeBody(name, payload);
+    return { seq, name, body, decodeError };
   }
 
   return { encode, decode, decodeView };

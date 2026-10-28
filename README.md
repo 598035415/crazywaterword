@@ -28,7 +28,7 @@
 | 日常 | 17 项日常任务的自动完成 + 任务奖励 + 活跃度宝箱 + 每日免费赠礼 |
 | 英雄 | 升级、升星、升技能（判定条件照抄客户端红点逻辑）；**主战英雄**再加勋章（强化/替换）与装备（升级/精炼/升星/替换），材料按战力从高到低共享（默认只算出战阵容，勾选后含替补） |
 | 海面世界 | 收成品、竣工、建造新建筑、交居民订单、给空闲工厂按**需求缺口**排产（居民订单缺的 + 贸易港口货船缺的；队列空时瞬成配方一次排满）、收农田并重新播种、余料升级、加速 |
-| 联盟情报 | 读情报事件，按舰队战力筛能打过的，派空闲舰队去打，回来领奖励；循环里默认开启 |
+| 联盟情报 | 读情报事件，按舰队战力筛能打过的，派空闲舰队去打，回来领奖励；耐久 <80% 的船留在港里修满再派；循环里默认开启 |
 | 海盗讨伐 | 世界地图上的海盗部队：派空闲舰队**真出战**（一艘船打一个），默认只打「没打过的下一个等级」拿首杀奖励（每次烧 300 汽油、不掉耐久）；与日常里的**免战扫荡**是两回事；循环里默认开启，排在货轮和情报之后捡剩船 |
 | 装备厂 / 锻造 | 收取已锻好的装备，收完按「武器/防具/饰品」件数最少的部位排下一件（成套优先）；循环里默认开启 |
 | 海兽培育室 | 收取成熟海兽，队列空位按「材料够的里面品质最高」排满（基因专属该物种，有就排），并按勾选用材料加速（投喂，默认开）；循环里默认开启 |
@@ -166,6 +166,17 @@ node src/app.mjs            # 默认就是这个
   跟拾荒/农田一样有**独立间隔**（默认 60 秒，`--radar-every` 改，0 = 每轮都看）：
   没到点就整段跳过（连探测请求都不发）；到点跑一整套「读取情报 → 领奖 → 派兵」。
   计时只在探测成功时更新 —— 探测失败不占用间隔，下一轮立刻重试。
+  **修船**：耐久低于「挂机」页设的阈值（默认 **80%**，`--repair-below 80`，0 = 关）的船**不派出去**，
+  改成留在港里修满（`RepairFleetRequest{buildingId}`，无 Response）。花费与时长按服务端下发的
+  `FleetRepairParamResponse{unitRepairCost, unitRepairTime}` 折算 —— 本服实测 5.76 汽油/点、0.15 秒/点
+  （修满 2000 点 = 11520 汽油 / 5 分钟），所以**不硬编码**。只有 IDLE 能修；正在修（`state=4` / `repairing` 有值）
+  不重复发；汽油不够修满就先攒着，不发必失败的请求。顺序固定「领奖 → 派兵 → 修船」。
+  **80% 这条线有官方依据**：配置表 `LoadingTipsCfg` 原话「城战中舰船耐久度低于 1600 会降低输出，
+  增加受到的伤害，记得及时维修」——本账号 maxDura 2000 → 1600/2000 = 80%。
+  **同一个阈值也用在货轮和海盗**（`world.mjs` 的 `fleetDuraOk`）：三段共用一个 `radarRepairBelow`，
+  低于它的船一律留在港里等修（货轮打守军、海盗打野怪时低耐久都是「降输出 + 增受伤」，
+  打输白烧汽油/耐久）。被闸留下的船会进 `groundedFleets` 并在日志逐艘写明原因。
+  海商王是纯跑商不战斗（代码里没有 fleet），不受影响。
 
 - **海盗讨伐（默认开，`--no-pirate` 关）** —— 世界地图上常驻的海盗部队，派空闲舰队**真出战**
   （`ChallengePirateRequest{uid, fleetBuildingIds, cityId}`，一艘船打一个）。
@@ -283,16 +294,16 @@ node src/app.mjs <子命令> [参数]
 | `dailies [--dry] [--paid]` | 日常任务闭环 |
 | `heroes [--dry]` | 英雄养成 |
 | `world [--dry] [--speed-up] [--reroll] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--no-farm]` | 海面世界一轮 |
-| `radar [--dry] [--power-ratio N] [--max N]` | 联盟情报：领奖 + 每艘空闲船各派一个事件（战力余量默认 1.2，`--max` 默认不限） |
-| `pirates [--dry] [--power-ratio N] [--max N] [--repeat]` | 海盗讨伐（世界地图**真出战**）：按「已击杀最高等级 + 1」找地图上的海盗，派空闲舰队打（300 汽油/次、不掉耐久）。`--repeat` 连已通关等级也刷（只剩固定掉落）；`--max` 限派几艘。跟日常里的免战扫荡（`PirateSweepRequest`）不是一回事 |
+| `radar [--dry] [--power-ratio N] [--max N] [--repair-below N]` | 联盟情报：领奖 + 每艘空闲船各派一个事件 + 修耐久低于 N%（默认 80）的船（战力余量默认 1.2，`--max` 默认不限） |
+| `pirates [--dry] [--power-ratio N] [--max N] [--repeat] [--repair-below N]` | 海盗讨伐（世界地图**真出战**）：按「已击杀最高等级 + 1」找地图上的海盗，派空闲舰队打（300 汽油/次、不掉耐久）。`--repeat` 连已通关等级也刷（只剩固定掉落）；`--max` 限派几艘；`--repair-below` 耐久低于 N%（默认 80）的船不出战。跟日常里的免战扫荡（`PirateSweepRequest`）不是一回事 |
 | `forge [--dry]` | 装备厂：收取已锻好的装备 + 按部位均衡排下一件 |
 | `pet [--dry] [--pet-max-quality BLUE\|PURPLE\|ORANGE\|RED] [--no-pet-feed]` | 海兽培育室：收成熟 + 材料加速（默认开）+ 队列空位排产 |
 | `idle [--dry]` | 挂机领取：邮件附件 + 挂机本段收益 + 等级奖励 + 等级升级（只花挂机徽章） |
-| `treasure [--dry] [--max N] [--colors 3,4,5]` | 搁浅的货轮：按勾选等级抢货轮（无人占领优先，被占着的也派），空闲舰队压上去推占领进度。`--colors` 多选（3 小型 / 4 中型 / 5 万吨，默认只 5）；旧的 `--min-color 4` 仍认，等价于 `--colors 4,5` |
+| `treasure [--dry] [--max N] [--colors 3,4,5] [--repair-below N]` | 搁浅的货轮：按勾选等级抢货轮（无人占领优先，被占着的也派），空闲舰队压上去推占领进度。`--colors` 多选（3 小型 / 4 中型 / 5 万吨，默认只 5）；旧的 `--min-color 4` 仍认，等价于 `--colors 4,5`；`--repair-below` 耐久低于 N%（默认 80）的船不派去抢占 |
 | `cargo [--dry]` | 贸易港口（建筑「货轮港口」）：采购中的货船把「库存够的格子」一条请求全交（`FillCargoShipRequest`，拿经验+金币），已返航的船领 4 份藏品奖励（`DrawShipRewardRequest`）。缺料只报缺口不买货 |
 | `trade [--dry] [--no-speed]` | 海商王：在港就卖手上的货 + 共享商情 + 买本港特产 + 起航去「这件货的紧缺港口」+ 用商会指针加速，顺带领成就 / 联盟任务 / 商情奖励 / 战令免费档。`--no-speed` 不用指针（就老实等 2 小时） |
 | `field [gridIdx]` | 资源田报告 / 占田 / 弃田 |
-| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
+| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--repair-below N] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--repair-below` = 耐久低于该百分比就修，默认 80，0 = 不修；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
 
 **任何会改变账号状态的命令都必须显式授权**：CLI 加 `--yes` 或 `CW_ALLOW_MUTATE=1`，
 网页请求体里带 `confirm: true`。不加就只打印计划，一个字节都不发出去。

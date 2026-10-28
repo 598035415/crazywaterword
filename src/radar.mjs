@@ -29,8 +29,23 @@
 //   RadarGetAllRewardsRequest {}                一键全领（空体，固定事件也走这条）
 //   派兵要消耗汽油（`WorldParamCfg.情报事件消耗汽油` × 舰队数），本模块只读时不校验。
 //
-// 边界：只做「派舰队打情报事件 + 领奖」，不做世界地图上的占田/掠夺（那需要舰队且属于 PvP）。
+// 边界：只做「派舰队打情报事件 + 领奖 + 修船」，不做世界地图上的占田/掠夺（那需要舰队且属于 PvP）。
 // 战败会掉舰船耐久（修船要资源），所以派兵前必须按战力留足余量，见 minPowerRatio。
+//
+// ---- 修船（2026-10-27 加，全部按反编译客户端核对，别凭猜测改）----
+//   FleetRepairParamRequest  { buildingId }        -> FleetRepairParamResponse { unitRepairTime, unitRepairCost }
+//   RepairFleetRequest       { buildingId }        **无 Response**（协议表里没有 RepairFleetResponse）
+//   StopRepairingRequest     { buildingId }        中途停修（本模块不用）
+//   客户端两处调用点（FleetUtil.openArmyPop / ArmyPop._onBtnAmend、_onBtnRepair）：
+//     · `if (dura != maxDura)` 满耐久不发请求 —— 修是「修满」，请求体里没有数量字段。
+//     · `if (fleet.state == FleetState.IDLE)` 才发 —— **航行/战斗中不能修**，这条必须照抄。
+//     · 汽油是耐久道具：`GlobalDefine.DURABY_ITEM = "汽油"`。
+//       花费 = `Math.ceil((maxDura - dura) * unitRepairCost)`，时长 ≈ `(maxDura - dura) * unitRepairTime` 秒。
+//       unitRepairCost / unitRepairTime 都是服务端下发（double），**不能硬编码**（旧注释里的「6 汽油/点」是估的）。
+//     · 客户端只拦「持有汽油 < unitRepairCost」（连一个单位都修不起），不拦总量 ——
+//       但总量不足时服务端会怎么处理没验证过，所以本模块要求 gasoline 够修满才发，
+//       不够就只写 note，别拿一次必败请求去骚扰服务端。
+//   fleet.repairing = RepairingData { startTs, endTs, endDura } —— 有它就说明正在修（state=4），不要重复发。
 
 import { normalize } from './worlds.mjs';
 import { rowsOf, assetCount, paramOf } from './world.mjs';
@@ -38,6 +53,17 @@ import { rowsOf, assetCount, paramOf } from './world.mjs';
 // 派兵的最低战力比：舰队战力 ≥ 敌方战力 × 这个系数才派。
 // 1.0 = 刚好打平就上（拿耐久赌）；1.2 是保守值，战损小。
 export const DEFAULT_MIN_POWER_RATIO = 1.2;
+
+// 耐久低于这个比例就修（0.8 = 80%）。挂机页/CLI 用百分数（80）配置，到这里统一换成比例。
+// <=0 关掉修船，>=1 表示「不满就修」。
+export const DEFAULT_REPAIR_BELOW = 0.8;
+
+// 维修消耗的道具名（客户端 GlobalDefine.DURABY_ITEM = "汽油"），和派兵烧的是同一种。
+export const DURABY_ITEM = '汽油';
+
+// 修理中的舰队（state=4）不再派兵；这里只用来给「能不能派」一个统一的判定。
+const FLEET_STATE_IDLE = 1;
+const FLEET_STATE_REPAIRING = 4;
 
 const EVENT_STATE_TEXT = { 1: '可派兵', 2: '被占', 3: '进行中', 4: '可领奖' };
 const FLEET_STATE_TEXT = { 1: '空闲', 2: '航行中', 3: '战斗中', 4: '修理中', 5: '排队中' };
@@ -107,7 +133,54 @@ function toEvent(raw, { config = null, fromFixed = false } = {}) {
   };
 }
 
-export async function surveyRadar(client, protocol, { config = null, stock = null, timeout = 8000 } = {}) {
+// 舰队一条的归一化。repairing 有值 = 正在修（state 一般也是 4），端上来给 viewRadar 判断
+// 「已经在修了，别再发 RepairFleetRequest」。
+function toFleet(raw) {
+  return {
+    buildingId: raw?.buildingId ?? '',
+    state: Number(raw?.state) || 0,
+    power: assetCount(raw?.power),
+    durability: assetCount(raw?.durability),
+    maxDurability: assetCount(raw?.maxDura) || 0,
+    repairing: raw?.repairing
+      ? {
+        startTs: Number(raw.repairing.startTs) || 0,
+        endTs: Number(raw.repairing.endTs) || 0,
+        endDura: assetCount(raw.repairing.endDura),
+      }
+      : null,
+    autoFight: raw?.autoFight?.isOn === true,
+    todayFightTimes: Number(raw?.autoFight?.todayTimes) || 0,
+  };
+}
+
+// 缺多少耐久。maxDura 缺失（老回包 / 编造的测试数据）时按 0 处理 = 不修，
+// 因为「修满」的目标值就是 maxDura，没有它连花多少汽油都算不出来。
+function repairGapOf(fleet) {
+  const max = Number(fleet.maxDurability) || 0;
+  if (max <= 0) return 0;
+  return Math.max(0, max - (Number(fleet.durability) || 0));
+}
+
+// 耐久是否低于阈值。below 是比例（0.8）；<=0 关掉修船，>=1 等价于「不满就修」。
+function needsRepairOf(fleet, below) {
+  const ratio = Number(below);
+  if (!(ratio > 0)) return false;
+  const gap = repairGapOf(fleet);
+  if (gap <= 0) return false;
+  const max = Number(fleet.maxDurability) || 0;
+  return (Number(fleet.durability) || 0) < max * Math.min(1, ratio);
+}
+
+// 现在能不能真发 RepairFleetRequest：耐久低 + 空闲 + 没在修。
+// 客户端 _onBtnAmend 有 `state == IDLE` 这条硬判定，航行/战斗中不发 —— 服务端大概率也拒。
+function canStartRepair(fleet, below) {
+  return needsRepairOf(fleet, below)
+    && fleet.state === FLEET_STATE_IDLE
+    && !fleet.repairing;
+}
+
+export async function surveyRadar(client, protocol, { config = null, stock = null, timeout = 8000, repairBelow = DEFAULT_REPAIR_BELOW } = {}) {
   const get = async (name) => {
     const responseName = `${name.slice(0, -7)}Response`;
     if (!protocol[name] || !protocol[responseName]) return null;
@@ -144,24 +217,43 @@ export async function surveyRadar(client, protocol, { config = null, stock = nul
   if (Number(info.fixedEvent?.eventId) > 0) {
     events.push(toEvent(info.fixedEvent, { config, fromFixed: true }));
   }
+  // 只给「现在真能修」的船查参数：空闲 + 没在修 + 耐久低于阈值。
+  // 每艘一条只读请求，所以必须先筛 —— 否则每轮探测都白多发几条。
+  const fleets = (fleetList?.fleets ?? []).map(toFleet);
+  const repairParams = new Map();
+  const wantRepair = fleets.filter((fleet) => canStartRepair(fleet, repairBelow));
+  if (wantRepair.length > 0 && protocol.FleetRepairParamRequest && protocol.FleetRepairParamResponse) {
+    await Promise.all(wantRepair.map(async (fleet) => {
+      try {
+        const params = normalize(await client.request(
+          'FleetRepairParamRequest',
+          { buildingId: fleet.buildingId },
+          'FleetRepairParamResponse',
+          timeout,
+        ));
+        repairParams.set(fleet.buildingId, {
+          unitRepairTime: Number(params?.unitRepairTime) || 0,
+          unitRepairCost: Number(params?.unitRepairCost) || 0,
+        });
+      } catch {
+        // 拿不到参数 = 这轮不修这艘。修船是附属功能，不能因为它让整段情报探测失败。
+      }
+    }));
+  }
+
   return {
     now: Math.floor(Date.now() / 1000),
     level: Number(info.level) || 0,
     exp: Number(info.exp) || 0,
     storedNum: Number(info.storedNum) || 0,
     nextRefreshTime: Number(info.nextRefreshTime) || 0,
-    petrol: bag.get('汽油') ?? 0,
+    petrol: bag.get(DURABY_ITEM) ?? 0,
     stock: bag,
     events,
-    fleets: (fleetList?.fleets ?? []).map((fleet) => ({
-      buildingId: fleet.buildingId,
-      state: Number(fleet.state) || 0,
-      power: assetCount(fleet.power),
-      durability: assetCount(fleet.durability),
-      maxDurability: assetCount(fleet.maxDura) || 0,
-      autoFight: fleet.autoFight?.isOn === true,
-      todayFightTimes: Number(fleet.autoFight?.todayTimes) || 0,
-    })),
+    fleets,
+    // buildingId -> { unitRepairTime, unitRepairCost }（服务端下发，不能硬编码）
+    repairParams,
+    repairBelow,
     config,
   };
 }
@@ -212,24 +304,76 @@ function formatReward(reward, limit = 3) {
   return list.join('、') + (rest > 0 ? ` 等 ${(reward ?? []).length} 项` : '');
 }
 
+// 80% -> "80%"。阈值配的是比例，日志/页面一律按百分数说，跟用户输入的口径一致。
+function pctText(ratio) {
+  return `${Math.round((Number(ratio) || 0) * 1000) / 10}%`;
+}
+
+// 耐久 400/2000 = 20%
+function duraText(fleet) {
+  const max = Number(fleet.maxDurability) || 0;
+  const dur = Number(fleet.durability) || 0;
+  if (max <= 0) return `${dur}`;
+  return `${dur}/${max} = ${Math.round((dur / max) * 100)}%`;
+}
+
+// 修理时长（秒）-> 人话。跟 loop.mjs 的 humanDuration 分开写：两个模块互相 import 会成环。
+function durationText(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total <= 0) return '—';
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.round(total / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
 // 一个事件「现在能不能派、为什么不能」的唯一判定。
 // 之前 formatRadarPlan 和页面各算一套，加了固定事件后已经漂移（页面不认识「已派兵」「配置过期」），
 // 所以在这里算一次，两个渲染端都只读 verdict / verdictChip。
-function verdictOf(event) {
+// hasIdle = 当前有没有空闲舰队：一艘空闲船都没有时（全在航行/战斗/修理）说「战力不够」是错的 ——
+// 实测修船那 5 分钟里日志会写「路易斯的行踪 战力不够」，看着像配置过期。
+function verdictOf(event, { hasIdle = true } = {}) {
   if (event.state === 4) return { text: '待领奖', chip: 'done' };
   // 固定事件 startTime > 0 = 我方舰队已经在打（客户端 isBatting()），state 推送慢时也要能看出来。
   if (event.fixed && event.state === 1 && event.startTime > 0) return { text: '已派兵', chip: 'waiting' };
   if (event.state !== 1) return { text: event.stateText, chip: 'waiting' };
   if (event.dispatchable) return { text: '可派', chip: 'ready' };
   if (event.powerUnknown) return { text: '配置过期', chip: 'blocked' };
+  if (!hasIdle) return { text: '没空闲船', chip: 'waiting' };
   return event.fits ? { text: '材料不齐', chip: 'blocked' } : { text: '战力不够', chip: 'blocked' };
 }
 
-// 视图：每个事件标出「能不能打、敌方多少战力、值不值得」。
-export function viewRadar(survey, { config = null, minPowerRatio = DEFAULT_MIN_POWER_RATIO } = {}) {
+// 视图：每个事件标出「能不能打、敌方多少战力、值不值得」，每艘船标出耐久与要不要修。
+export function viewRadar(survey, {
+  config = null,
+  minPowerRatio = DEFAULT_MIN_POWER_RATIO,
+  repairBelow = survey.repairBelow ?? DEFAULT_REPAIR_BELOW,
+} = {}) {
   const config_ = config ?? survey.config ?? null;
-  const fleets = survey.fleets ?? [];
-  const idle = fleets.filter((fleet) => fleet.state === 1);
+  const repairParams = survey.repairParams ?? new Map();
+  // 阈值统一成比例，且不允许 >1（>1 等价于「不满就修」）。
+  const below = Number(repairBelow) > 0 ? Math.min(1, Number(repairBelow)) : 0;
+  const fleets = (survey.fleets ?? []).map((fleet) => {
+    const max = Number(fleet.maxDurability) || 0;
+    const gap = repairGapOf(fleet);
+    const param = repairParams.get(fleet.buildingId) ?? null;
+    return {
+      ...fleet,
+      stateText: FLEET_STATE_TEXT[fleet.state] ?? String(fleet.state),
+      // maxDura 缺失（老回包/编的测试数据）按「满耐久」处理 —— 0/0 当成 0% 会每轮都想修。
+      duraPct: max > 0 ? (Number(fleet.durability) || 0) / max : 1,
+      needRepair: needsRepairOf(fleet, below),
+      // 「现在就能发 RepairFleetRequest」：耐久低 + 空闲 + 没在修。
+      repairable: canStartRepair(fleet, below),
+      repairParam: param,
+      // 花多少汽油、修多久：服务端下发 unitRepairCost / unitRepairTime（都是 double），
+      // 按「缺多少点耐久」折算；参数没拿到就是 null（这轮不修，也不瞎算）。
+      repairCost: param ? Math.ceil(gap * (Number(param.unitRepairCost) || 0)) : null,
+      repairSeconds: param ? Math.ceil(gap * (Number(param.unitRepairTime) || 0)) : null,
+    };
+  });
+  const idle = fleets.filter((fleet) => fleet.state === FLEET_STATE_IDLE);
   // 舰队战力取「最强的那艘空闲船」—— 派兵是按 buildingId 一艘一艘派的。
   const bestPower = idle.reduce((max, fleet) => Math.max(max, fleet.power), 0);
 
@@ -261,11 +405,17 @@ export function viewRadar(survey, { config = null, minPowerRatio = DEFAULT_MIN_P
         && fits
         && (!event.refugee || event.refugee.requirements.every((need_) => (survey.stock?.get(need_.id) ?? 0) >= need_.num)),
     };
-    const verdict = verdictOf(view);
+    const verdict = verdictOf(view, { hasIdle: idle.length > 0 });
     view.verdict = verdict.text;
     view.verdictChip = verdict.chip;
     return view;
   });
+
+  // 派一艘兵要烧多少汽油（WorldParamCfg「情报事件消耗汽油」，本服 500）。维修和派兵抢同一池汽油，
+  // 所以维修预算必须先把派兵的钱扣掉 —— 否则会排出「派 2 艘（1000）+ 修满 2 艘（23000）」的超支计划。
+  const dispatchFuel = Number(
+    rowsOf(config_, 'WorldParamCfg').find((row) => row.paramName === '情报事件消耗汽油')?.paramValue,
+  ) || 0;
 
   return {
     now: survey.now,
@@ -275,24 +425,35 @@ export function viewRadar(survey, { config = null, minPowerRatio = DEFAULT_MIN_P
     nextRefreshTime: survey.nextRefreshTime,
     petrol: survey.petrol,
     minPowerRatio,
-    idleFleets: idle.map((fleet) => ({ ...fleet, stateText: FLEET_STATE_TEXT[fleet.state] ?? String(fleet.state) })),
-    fleets: fleets.map((fleet) => ({ ...fleet, stateText: FLEET_STATE_TEXT[fleet.state] ?? String(fleet.state) })),
+    repairBelow: below,
+    dispatchFuel,
+    idleFleets: idle,
+    fleets,
     bestIdlePower: bestPower,
     events,
     // 待领奖的事件（state=4）不占舰队，先领掉最省事。
     rewards: events.filter((event) => event.state === 4),
+    // 该修的船（耐久低于阈值）：repairable = 现在就能修，否则是在航行/战斗中或在修。
+    repairQueue: fleets.filter((fleet) => fleet.needRepair),
   };
 }
 
 // 计划：先领奖（一条 RadarGetAllRewardsRequest 全领），再把**每一艘空闲船各派一个事件**。
 // 一艘船同一时刻只能打一个点，所以船数就是并发上限；同一事件不会被派两次。
 // maxDispatch 是「最多派几艘」的上限（默认 Infinity = 有多少空闲船就派多少）。
+// repair / repairBelow：耐久低于 repairBelow（比例）的船**不派出去**，改成留在港里修。
+// 顺序固定为「领奖 → 派兵 → 修船」：派兵用的都是耐久达标的船，跟维修对象互不重叠。
 export function planRadar(view, {
   maxDispatch = Infinity,
   minPowerRatio = DEFAULT_MIN_POWER_RATIO,
+  repair = true,
+  repairBelow = view.repairBelow ?? DEFAULT_REPAIR_BELOW,
+  maxRepair = Infinity,
 } = {}) {
   const actions = [];
   const notes = [];
+  const below = Number(repairBelow) > 0 ? Math.min(1, Number(repairBelow)) : 0;
+  const repairOn = repair === true && below > 0;
 
   if (view.rewards.length > 0) {
     actions.push({
@@ -307,10 +468,17 @@ export function planRadar(view, {
     });
   }
 
-  const idle = (view.idleFleets ?? []).slice().sort((a, b) => b.power - a.power);
-  if (idle.length === 0) {
+  const idleAll = (view.idleFleets ?? []).slice().sort((a, b) => b.power - a.power);
+  // 耐久不达标的船留在港里等修，不派出去：它已经掉了这么多耐久，再打一场很可能直接打空。
+  // 实测出现过 0/2000 的船照样被派出去（服务端不拦 IDLE 船的耐久），所以这条必须自己判。
+  const grounded = repairOn ? idleAll.filter((fleet) => needsRepairOf(fleet, below)) : [];
+  const idle = idleAll.filter((fleet) => !grounded.includes(fleet));
+
+  if (idleAll.length === 0) {
     notes.push(`没有空闲舰队（${(view.fleets ?? []).map((fleet) => `${fleet.buildingId}=${fleet.stateText}`).join(' ') || '一艘都没有'}），这轮只领奖`);
-    return { actions, notes };
+  } else if (grounded.length > 0) {
+    notes.push(`${grounded.length} 艘空闲船耐久低于 ${pctText(below)}，留在港里修，不出去打：`
+      + grounded.map((fleet) => `${fleet.buildingId}(${duraText(fleet)})`).join('、'));
   }
 
   // 候选：可派 + 战力够。排序规则：
@@ -339,62 +507,115 @@ export function planRadar(view, {
     notes.push(`固定事件「${event.name}」已经派舰队去打，等它回来再派`);
   }
 
-  if (candidates.length === 0) {
-    if (skipped.length > 0) {
-      notes.push(`有 ${skipped.length} 个事件打不了：`
-        + skipped.map((event) => `${event.name}(${reasonOf(event)})`).slice(0, 4).join('、'));
-    }
-    return { actions, notes };
-  }
-
   // 贪心配对：最强的那艘先挑，所以它能拿优先级最高（通常奖励最好）的事件；
   // 弱船往后顺延挑剩下的。战力不够的事件不硬派 —— 打输会掉耐久，修船要资源。
-  const cap = Number.isFinite(Number(maxDispatch)) ? Math.max(0, Number(maxDispatch)) : Infinity;
   const taken = new Set();
   const idleLeft = [];
-  for (const fleet of idle) {
-    if (taken.size >= cap) break;
-    const event = candidates.find((one) => !taken.has(one.key)
-      && (one.powerNeeded === 0 || fleet.power >= one.powerNeeded));
-    if (!event) {
-      idleLeft.push(fleet);
-      continue;
+  if (idle.length > 0 && candidates.length > 0) {
+    const cap = Number.isFinite(Number(maxDispatch)) ? Math.max(0, Number(maxDispatch)) : Infinity;
+    for (const fleet of idle) {
+      if (taken.size >= cap) break;
+      const event = candidates.find((one) => !taken.has(one.key)
+        && (one.powerNeeded === 0 || fleet.power >= one.powerNeeded));
+      if (!event) {
+        idleLeft.push(fleet);
+        continue;
+      }
+      taken.add(event.key);
+      actions.push({
+        kind: 'radarDispatch',
+        request: 'RadarSendFleetsRequest',
+        response: null,
+        // fixed 事件不带 uid（客户端 isFixed() 分支），普通事件带。
+        body: event.fixed
+          ? { fleetBuildingIds: [fleet.buildingId] }
+          : { uid: event.uid, fleetBuildingIds: [fleet.buildingId] },
+        // 事件 uid 天然唯一，拿它当 key；派兵失败多是「被别人抢了 / 船不在港」这类瞬时状态，
+        // 记进 rejected 会让这个点永远不再尝试，所以标 transient。
+        key: `radarDispatch:${event.key}`,
+        // 按船分隔离组：一条被拒只停这艘船，别的船照派（否则一条失败全废）。
+        group: `radarDispatch:${fleet.buildingId}`,
+        transient: true,
+        label: `派 ${fleet.buildingId}（战力 ${fleet.power}）打「${event.name}」`
+          + (event.enemyPower > 0 ? `（敌方 ${event.enemyPower}，${minPowerRatio}× 余量 = ${event.powerNeeded}）` : '')
+          + `，奖励 ${event.rewardText}`,
+      });
     }
-    taken.add(event.key);
-    actions.push({
-      kind: 'radarDispatch',
-      request: 'RadarSendFleetsRequest',
-      response: null,
-      // fixed 事件不带 uid（客户端 isFixed() 分支），普通事件带。
-      body: event.fixed
-        ? { fleetBuildingIds: [fleet.buildingId] }
-        : { uid: event.uid, fleetBuildingIds: [fleet.buildingId] },
-      // 事件 uid 天然唯一，拿它当 key；派兵失败多是「被别人抢了 / 船不在港」这类瞬时状态，
-      // 记进 rejected 会让这个点永远不再尝试，所以标 transient。
-      key: `radarDispatch:${event.key}`,
-      // 按船分隔离组：一条被拒只停这艘船，别的船照派（否则一条失败全废）。
-      group: `radarDispatch:${fleet.buildingId}`,
-      transient: true,
-      label: `派 ${fleet.buildingId}（战力 ${fleet.power}）打「${event.name}」`
-        + (event.enemyPower > 0 ? `（敌方 ${event.enemyPower}，${minPowerRatio}× 余量 = ${event.powerNeeded}）` : '')
-        + `，奖励 ${event.rewardText}`,
-    });
-  }
 
-  const rest = candidates.length - taken.size;
-  if (rest > 0) {
-    notes.push(idleLeft.length > 0
-      ? `还有 ${rest} 个事件没派：${idleLeft.length} 艘空闲船的战力不够（每艘船同时只能打一个点）`
-      : `还有 ${rest} 个能打的事件，空闲船都用完了（每艘船同时只能打一个点）`);
-  } else if (idleLeft.length > 0) {
-    // 走到这里 rest === 0，即「能打的事件全派出去了」：剩下的船不是打不过，是没事件可打
-    // （以前这里统一写成「战力不够」，一艘船打一个事件的场景下会给出误导性原因）。
-    notes.push(`${idleLeft.length} 艘空闲船没派：能打的事件都派出去了（每艘船同时只能打一个点）`);
+    const rest = candidates.length - taken.size;
+    if (rest > 0) {
+      notes.push(idleLeft.length > 0
+        ? `还有 ${rest} 个事件没派：${idleLeft.length} 艘空闲船的战力不够（每艘船同时只能打一个点）`
+        : `还有 ${rest} 个能打的事件，空闲船都用完了（每艘船同时只能打一个点）`);
+    } else if (idleLeft.length > 0) {
+      // 走到这里 rest === 0，即「能打的事件全派出去了」：剩下的船不是打不过，是没事件可打
+      // （以前这里统一写成「战力不够」，一艘船打一个事件的场景下会给出误导性原因）。
+      notes.push(`${idleLeft.length} 艘空闲船没派：能打的事件都派出去了（每艘船同时只能打一个点）`);
+    }
+  } else if (candidates.length > 0 && idle.length === 0 && grounded.length === 0) {
+    notes.push(`${candidates.length} 个事件能打，但没有空闲船`);
   }
-  if (skipped.length > 0) {
+  // 一艘空闲船都没有时不报「打不过」：那几艘在航行/修理，几分钟后自己会回来，
+  // 上面已经有一条「没有空闲舰队（…）」，再写「战力不够」会让人以为配置过期。
+  if (skipped.length > 0 && idleAll.length > 0) {
     notes.push(`${skipped.length} 个事件打不过或材料不齐：`
       + skipped.map((event) => `${event.name}(${reasonOf(event)})`).slice(0, 4).join('、'));
   }
+
+  // ---- 修船 ----
+  // 只对「现在就能修」的船动手：空闲 + 没在修 + 耐久低于阈值（客户端 _onBtnAmend 同款门槛）。
+  // 修满要花的汽油按服务端下发的 unitRepairCost 折算，**不硬编码**。
+  if (repairOn) {
+    const queue = (view.fleets ?? [])
+      .filter((fleet) => canStartRepair(fleet, below))
+      // 最破的先修：一艘 0/2000 的船比 1900/2000 的船更该先回厂。
+      .sort((a, b) => repairGapOf(b) - repairGapOf(a));
+    const capRepair = Number.isFinite(Number(maxRepair)) ? Math.max(0, Number(maxRepair)) : Infinity;
+    // 派兵先花掉一部分汽油（每艘「情报事件消耗汽油」），维修预算从剩下的里面算。
+    const dispatchSpent = taken.size * (Number(view.dispatchFuel) || 0);
+    let fuelLeft = Math.max(0, (Number(view.petrol) || 0) - dispatchSpent);
+    let planned = 0;
+    for (const fleet of queue) {
+      if (planned >= capRepair) {
+        notes.push(`还有 ${queue.length - planned} 艘船要修，本轮达到上限 ${capRepair} 艘，下一轮继续`);
+        break;
+      }
+      const gap = repairGapOf(fleet);
+      const param = fleet.repairParam;
+      if (!param) {
+        notes.push(`${fleet.buildingId} 要修但拿不到维修参数（FleetRepairParamRequest 没成功），这轮跳过`);
+        continue;
+      }
+      const cost = Math.ceil(gap * (Number(param.unitRepairCost) || 0));
+      if (cost > fuelLeft) {
+        notes.push(`${fleet.buildingId} 修满要 ${cost} ${DURABY_ITEM}，`
+          + `剩下的汽油只有 ${fuelLeft}${dispatchSpent > 0 ? `（已扣掉派兵 ${dispatchSpent}）` : ''}，攒够再修`);
+        continue;
+      }
+      fuelLeft -= cost;
+      planned += 1;
+      actions.push({
+        kind: 'radarRepair',
+        request: 'RepairFleetRequest',
+        response: null,
+        body: { buildingId: fleet.buildingId },
+        // 一艘船一个 key：失败了别让整段情报陪葬，也别把这条永久记进 rejected
+        // （维修失败多是「汽油又被别的段花掉了」这种会恢复的状态）。
+        key: `radarRepair:${fleet.buildingId}`,
+        group: `radarRepair:${fleet.buildingId}`,
+        transient: true,
+        label: `维修 ${fleet.buildingId}（耐久 ${duraText(fleet)}，低于 ${pctText(below)}）→ 修满`
+          + `，花 ${cost} ${DURABY_ITEM}` + (fleet.repairSeconds > 0 ? `，约 ${durationText(fleet.repairSeconds)}` : ''),
+      });
+    }
+    // 要修但现在修不了的（航行中 / 战斗中 / 已经在修）说清楚原因，别让人以为漏了。
+    const waiting = (view.fleets ?? []).filter((fleet) => needsRepairOf(fleet, below) && !canStartRepair(fleet, below));
+    if (waiting.length > 0) {
+      notes.push(`${waiting.length} 艘船耐久也低，但暂时修不了：`
+        + waiting.map((fleet) => `${fleet.buildingId}(${fleet.stateText}${fleet.repairing && fleet.repairing.endTs > 0 ? `，${durationText(fleet.repairing.endTs - Math.floor(Date.now() / 1000))}后好` : ''})`).join('、'));
+    }
+  }
+
   return { actions, notes };
 }
 
@@ -402,6 +623,19 @@ export function formatRadarPlan(view, plan) {
   const lines = [];
   lines.push(`情报 Lv${view.level}（经验 ${view.exp}）· 存 ${view.storedNum} 个 · 汽油 ${view.petrol}`
     + ` · 舰队 ${view.fleets.length} 艘（空闲 ${view.idleFleets.length}，最强 ${view.bestIdlePower}）`);
+  // 舰队耐久单独列一行：修船是按耐久判的，不写出来就看不出「为什么这轮没派兵」。
+  if ((view.fleets ?? []).length > 0) {
+    const below = Number(view.repairBelow) || 0;
+    lines.push(`  舰队耐久（低于 ${pctText(below)} 就修）：`
+      + view.fleets.map((fleet) => `${fleet.buildingId} ${fleet.stateText} ${duraText(fleet)}`
+        + (fleet.repairable ? `（要修，${fleet.repairCost !== null ? `${DURABY_ITEM} ${fleet.repairCost}` : '参数未知'}）`
+          // 修的时候服务端**不更新 durability**，只给 repairing.endDura —— 光看「0/2000」会以为没修上，
+          // 所以把「修到多少、还有多久」一起写出来。
+          : fleet.repairing
+            ? `（修理中${fleet.repairing.endDura > 0 ? ` → ${fleet.repairing.endDura}/${fleet.maxDurability}` : ''}`
+              + `${fleet.repairing.endTs > 0 ? `，${durationText(fleet.repairing.endTs - Math.floor(Date.now() / 1000))}后好` : ''}）`
+            : '')).join('；'));
+  }
   if (view.events.length === 0) {
     // 事件为空不等于出问题：情报池按 nextRefreshTime 才刷（实测隔 6 小时量级），
     // 期间每轮探测都会是 0 个。

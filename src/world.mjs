@@ -36,6 +36,12 @@ const POPULATION_PARAM = '初始人口上限';
 // BuildingCfg.buildingType 里的农田名（UI 名同款）。农田只能靠它认，
 // 因为服务端只在有作物时才编码 building.farm，空地回包里没有这个字段。
 export const FARM_TYPE = '农田';
+// 农田产物「单种库存上限」（实测推断，2026-10-27）：
+//   土豆 245 时播种成功（13:28 OkResponse），260 起一律 `item limit reached`（13:58 起每轮被拒）。
+//   说明线落在 245~260 之间，取 250 保守值。注意**收获不校验上限** ——
+//   4 块地同时收会把库存顶过线（245 → 260），顶过去就再也种不上，所以播种前必须自己卡住。
+// 传 0 关闭这条保护（想回到「不管库存、能种就种」时用）。
+export const FARM_CROP_CAP = 250;
 
 // 生产时间的公式是**减免后**的，不是 BuildingProduceCfg.produceTime 原值：
 //   BuildingProduceUtil.produceFinalTime = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
@@ -483,6 +489,11 @@ export function planWorld(survey, {
   // 农田开关：收成熟作物 + 补种空地。跟拾荒一样由调用方按自己的间隔门控
   // （循环默认 2 分钟看一次），关掉就完全不碰农田。
   farm = true,
+  // 被服务端拒过的作物 → 解禁时间戳(ms)。由 loop 学习后回传：同一种作物撞了
+  // `item limit reached` 就别每轮再来一次，换别的种子顶上。
+  farmBlocked = null,
+  // 单种库存上限（0 = 不判断）。默认 FARM_CROP_CAP，见那里的实测说明。
+  farmCropCap = FARM_CROP_CAP,
   // 外部需求（Map<itemId, 数量>）：居民订单之外还有谁在等这批货 —— 目前是贸易港口的货船缺口。
   // 并进排产需求的同一张表（见下面的 demand），所以工厂会优先产它，而不是拿空位去产别的。
   // 纯函数：不传/传空 Map 就等于旧行为（只认订单缺口）。
@@ -1107,6 +1118,9 @@ export function planWorld(survey, {
     if (empties.length > 0 && survey.autoFarming === true) {
       notes.push(`农田 ${empties.length} 块空着，游戏内「自动种植」开着，交给服务端`);
     } else if (empties.length > 0) {
+      const cap = Math.max(0, Number(farmCropCap) || 0);
+      const blockedUntil = (crop) => Number(farmBlocked?.get?.(crop) ?? 0) || 0;
+      const skippedSeeds = [];
       const options = rowsOf(config, 'FarmlandPlantCfg')
         .map((row) => ({
           id: row?.id,
@@ -1117,10 +1131,36 @@ export function planWorld(survey, {
           seed: Array.isArray(row?.material) && row.material.length >= 2 ? row.material : null,
         }))
         .filter((row) => row.id && row.seed)
-        // 播种顺序：**价值高的先种**。作物配置里没有价格字段，`produceNum` 又全是 5，
-        // 唯一的成本差异就是成熟时间 —— 时间越长越贵（橡胶 15600s ＞ 花菜 7200 ＞ 小麦 1800），
-        // 所以用 time 降序当作「高价值 → 低价值」。同一时长内订单缺的优先。
-        .sort((a, b) => b.time - a.time || (demand.get(b.id) ?? 0) - (demand.get(a.id) ?? 0));
+        // 播种前先做两道「别再撞墙」的检查（2026-10-27 事故：土豆一路堆到 265，
+        // 服务端每轮回 `item limit reached`，4 块地空了一个多小时，日志每轮刷一条失败）：
+        //   ① 该作物库存已到单种上限 → 不种（收获不校验上限，能顶到 265）。
+        //   ② 刚被服务端拒过（loop 记下来暂缓的）→ 不种，等解禁。
+        .filter((row) => {
+          const held = free(row.id);
+          if (cap > 0 && held >= cap) {
+            skippedSeeds.push(`${row.id} 库存 ${held} 已到单种上限 ${cap}`);
+            return false;
+          }
+          const until = blockedUntil(row.id);
+          if (until > now * 1000) {
+            skippedSeeds.push(`${row.id} 刚被服务端拒过，${Math.ceil((until - now * 1000) / 60000)} 分钟后再试`);
+            return false;
+          }
+          return true;
+        })
+        // 播种顺序：**离上限越远的越先种**；同一档里按价值（成熟时长）降序，再按订单缺口。
+        // 为什么不是单纯「价值高的先种」：土豆 2400s 比小麦 1800s 值钱，只看时长会一直种土豆，
+        // 一路堆到撞上限（265），然后被迫跳过去、等库存降下来又回头种土豆 —— 来回振荡。
+        // 留 20% 余量（cap 的 0.8）当软线，越过软线的作物让位给库存少的，自然就轮作了。
+        .sort((a, b) => {
+          const warn = cap > 0 ? cap * 0.8 : Number.POSITIVE_INFINITY;
+          const aNear = free(a.id) >= warn ? 1 : 0;
+          const bNear = free(b.id) >= warn ? 1 : 0;
+          return aNear - bNear
+            || b.time - a.time
+            || (demand.get(b.id) ?? 0) - (demand.get(a.id) ?? 0);
+        });
+      if (skippedSeeds.length > 0) notes.push(`农田跳过这些种子：${skippedSeeds.join('、')}`);
       const args = [];
       const left = [...empties];
       for (const option of options) {
@@ -1134,22 +1174,29 @@ export function planWorld(survey, {
           args.push({ buildingId: plot.buildingId, productId: option.id });
         }
       }
-      if (args.length > 0) {
-        const mix = [...new Set(args.map((a) => a.productId))]
-          .map((id) => `${id}×${args.filter((a) => a.productId === id).length}`)
-          .join(' ');
+      // **一种作物一条 FarmPlantRequest**：以前全部打包成一条，土豆那条被
+      // `item limit reached` 拒掉时，小麦/玉米跟着一条都发不出去（runWorld 按 group
+      // 失败隔离，同一组里第一条失败后面全 skip）。分开之后互不拖累。
+      const byCrop = new Map();
+      for (const arg of args) {
+        if (!byCrop.has(arg.productId)) byCrop.set(arg.productId, []);
+        byCrop.get(arg.productId).push(arg);
+      }
+      for (const [crop, group] of byCrop) {
         actions.push({
           kind: 'farmPlant',
           request: 'FarmPlantRequest',
           response: null,
-          body: { args },
-          // transient：同 farmHarvest —— 常量 key，一次「种子不足/地块状态变了」的 prompt
-          // 会让播种在本进程内永久停掉。下一轮探测会重新判种子，重试是安全的。
+          body: { args: group },
+          // transient：同 farmHarvest —— 一次「种子不足/地块状态变了/该作物到上限」的 prompt
+          // 会让播种在本进程内永久停掉。下一轮探测会重新判库存和种子，重试是安全的。
           transient: true,
+          key: `farmPlant:${crop}`,
+          group: `farmPlant:${crop}`,
           // 同上：单位是地块数（args 一个元素 = 一块地）。
-          items: args.map((a) => [a.productId, 1]),
+          items: group.map((a) => [a.productId, 1]),
           unit: '块',
-          label: `播种 ${args.length} 块（${mix}）`,
+          label: `播种 ${group.length} 块（${crop}×${group.length}）`,
         });
       }
       if (left.length > 0) {
@@ -1446,6 +1493,32 @@ export function loadMapAsset(scenarioId) {
 // 舰队状态：1=IDLE 2=MOVING 3=BATTLING 4=REPAIRING 5=QUEUING（客户端 FleetState 枚举）。
 export function idleFleets(survey) {
   return (survey.fleets ?? []).filter((f) => Number(f.state) === 1 && Number(f.durability) > 0);
+}
+
+// --- 舰队耐久 ----------------------------------------------------------------
+//
+// 80% 这条线不是拍脑袋：配置表 `LoadingTipsCfg` 的原话是
+// 「城战中舰船耐久度低于 1600 会降低输出，增加受到的伤害，记得及时维修。」
+// 本账号 maxDura = 2000 → 1600 / 2000 = **80%**。所以耐久低于 80% 的船去打任何一场战斗
+// 都是「输出低 + 挨打疼」，输了还要花汽油修（5.76 汽油/点，见 radar.mjs），不如先修再派。
+//
+// 耐久消耗本身是分场景的（`WorldParamCfg`）：攻城战 100、打野怪 0、资源地 0、进攻首领 0；
+// 情报事件与货轮战斗走通用战损。无论哪一段，判定口径都该是同一个，所以放在这里给各段共用。
+export const DURABILITY_WARN_RATIO = 0.8;
+
+// 耐久百分比（0~1）。maxDura 缺失时按「满耐久」处理 —— 拿不到上限就拦船，
+// 等于把整个玩法关掉，那是更糟的失败方式。
+export function fleetDuraPct(fleet) {
+  const max = Number(fleet?.maxDurability ?? fleet?.maxDura) || 0;
+  if (max <= 0) return 1;
+  return Math.min(1, Math.max(0, (Number(fleet?.durability) || 0) / max));
+}
+
+// 耐久够不够派出去打架。floor 是比例（0.8）；<=0 = 不拦（关掉这道闸）。
+export function fleetDuraOk(fleet, floor = 0) {
+  const ratio = Number(floor);
+  if (!(ratio > 0)) return true;
+  return fleetDuraPct(fleet) >= Math.min(1, ratio);
 }
 
 export function formatFieldReport(survey, map) {
