@@ -42,6 +42,29 @@ export const FARM_TYPE = '农田';
 //   4 块地同时收会把库存顶过线（245 → 260），顶过去就再也种不上，所以播种前必须自己卡住。
 // 传 0 关闭这条保护（想回到「不管库存、能种就种」时用）。
 export const FARM_CROP_CAP = 250;
+// 农田「想种什么」反馈给种子厂的两个阈值（见 planWorld 里那段 farmSeed 需求）：
+//   FARM_SEED_RESERVE 每种作物至少备几个种子 —— 8 = 两轮（4 块地 × 2）。
+//     种子厂一炉 1800~7200 秒只出 **1 个**，而 4 块地 1800 秒就要吃掉 4 个（4 倍缺口），
+//     只备 4 个的话第二轮就断种。种子能存到 50，多备几个是免费的缓冲。
+//   FARM_CROP_COMFORT 作物库存低于它就当「缺」，才值得为它专门产种子（40 远低于上限 250，
+//     不会给正在爆仓的土豆/小麦再加需求）；同时也是「安全水位」的地板值。
+export const FARM_SEED_RESERVE = 8;
+export const FARM_CROP_COMFORT = 40;
+// 种子厂的「别排到上限」余量（2026-10-28）：种子一炉只出 1 个，堆到 50 就是纯浪费 ——
+// 实测小麦种子 45/50 还被排了 4 个（6 个队列位占了 4 个），而真正缺的番茄种子（0 个）只排上 1 个。
+// 留 5 个余量后，接近上限的种子不进 pool，队列位自然让给缺的那种。
+export const SEED_STOCK_MARGIN = 5;
+// 作物「安全水位」的最高档（分档见 planWorld 里的 waterlineOf）。
+// 高于水位的库存算「过剩」：工厂该去吃它，农田暂时不用再种 ——
+// 否则 13 种作物会一起被推到单种上限 250，然后上限过滤把每一种都剔掉，
+// 地块永久空着（死局），而仓库里全是工厂吃不掉的存货。
+//   6 条配方（小麦/番茄）200 · 5 条（橡胶）180 · 4 条（胡萝卜）150
+//   3 条（大豆/可可豆）120 · 2 条（玉米/土豆/卷心菜/辣椒/花菜）80 · 1 条（南瓜/茄子）40
+// 配方表里查不到的作物退回 FARM_CROP_COMFORT(40)，绝不让它变成 0（那会让农田全面停摆）。
+export const FARM_CROP_WATERLINE_MAX = 200;
+// 「用过剩作物排产」时每种成品最多加几份需求。216 个小麦能折成 36 份海鲜披萨（226 分钟），
+// 不限的话 6 个制造位全被它钉死，真正缺料的配方反而排不进来。
+export const FARM_FEED_MAX = 3;
 
 // 生产时间的公式是**减免后**的，不是 BuildingProduceCfg.produceTime 原值：
 //   BuildingProduceUtil.produceFinalTime = ceil( max(0, produceTime - reduce) / (1 + speedUp) )
@@ -816,6 +839,107 @@ export function planWorld(survey, {
     notes.push(`货船需求已并入排产：${cargoWants.map(([id, num]) => `${id}×${num}`).join(' ')}`);
   }
   const produceRows = rowsOf(config, 'BuildingProduceCfg');
+  // 作物 → 被几条成品配方用到（决定它的安全水位，见下面的 waterlineOf）。
+  // 只从 FarmlandPlantCfg 取「哪些是作物」，配方表里查不到用途的作物也进表（计 0 次）。
+  const cropIds = new Set(rowsOf(config, 'FarmlandPlantCfg').map((row) => row?.id).filter(Boolean));
+  const cropUses = new Map([...cropIds].map((crop) => [crop, 0]));
+  for (const row of produceRows) {
+    for (const [id] of row.costItem ?? []) {
+      if (cropUses.has(id)) cropUses.set(id, cropUses.get(id) + 1);
+    }
+  }
+  // 农田的「安全水位」：库存到这个数就认为够用了，农田不再为它种、工厂该去吃它。
+  // 用途越广越值得囤（小麦/番茄各 6 条配方 → 200，南瓜/茄子只有 1 条 → 40）。
+  // farmCropCap = 0 表示「关掉一切库存保护、能种就种」，水位跟着变 Infinity。
+  // 水位永远排在单种上限之下，否则「到水位」和「到上限」同时触发，跳过原因会说不清。
+  const waterlineOf = (crop) => {
+    const cap = Number(farmCropCap) || 0;
+    if (cap <= 0) return Number.POSITIVE_INFINITY;
+    const uses = cropUses.get(crop) ?? 0;
+    const byUses = uses >= 6 ? FARM_CROP_WATERLINE_MAX
+      : uses === 5 ? 180
+        : uses === 4 ? 150
+          : uses === 3 ? 120
+            : uses === 2 ? 80
+              : FARM_CROP_COMFORT;
+    return Math.min(byUses, Math.max(FARM_CROP_COMFORT, cap - 1));
+  };
+  // 农田缺的作物 → 给种子厂加需求（2026-10-28）。
+  // 为什么需要这段：种子厂按 pool 顺序「慢慢轮」（产完小麦产玉米…），13 种种子要好几轮才轮到；
+  // 而农田这边「分散铺开」恰恰需要那些库存为 0 的作物有种子。把农田的缺口当成需求喂进去，
+  // 种子厂的 scoreFor 就会被顶到前面（×1e6），先产真正缺的那几种。
+  // 三道过滤，缺一不可：
+  //   ① 该种子的配方，种子厂等级得够（unlockLevel ≤ 种子厂等级）—— 够不上别加需求，
+  //      加了也没人能做，只会让别的工厂误判（其实只影响种子厂，但保持口径干净）；
+  //   ② 作物库存 ≥ 它的**安全水位**（waterlineOf，见上面）的不补 —— 土豆 241、小麦 226 这种正在爆仓的别再加；
+  //   ③ 种子已有 FARM_SEED_RESERVE(8) 个的不补 —— 够种两轮了（种子厂一炉只出 1 个，得提前囤）。
+  // 需求值 = 「种子缺几个」+ 0.9×饥荒度：整数部分决定产几个（种子厂一炉只出 1 个、
+  // 非瞬成配方一次只排 1 个，靠它决定排到几时停），小数部分只当排序权重（作物库存 0 的靠前），
+  // 副作用是多产 1 个，可以忽略。
+  const farmSeedWants = [];
+  const seedPlots = (survey.buildings ?? []).filter((b) => b.farm).length;
+  const seedFactory = (survey.buildings ?? [])
+    .find((b) => b.type === '种子厂' && !(Number(b.buildFinishTime) > 0));
+  const seedLevel = Number(seedFactory?.level ?? 0);
+  if (seedPlots > 0 && seedLevel > 0) {
+    for (const row of rowsOf(config, 'FarmlandPlantCfg')) {
+      const crop = row?.id;
+      const seedId = Array.isArray(row?.material) && row.material.length >= 2 ? row.material[0] : null;
+      if (!crop || !seedId) continue;
+      const recipe = produceRows.find((r) => r.buildType === '种子厂' && r.itemId === seedId);
+      if (!recipe || Number(recipe.unlockLevel) > seedLevel) continue;
+      const cropHeld = free(crop);
+      const seedHeld = free(seedId);
+      // 判据跟**播种**用同一个口径（waterlineOf），不能再拿 FARM_CROP_COMFORT 顶：
+      // 小麦水位 200、舒适线 40，降到 150 时农田已经在种它了，但按 40 判就永远不催种子，
+      // 结果是「地要种它、种子却没人产」。farmCropCap=0（关掉库存保护）时退回 40。
+      const line = waterlineOf(crop);
+      const cropLine = Number.isFinite(line) ? line : FARM_CROP_COMFORT;
+      if (cropHeld >= cropLine || seedHeld >= FARM_SEED_RESERVE) continue;
+      const urgency = Math.min(0.9, (Math.max(0, cropLine - cropHeld) / Math.max(1, cropLine)) * 0.9);
+      demand.set(seedId, (demand.get(seedId) ?? 0) + (FARM_SEED_RESERVE - seedHeld) + urgency);
+      farmSeedWants.push(`${crop}（库存 ${cropHeld}、种子 ${seedHeld}）`);
+    }
+  }
+  if (farmSeedWants.length > 0) {
+    notes.push(`农田缺 ${farmSeedWants.join('、')}，已给种子厂加需求`);
+  }
+  // 农田过剩的作物 → 成品需求（2026-10-28）。
+  // 为什么需要：工厂没有外部需求时按「产出时间短的先排」，食品厂/食品厂B 那 22 条配方要
+  // 180~300 分钟（减免后仍 2~4 小时），永远排在淡水（0 秒）、布匹这些瞬成配方后面。
+  // 实测一整天（2026-10-28）：食品厂只排了 16 次、食品厂B 13 次，含农产品的配方只有
+  // 「酒精」13 次（= 39 个小麦），而农田一天产 400+ 个 —— 216 小麦 / 241 土豆全烂在仓库，
+  // 最后一起堆到单种上限 250，反倒把农田自己堵死。
+  // 做法：把「库存超过安全水位」的那部分作物，折成「这条配方还能做几份」注入 demand，
+  // 让 scoreFor 里的 ×1e6 权重把它们顶到食品厂队列前面。
+  // 三条约束（缺一条都会出事）：
+  //   ① 只用**料已经齐**的配方 —— 料不齐又给需求，工厂会拿自选包去兑，
+  //      而「无需求不烧包」是硬规则（2026-10-27 一夜烧掉几万个包的教训）；
+  //   ② 每种成品最多加 FARM_FEED_MAX(3) 份 —— 见那个常量的注释；
+  //   ③ 作物库存不高于水位的不算过剩（那是农田该补的，不是工厂该吃的）。
+  const feedWants = [];
+  for (const row of produceRows) {
+    const crops = (row.costItem ?? []).filter(([id]) => cropIds.has(id));
+    if (crops.length === 0) continue;
+    // **全部材料都要齐**，不是只齐作物 —— 配方还要鱼/木材时，只齐作物也给他加需求，
+    // 工厂就会拿自选包去兑那些缺的料，等于绕过「无需求不烧包」这条硬规则。
+    if (!(row.costItem ?? []).every(([id, num]) => free(id) >= Number(num))) continue;
+    // 能产几份 = 所有作物「超出水位的余量 ÷ 单耗」里最小的那个
+    let fits = Number.POSITIVE_INFINITY;
+    for (const [id, num] of crops) {
+      const surplus = free(id) - waterlineOf(id);
+      fits = Math.min(fits, Math.floor(surplus / Math.max(1, Number(num))));
+    }
+    if (!Number.isFinite(fits) || fits <= 0) continue;
+    const want = Math.min(FARM_FEED_MAX, fits);
+    // 只往上加，不覆盖订单/货船给出的更大需求。
+    if (want <= (demand.get(row.itemId) ?? 0)) continue;
+    demand.set(row.itemId, want);
+    feedWants.push(`${row.itemId}×${want}`);
+  }
+  if (feedWants.length > 0) {
+    notes.push(`用过剩作物排产：${feedWants.slice(0, 4).join(' ')}${feedWants.length > 4 ? ' …' : ''}`);
+  }
   const instantHints = new Set(survey.produce?.instant ?? []);
   // **全局在产量**：所有工厂的「待收 + 队列」里这件物品一共有几个。
   // 存量上限是全局限，不是单厂限 —— 同一件物品可能好几座工厂都能产（配方表按 buildType 分，
@@ -870,9 +994,19 @@ export function planWorld(survey, {
     // pool = 等级够 + 未到存量上限的配方，**不看料**，按优先级排好。
     // 之后再分成两条路：料够的直接排（老行为）；一条都不够时，按优先级逐条试算「自选包能不能补齐」，
     // 只给**真正要排的那一条**兑料 —— 不能给整池子都兑，那会把包烧在没有意义的配方上。
+    // 存量上限的口径：默认就是 stockCap，**种子厂要留余量**（2026-10-28）。
+    // 种子一炉只出 1 个，堆到 50 就是纯浪费 —— 实测小麦种子 45/50 还被连排 4 个
+    // （6 个队列位占了 4 个，一占就是 2 小时），而真正缺的番茄种子（0 个）只排上 1 个。
+    // 留 SEED_STOCK_MARGIN 之后，接近上限的种子进不了 pool，队列位自然让给缺的那种。
+    const capOf = (itemId) => {
+      if (!(survey.stockCap > 0)) return Number.POSITIVE_INFINITY;
+      return b.type === '种子厂'
+        ? Math.max(1, Number(survey.stockCap) - SEED_STOCK_MARGIN)
+        : Number(survey.stockCap);
+    };
     const pool = produceRows
       .filter((row) => row.buildType === b.type && row.unlockLevel <= b.level)
-      .filter((row) => (survey.stockCap > 0 ? heldOf(row.itemId) < survey.stockCap : true))
+      .filter((row) => heldOf(row.itemId) < capOf(row.itemId))
       .sort((a, b2) => scoreFor(b2) - scoreFor(a));
     const costOf = (row) => (row.costItem ?? []).map(([id, n]) => ({ id, num: Number(n) || 0 }));
     const affordable = (row) => costOf(row).every((cost) => free(cost.id) >= cost.num);
@@ -1125,6 +1259,8 @@ export function planWorld(survey, {
         .map((row) => ({
           id: row?.id,
           time: Number(row?.time) || 0,
+          // 一季收获几个（配置全是 5，但要按表读：分散铺开时靠它预估「种下去会长出多少」）。
+          produce: Math.max(1, Number(row?.produceNum) || 5),
           // 注意：FarmlandPlantCfg.material 是**一对** `[种子名, 份数]`，不是 [[id,num], …] 的列表
           // （实测 `{"id":"玉米","material":["玉米种子",1]}`）。当成列表取 [0] 会拿到字符串，
           // 解构出来是「玉」「米」两个字，free('玉') 永远是 0 → 一块都种不上。
@@ -1137,8 +1273,10 @@ export function planWorld(survey, {
         //   ② 刚被服务端拒过（loop 记下来暂缓的）→ 不种，等解禁。
         .filter((row) => {
           const held = free(row.id);
-          if (cap > 0 && held >= cap) {
-            skippedSeeds.push(`${row.id} 库存 ${held} 已到单种上限 ${cap}`);
+          // 用「种下去之后」的量判：收获不校验上限，所以 held 245 种一季（+5 = 250）
+          // 刚好压线，再种就必然顶着上限被拒。宁可这一季不种，也别把自己顶死。
+          if (cap > 0 && held + row.produce > cap) {
+            skippedSeeds.push(`${row.id} 库存 ${held}，种一季 +${row.produce} 会超过上限 ${cap}`);
             return false;
           }
           const until = blockedUntil(row.id);
@@ -1147,32 +1285,52 @@ export function planWorld(survey, {
             return false;
           }
           return true;
-        })
-        // 播种顺序：**离上限越远的越先种**；同一档里按价值（成熟时长）降序，再按订单缺口。
-        // 为什么不是单纯「价值高的先种」：土豆 2400s 比小麦 1800s 值钱，只看时长会一直种土豆，
-        // 一路堆到撞上限（265），然后被迫跳过去、等库存降下来又回头种土豆 —— 来回振荡。
-        // 留 20% 余量（cap 的 0.8）当软线，越过软线的作物让位给库存少的，自然就轮作了。
-        .sort((a, b) => {
-          const warn = cap > 0 ? cap * 0.8 : Number.POSITIVE_INFINITY;
-          const aNear = free(a.id) >= warn ? 1 : 0;
-          const bNear = free(b.id) >= warn ? 1 : 0;
-          return aNear - bNear
-            || b.time - a.time
-            || (demand.get(b.id) ?? 0) - (demand.get(a.id) ?? 0);
         });
       if (skippedSeeds.length > 0) notes.push(`农田跳过这些种子：${skippedSeeds.join('、')}`);
       const args = [];
       const left = [...empties];
-      for (const option of options) {
-        if (left.length === 0) break;
-        const [seedId, perRaw] = option.seed;
-        const per = Math.max(1, Number(perRaw) || 1);
-        const can = Math.min(left.length, Math.floor(free(seedId) / per));
-        for (let i = 0; i < can; i += 1) {
-          const plot = left.shift();
-          reserve(seedId, per);
-          args.push({ buildingId: plot.buildingId, productId: option.id });
+      // **目标水位 + 分散铺开**（2026-10-28 两轮改动合并）：
+      //   分散铺开解决的是「4 块地常年只种土豆/小麦，另外 11 种恒为 0，缺料的产品线永远排不出来」；
+      //   目标水位解决的是反过来那一头 —— 只按「库存少的先种」会把 13 种作物一起推向单种上限 250，
+      //   然后上限过滤把每一种都剔掉，地块永久空着（死局），而仓库里全是工厂吃不掉的存货。
+      // 现在每放一块地重挑一次「离水位最远的那种」：
+      //   ① 订单/货船有缺口的最优先（需求扣掉已排的量），并且**可以突破水位**；
+      //   ② 其余按「水位 − 当前持有量」降序 —— 越缺越先，放下后立刻 +produceNum，
+      //      所以同一种作物不会一口吃光所有地块，有种子且缺的作物自然轮着铺开；
+      //   ③ 都到水位的地块宁可空着 —— 工厂把库存吃下去后下一轮自动恢复种。
+      const load = new Map(options.map((option) => [option.id, free(option.id)]));
+      const hasDemand = (option) => (demand.get(option.id) ?? 0) - (load.get(option.id) ?? 0) > 0;
+      const plantable = (option) => hasDemand(option)
+        || (load.get(option.id) ?? 0) < waterlineOf(option.id);
+      const cropScore = (option) => {
+        const held = load.get(option.id) ?? 0;
+        // 有缺口：用一个足够大的负基数排到所有「没需求」的前面；同档仍按持有量少的先。
+        if (hasDemand(option)) return -1e9 + held;
+        // 没需求：越小越先 —— 也就是「离水位越远（越缺）越先种」，和以前的「库存少的先」同向，
+        // 但多了一条「到水位就不参与」（见 plantable）。
+        return held - waterlineOf(option.id);
+      };
+      const seedPer = (option) => Math.max(1, Number(option.seed[1]) || 1);
+      // 本圈已经拿到地的那种作物：一圈之内一作物只占一块地，
+      // 等所有「有种子」的作物都轮过一遍（fresh 为空）才开下一圈。
+      const usedThisRing = new Set();
+      while (left.length > 0) {
+        // 种子够 + 还没到水位，两条都满足才参与挑地。
+        const ready = options.filter((option) => free(option.seed[0]) >= seedPer(option) && plantable(option));
+        if (ready.length === 0) break;
+        let pool = ready.filter((option) => !usedThisRing.has(option.id));
+        if (pool.length === 0) {
+          usedThisRing.clear();
+          pool = ready;
         }
+        pool.sort((a, b) => cropScore(a) - cropScore(b) || b.time - a.time);
+        const pick = pool[0];
+        const plot = left.shift();
+        reserve(pick.seed[0], seedPer(pick));
+        args.push({ buildingId: plot.buildingId, productId: pick.id });
+        usedThisRing.add(pick.id);
+        // 种下去就是「预计会多出 produceNum 个」，记进去，下一圈才会先挑别的作物。
+        load.set(pick.id, (load.get(pick.id) ?? 0) + pick.produce);
       }
       // **一种作物一条 FarmPlantRequest**：以前全部打包成一条，土豆那条被
       // `item limit reached` 拒掉时，小麦/玉米跟着一条都发不出去（runWorld 按 group
@@ -1200,7 +1358,18 @@ export function planWorld(survey, {
         });
       }
       if (left.length > 0) {
-        notes.push(`农田还有 ${left.length} 块没种子可种（${left.map((b) => b.buildingId).join(' ')}）`);
+        // 空着的原因有三种，别再混着写「没种子可种」（2026-10-28 加水位机制后必须分开）：
+        //   ① 想种的那几种没有种子 → 指向种子厂，这是唯一值得去催的情况；
+        //   ② 有种子但都到水位 → 正常，等工厂把库存吃下去；
+        //   ③ 剩下的地配不上（种子只够种一部分）。
+        const shortNoSeed = options
+          .filter((option) => plantable(option) && free(option.seed[0]) < seedPer(option))
+          .map((option) => option.id);
+        const anyRoom = options.some((option) => free(option.seed[0]) >= seedPer(option) && plantable(option));
+        const why = shortNoSeed.length > 0
+          ? `缺 ${shortNoSeed.slice(0, 3).join('、')}${shortNoSeed.length > 3 ? ` 等 ${shortNoSeed.length} 种` : ''} 但没有种子`
+          : (anyRoom ? '剩下的地种子不够' : '作物都到安全水位了（等工厂消化）');
+        notes.push(`农田还有 ${left.length} 块没种（${left.map((b) => b.buildingId).join(' ')}）：${why}`);
       }
     }
   }
@@ -1306,6 +1475,12 @@ export function stepKey(step) {
   return `${step.kind}:${Array.isArray(target) ? target.join('+') : target}`;
 }
 
+// PromptResponse.prompt 里这几种是「此刻不行」，等一下/重试就能过，不该按「这类动作全废」处理：
+// 7 SERVER_IS_BUSY（服务忙）、70 HIGH_OP_FREQUENCY（操作过快）、74 ACTIVE_END（活动状态切换中）。
+// 实测教训：装备升 50 级被 prompt=74 拒，同 group 的 18 条（51~65 级 + 别件装备）全被跳过，
+// 下一轮重试 51 级却成功了 —— 一条瞬时失败废掉一整组，纯亏。
+export const TRANSIENT_PROMPT_IDS = new Set([7, 70, 74]);
+
 // 逐条执行。同类动作失败就跳过该类的剩余动作；被服务端拒过的具体动作记进 rejected，
 // 循环模式下后续轮次不再重发（否则每轮都会骚扰一次同一个必败请求）。
 export async function runWorld(client, protocol, plan, {
@@ -1343,7 +1518,9 @@ export async function runWorld(client, protocol, plan, {
         // transient 的失败原因多是瞬时状态（队列满、库存满、这一份料刚好不够），
         // 记进 rejected 会让后续轮次永远跳过同一格，反而不排了。
         if (!step.transient) rejected.add(key);
-        blocked.add(guard);
+        // 瞬时类拒绝（忙 / 太快 / 活动切换）只说明这一条此刻不行，不封锁整个 group ——
+        // 否则一次抖动会把后面十几条本来能成的动作一起废掉。
+        if (!TRANSIENT_PROMPT_IDS.has(Number(error.prompt?.prompt ?? 0))) blocked.add(guard);
         entry = { step, ok: false, error: error.message };
       }
     }

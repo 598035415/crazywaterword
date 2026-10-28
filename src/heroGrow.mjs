@@ -499,7 +499,10 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
             response: null,
             body: { uid: best.uid, heroId: hero.heroId, pos: slot.pos },
             key: `badgePutOn:${hero.heroId}:${slot.pos}:${best.uid}`,
-            group: `hero:${hero.heroId}:badge`,
+            // group 是 runWorld 的失败隔离单位：一条被拒 → 同 group 后面全部跳过。
+            // 所以必须细到「第几号位 / 哪一件」，否则一件装备没料会把同英雄其他件一起废掉
+            // （实测吃过一次：装备升 50 级被服务端瞬时拒，同一 group 的 18 条全跳过了）。
+            group: `hero:${hero.heroId}:badge:${slot.pos}`,
             transient: true,
             label: `${hero.heroId} 第${slot.pos}枚勋章位戴上「${best.badgeId}」lv${best.level} ${best.star}星`,
           }, { text: `戴勋章 ${best.badgeId} lv${best.level} ${best.star}星 → 第${slot.pos}位` });
@@ -515,7 +518,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
           response: 'BadgeReplaceResponse',
           body: { downUid: best.uid, upUid: current.uid },
           key: `badgeReplace:${hero.heroId}:${pos}:${best.uid}`,
-          group: `hero:${hero.heroId}:badge`,
+          group: `hero:${hero.heroId}:badge:${pos}`,
           transient: true,
           label: `${hero.heroId} 第${pos}位：「${best.badgeId}」lv${best.level} ${best.star}星 换下「${current.badgeId}」lv${current.level} ${current.star}星`,
         }, { text: `换勋章 第${pos}位：${current.badgeId} lv${current.level} ${current.star}星 → ${best.badgeId} lv${best.level} ${best.star}星` });
@@ -535,7 +538,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
           // decomposeUid 恒空：客户端的经验来自「徽章经验」道具，分解徽章是不可逆的，这里不做。
           body: { uid: badge.uid, decomposeUid: [], expItemNum: delta.exp },
           key: `badgeEnhance:${badge.uid}:${delta.to}`,
-          group: `hero:${hero.heroId}:badge`,
+          group: `hero:${hero.heroId}:badgeEnhance:${badge.uid}`,
           transient: true,
           label: `${hero.heroId} 强化「${badge.badgeId}」${delta.from} → ${delta.to} 级（经验 ${delta.exp} · 金币 ${goldText(delta.gold)}）`,
         }, { text: `勋章 ${badge.badgeId} ${delta.from}→${delta.to} 级（+${delta.gained}）` });
@@ -561,7 +564,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
             response: null,
             body: { uid: best.uid, heroId: hero.heroId },
             key: `equipPutOn:${hero.heroId}:${type}:${best.uid}`,
-            group: `hero:${hero.heroId}:equip`,
+            group: `hero:${hero.heroId}:equip:${type}`,
             transient: true,
             label: `${hero.heroId} 穿上 ${type}「${best.equipId}」lv${best.level} ${best.star}星`,
           }, { text: `穿装备 ${type}：${best.equipId} lv${best.level} ${best.star}星` });
@@ -576,7 +579,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
           response: 'EquipReplaceResponse',
           body: { downUid: best.uid, upUid: current.uid },
           key: `equipReplace:${hero.heroId}:${type}:${best.uid}`,
-          group: `hero:${hero.heroId}:equip`,
+          group: `hero:${hero.heroId}:equip:${type}`,
           transient: true,
           label: `${hero.heroId} ${type}：「${best.equipId}」lv${best.level} ${best.star}星 换下「${current.equipId}」lv${current.level} ${current.star}星`,
         }, { text: `换装备 ${type}：${current.equipId} lv${current.level} ${current.star}星 → ${best.equipId} lv${best.level} ${best.star}星` });
@@ -605,7 +608,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
             body: { uid: equip.uid },
             // 每级一条请求，key 必须带目标等级，否则第 2 级起会撞成同一条被去重。
             key: `equipLevel:${equip.uid}:${level}`,
-            group: `hero:${hero.heroId}:equipLevel`,
+            group: `hero:${hero.heroId}:equipLevel:${equip.uid}`,
             transient: true,
             label: `${hero.heroId} 装备「${equip.equipId}」升到 ${level} 级（精铁 ${cost}）`,
           }, { mergeKey: `level:${equip.uid}`, title: `装备 ${equip.equipId} 升级`, from, to: level, cost: iron });
@@ -632,7 +635,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
             response: null,
             body: { uid: equip.uid },
             key: `equipRefine:${equip.uid}:${refineLv}`,
-            group: `hero:${hero.heroId}:equipRefine`,
+            group: `hero:${hero.heroId}:equipRefine:${equip.uid}`,
             transient: true,
             label: `${hero.heroId} 装备「${equip.equipId}」精炼到 ${refineLv}（${costText([[EQUIP_IRON, row.costItem1], [EQUIP_REFINE_ITEM, row.costItem2]])}）`,
           }, { mergeKey: `refine:${equip.uid}`, title: `装备 ${equip.equipId} 精炼`, from, to: refineLv, cost: iron });
@@ -658,7 +661,7 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
             response: null,
             body: { uid: equip.uid },
             key: `equipStar:${equip.uid}:${star}`,
-            group: `hero:${hero.heroId}:equipStar`,
+            group: `hero:${hero.heroId}:equipStar:${equip.uid}`,
             transient: true,
             label: `${hero.heroId} 装备「${equip.equipId}」升到 ${star} 星（${costText(costs)}）`,
           }, { mergeKey: `star:${equip.uid}`, title: `装备 ${equip.equipId} 升星`, from, to: star, cost: iron });

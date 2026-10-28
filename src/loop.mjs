@@ -23,6 +23,18 @@ import { surveyPirates, viewPirates, planPirates, formatPirateSummary } from './
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
 import { surveyCargo, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, cargoDemandOf } from './tradePort.mjs';
+import { surveyGuildOrder, viewGuildOrder, planGuildOrder, formatGuildOrderSummary } from './guildOrder.mjs';
+import {
+  surveyGuildShip,
+  viewGuildShip,
+  planGuildShip,
+  summarizeGuildShip,
+  formatGuildShipSummary,
+  formatGuildShipGain,
+  bigNum,
+} from './guildShip.mjs';
+// ⚠ 海商王（活动 Trade）2026-10-28 已下线：第 10 段整段注释，下面这几个导入暂时用不到，
+// 但**故意保留** —— 活动重开时解注释那一段就能直接跑，不用回来补 import（ESM 允许未使用的导入）。
 import {
   surveyTradeKing,
   viewTradeKing,
@@ -197,6 +209,18 @@ export async function runLoop(initialClient, protocol, {
   // 一趟「卖+买+起航」就是一轮，所以 60 秒看一眼足够；在航且没指针时会静默到靠港。
   tradeEnabled = true,
   tradeEveryMs = 60_000,
+  // 联盟订单（GuildOrder）：每天 0 点刷一单，交齐 3 种物品换公会经验 + 功勋（+联盟城市兵力）。
+  // 请求体只有 cityId，不花货币/钻石，唯一成本是仓库里那 3 样货（多是加工品）—— 默认开。
+  // 间隔 10 分钟：料是工厂产的（30~300 分钟一炉），看太勤只是白打 3 个请求，看太慢会错过刚补齐的时刻。
+  // 交成功后静默到 nextRefreshTime（次日 00:00）。
+  guildOrderEnabled = true,
+  guildOrderEveryMs = 600_000,
+  // 联盟商船（活动 GuildShip）：给「有船长、舱还空着」的船补一个货舱（材料得够，缺料绝不买），
+  // 外加应聘没人当的船长（零成本赌队友）。名额只有 2 个、上船就锁到到港，所以节奏不用太快：
+  // 补货窗口 30 分钟、刷新 3 小时一次，2 分钟看一眼足够抢到好舱。
+  guildShipEnabled = true,
+  guildShipEveryMs = 120_000,
+  guildShipSeek = true,
   // 用商会指针加速航程（免费道具）。关掉就是老老实实等 2 小时一趟。
   tradeAllowSpeed = true,
   // 领海商王战令的免费奖励（BattlePassGotRewardRequest type=3，只会发免费档）。
@@ -235,7 +259,7 @@ export async function runLoop(initialClient, protocol, {
   // 下面十几处 `client.request(...)` 自动就跟上新的，不用逐个改。
   let client = initialClient;
   let linkError = '';
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set(), guildOrder: new Set(), guildShip: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -245,6 +269,16 @@ export async function runLoop(initialClient, protocol, {
   // 被服务端拒过的作物 → 解禁时间戳(ms)。撞一次 `item limit reached`（该作物库存到上限）
   // 就歇 30 分钟，别每轮拿同一条请求去撞墙刷日志；这期间换别的种子顶上。
   const farmBlocked = new Map();
+  // 联盟订单：上次探测时间 + 交成功后的静默窗（睡到次日刷新点）。
+  let lastGuildOrderAt = 0;
+  let lastGuildShipAt = 0;
+  let guildOrderSkipUntil = 0;
+  // 联盟商船的静默窗（船位满了就睡到自己那几条船最早释放的一刻）与英雄星级缓存。
+  let guildShipSkipUntil = 0;
+  let guildShipSkipReason = '';
+  let guildShipSkipNoticedAt = 0;
+  let gsHeroes = null;
+  let gsHeroesAt = 0;
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
@@ -362,6 +396,7 @@ export async function runLoop(initialClient, protocol, {
       tasks: part(), dailies: part(), world: { ...part(), population: '-', floaterLoot: null },
       idle: part(), treasure: part(), radar: part(), pirate: part(), forge: part(), pet: part(), cargo: part(),
       trade: part(),
+      guildOrder: part(), guildShip: part(),
     };
 
     // 一轮的统一收尾：补耗时 → 进历史 → 交给页面/日志。
@@ -661,9 +696,13 @@ export async function runLoop(initialClient, protocol, {
             ? (refreshLeft > 0 ? `（下次刷新 ${humanDuration(refreshLeft)}后）` : '（等刷新）')
             : '')
           + ` · 空闲舰队 ${radarView.idleFleets.length}`
-          // 耐久里报「最低那艘」，比列全部船短；要全量看刷新情报页。
-          + (lowest ? ` · 最低耐久 ${Math.round(lowest.duraPct * 100)}%` : '')
-          + (radarView.repairBelow > 0 ? `（低于 ${Math.round(radarView.repairBelow * 100)}% 就修）` : '')
+          // 耐久报「最低那艘」的绝对值 + 百分比，比只写百分比短，也不会再出现
+          // 「最低耐久 80%（低于 80% 就修）」这种自相矛盾的读法（1600 正好在阈值上 = 不用修）。
+          + (lowest
+            ? ` · 最低耐久 ${lowest.durability}/${lowest.maxDurability}（${Math.round(lowest.duraPct * 100)}%`
+              + (lowest.needRepair ? '，要修）'
+                : radarView.repairBelow > 0 ? `，阈值 ${Math.round(radarView.repairBelow * 100)}%）` : '，不修船）')
+            : '')
           + (repairs > 0 ? ` · 本轮修 ${repairs} 艘` : '');
         if (radarPlan.actions.length > 0) {
           const { results, rejected: stillRejected } = await runWorld(client, protocol, radarPlan, {
@@ -855,6 +894,15 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
+    // 10. 海商王（活动「Trade」，每天 10~22 点，17 个港口之间低买高卖）
+    // ───────────────────────────────────────────────────────────────────────
+    // ⚠ 2026-10-28：**活动已下线，本段整段停用**。代码原样保留在下面（判据/协议一行没删），
+    //   只是不再探测：不发请求、日志里也不会出现「海商王」这一行。
+    //   活动重开时恢复办法：去掉下面那对块注释标记（就是单独一行的斜杠星号 / 星号斜杠），
+    //   再删掉末尾那个 4 行 stub 即可。
+    //   页面开关 / `/api/trade` / CLI `trade` 都还在，不用改。
+    //   它不跟前面任何一段抢资源（不用材料、不用舰队），所以一直排在最后、独立开关。
+    /*
     // 10. 海商王（活动「Trade」，每天 10~22 点，17 个港口之间低买高卖）：
     //     在港 → 领奖 + 卖掉 + 共享商情 + 买本港特产 + 开去「把这件货当紧缺」的港口；
     //     在航 → 只用商会指针加速（免费道具）。
@@ -911,9 +959,16 @@ export async function runLoop(initialClient, protocol, {
         const gainedReward = tradeGainedReward(summary.trade.results);
         // 静默窗：在航且没指针 → 等靠港；不在贸易时间 → 等开市。两种都不该每 60 秒探一次。
         if (tradeView.period === 0) {
-          // 本期没开（活动期间之外）：一天看一次就够，别每 60 秒问一遍。
-          tradeSkipUntil = (tradeView.windowOpen ? tradeView.startAt + 86_400 : tradeView.startAt) * 1000;
-          tradeSkipReason = '本期海商王活动未开启';
+          // 本期没开。开闭时间只由服务端运营后台决定，本地配置里查不到（ActivityTradeCfg 只有玩法参数），
+          // 所以**不能**一次静默到明天 10 点：10-28 实盘 08:53 探到 period=0，若今天下午运营开新一期
+          // 就整天错过了。开市时段内每小时探一次（2 个请求，成本可忽略），夜间照旧等到开市。
+          if (tradeView.windowOpen) {
+            tradeSkipUntil = tickAt + 3_600_000;
+            tradeSkipReason = '本期海商王未开启（每小时探一次，等开新一期）';
+          } else {
+            tradeSkipUntil = tradeView.startAt * 1000 + 1_000;
+            tradeSkipReason = '本期海商王未开启（开市后再探）';
+          }
         } else if (tradeView.cargo.phase === 'sail' && !gainedReward
           && !(tradeSpeedNow && tradeView.speed.owned > 0)) {
           tradeSkipUntil = (tradeView.cargo.moveEndTime + 5) * 1000;
@@ -930,6 +985,157 @@ export async function runLoop(initialClient, protocol, {
         lastTradeAt = tickAt;
       } catch (error) {
         summary.trade.notes = [`海商王探测失败：${error.message}`];
+      }
+    }
+    */
+    // 停用期间的 stub：gates 与日志格式化仍然引用这几个名字。
+    // enabled=false 时 gateLine 直接返回空串，所以日志里不会多一行「海商王」。
+    const tradeOn = false;
+    const tradeEvery = 0;
+    const tradeDue = false;
+    const tradeSkipping = false;
+
+    // 11. 联盟订单：每天 0 点刷一单，交齐 3 种物品换公会经验 + 功勋（外加联盟城市兵力）。
+    //     请求体只有 cityId，不花货币/钻石 —— 唯一的成本是仓库里那 3 样货（多是加工品，
+    //     工厂本来就在产），所以默认开。
+    //     节奏按 10 分钟看一次：订单料是加工品，工厂产出周期 30~300 分钟，料不会一分钟就补齐，
+    //     看太勤只是白打 3 个请求（GuildOrder + GuildCityInfo + CounterInfo）；
+    //     看太慢又会错过「刚补齐」的时刻，白等工厂下一炉。
+    //     交成功后静默到 nextRefreshTime（次日 00:00）：一天就这一单，没必要反复问。
+    const guildOrderOn = pickAt(conf, 'guildOrderEnabled', guildOrderEnabled);
+    const guildOrderEvery = pickAt(conf, 'guildOrderEveryMs', guildOrderEveryMs);
+    const guildOrderSkipping = guildOrderOn && guildOrderSkipUntil > tickAt;
+    const guildOrderDue = guildOrderOn && !guildOrderSkipping && gateDue(lastGuildOrderAt, guildOrderEvery, tickAt);
+    if (halted()) break;
+    if (guildOrderDue) {
+      try {
+        const orderSurvey = await linkRetry(() => surveyGuildOrder(client, protocol, {
+          config,
+          // 复用海面那一段的库存表（物品 + 资源都在里面），零额外请求。
+          stock: worldSurvey?.stock ?? null,
+          player,
+        }));
+        const orderView = viewGuildOrder(orderSurvey);
+        const orderPlan = planGuildOrder(orderView, { config });
+        summary.guildOrder.planned = orderPlan.actions.length;
+        summary.guildOrder.notes = orderPlan.notes;
+        summary.guildOrder.summary = formatGuildOrderSummary(orderView);
+        if (orderPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, orderPlan, {
+            allowMutate,
+            rejected: rejected.guildOrder,
+            window: 1200,
+            onStep: (entry) => onStep?.({ round, phase: 'guildOrder', ...entry }),
+          });
+          rejected.guildOrder = stillRejected;
+          summary.guildOrder.results = results;
+          const done = results.some((entry) => entry.ok);
+          if (done) {
+            // 交完当天就别再问了，直接睡到次日刷新点（拿不到就用 4 小时兜底）。
+            const refreshAt = Number(orderView.nextRefreshTime) * 1000;
+            guildOrderSkipUntil = refreshAt > tickAt ? refreshAt : tickAt + 4 * 3600 * 1000;
+            summary.guildOrder.notes = [...summary.guildOrder.notes,
+              `今日订单已交，${new Date(guildOrderSkipUntil).toLocaleString('zh-CN', { hour12: false })} 刷新后再看`];
+          }
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastGuildOrderAt = tickAt;
+      } catch (error) {
+        summary.guildOrder.notes = [`联盟订单探测失败：${error.message}`];
+      }
+    }
+
+    // 12. 联盟商船（活动「GuildShip」）：全联盟一起凑货舱，凑齐立刻启航，船长与登船成员拿**同样**奖励。
+    //     能做的只有两件事：
+    //       ① 给「已有船长、舱还空着」的船**补一个货舱** —— 但材料必须已经够（缺料时客户端会弹
+    //          「购买」，那是花钻石买料，本工具不接那条路，缺料就等工厂产）；
+    //       ② 应聘没人当的**船长** —— 零成本赌队友（凑不齐只遣返船长、退还已交的商品）。
+    //     ⚠ 两条硬限制：船长**不能**给自己的船补货（实盘 `captain cannot resupply`）；
+    //       每个玩家最多同时登 2 艘，且一旦上船就被锁到船到港（2.5/5/9 小时）才释放名额。
+    //       所以船员优先、而且优先挑「空舱少 = 快启航」的船，名额才转得动。
+    //     节奏 2 分钟：补货窗口只有 30 分钟、好舱位会被队友抢；但刷新 3 小时一次，再快也没意义。
+    const guildShipOn = pickAt(conf, 'guildShipEnabled', guildShipEnabled);
+    const guildShipEvery = pickAt(conf, 'guildShipEveryMs', guildShipEveryMs);
+    const guildShipSeekNow = pickAt(conf, 'guildShipSeek', guildShipSeek) === true;
+    const guildShipSkipping = guildShipOn && guildShipSkipUntil > tickAt;
+    const guildShipDue = guildShipOn && !guildShipSkipping && gateDue(lastGuildShipAt, guildShipEvery, tickAt);
+    if (halted()) break;
+    if (guildShipDue) {
+      try {
+        // 英雄星级决定「能不能应聘某艘船的船长」。星级不会一分钟一变，缓存 30 分钟，
+        // 省掉每轮一个 AllHeroRequest。拿不到就当「没有英雄」，只是这次不当船长，不影响补货。
+        if (!gsHeroes || tickAt - gsHeroesAt > 30 * 60 * 1000) {
+          const heroBody = await linkRetry(() => client.request('AllHeroRequest', {}, 'AllHeroResponse', 12_000));
+          gsHeroes = new Map();
+          for (const hero of heroBody?.heroes ?? []) {
+            const id = String(hero.heroId ?? hero.name ?? hero.id ?? '');
+            if (id) gsHeroes.set(id, { star: Number(hero.star) || 0, exStar: Number(hero.exclusive?.star) || 0 });
+          }
+          gsHeroesAt = tickAt;
+        }
+        const gsSurvey = await linkRetry(() => surveyGuildShip(client, protocol, { now: tickAt }));
+        const gsView = viewGuildShip(gsSurvey, {
+          config,
+          // 复用海面那一段的库存表（物品 + 资源），零额外请求。
+          stock: worldSurvey?.stock ?? null,
+          heroes: gsHeroes,
+          // playerId 是 int64，必须走 bigNum：直接用裸 low 会算成负数，
+          // 于是「我是不是这艘船的船长」判成 false，计划器就会让船长去补自己的船（必被拒）。
+          playerId: bigNum(player?.playerId),
+          now: tickAt,
+        });
+        const gsPlan = planGuildShip(gsView, { config, allowSeek: guildShipSeekNow });
+        summary.guildShip.planned = gsPlan.actions.length;
+        summary.guildShip.notes = gsPlan.notes;
+        summary.guildShip.summary = formatGuildShipSummary(gsView);
+        if (gsPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, gsPlan, {
+            allowMutate,
+            rejected: rejected.guildShip,
+            window: 1200,
+            onStep: (entry) => onStep?.({ round, phase: 'guildShip', ...entry }),
+          });
+          rejected.guildShip = stillRejected;
+          summary.guildShip.results = results;
+          summary.guildShip.gain = formatGuildShipGain(summarizeGuildShip(results));
+        }
+        // 静默窗：
+        //   period=0  → 本期没开。开闭时间只由运营后台定（GuildShipParamCfg 只有刷新点，没有起止），
+        //               所以每小时探一次，别一次睡到明天 —— 中途开新一期也不会错过。
+        //   船位满了   → 睡到自己那几条船里**最早释放**的一刻（在航的到港时间 / 补货截止时间）+5 秒。
+        //               否则 2 分钟一次全是白打请求，而名额没释放前什么都做不了。
+        // 服务端明确回「船位已满」→ 我们的账和服务端对不上（典型：在航的船没被 ownRun 给出）。
+        // 别硬打请求，退避 10 分钟，下一轮重探时以服务端返回为准。
+        const slotRejected = (summary.guildShip.results ?? []).some(
+          (entry) => entry.ok === false && !entry.skipped && /slot limit|船位/i.test(String(entry.error ?? '')),
+        );
+        if (gsView.period === 0) {
+          guildShipSkipUntil = tickAt + 3_600_000;
+          guildShipSkipReason = '本期联盟商船未开启（每小时探一次）';
+        } else if (slotRejected) {
+          guildShipSkipUntil = tickAt + 10 * 60 * 1000;
+          guildShipSkipReason = '服务端回「船位已满」（我们算出来还有空位），退避 10 分钟等状态同步';
+        } else if (gsView.slotsLeft <= 0) {
+          const releases = [];
+          for (const run of gsView.ownRun) if (run.moveEndAt > 0) releases.push(run.moveEndAt * 1000);
+          for (const ship of gsView.ships) if (ship.mine && ship.endAt > 0) releases.push(ship.endAt * 1000);
+          const soonest = releases.length > 0 ? Math.min(...releases) + 5_000 : tickAt + 30 * 60 * 1000;
+          guildShipSkipUntil = soonest > tickAt ? soonest : tickAt + 60_000;
+          // 名额占用 = 码头上的 + **在航的**（在航的船还没到港，一样锁着名额）。
+          const held = [
+            ...gsView.myShips.map((row) => `#${row.shipId}${row.role === 'leader' ? '船长' : '船员'}`),
+            ...(gsView.runningMine ?? []).map((row) => `#${row.shipId}在航`),
+          ].join('、');
+          guildShipSkipReason = `船位已满 ${gsView.slotsUsed ?? gsView.myShips.length}/${gsView.maxShips}（${held || '?'}），等最早一条释放`;
+        } else {
+          guildShipSkipUntil = 0;
+          guildShipSkipReason = '';
+        }
+        guildShipSkipNoticedAt = 0;
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastGuildShipAt = tickAt;
+      } catch (error) {
+        summary.guildShip.notes = [`联盟商船探测失败：${error.message}`];
       }
     }
 
@@ -991,6 +1197,29 @@ export async function runLoop(initialClient, protocol, {
         skipUntil: tradeSkipping ? Math.floor(tradeSkipUntil / 1000) : null,
         skipNotice: tradeSkipNotice,
       },
+      guildOrder: {
+        ...gateSummary(guildOrderOn, guildOrderEvery, lastGuildOrderAt, tickAt),
+        throttled: guildOrderOn && !guildOrderDue && !guildOrderSkipping,
+        // 「今天这单已经交了、睡到明早刷新」跟「间隔未到」是两回事，页面上要分得清。
+        skipped: guildOrderSkipping,
+        skipReason: guildOrderSkipping ? '今日已交，等 00:00 刷新' : '',
+        skipForever: false,
+        skipLeftSeconds: guildOrderSkipping ? Math.max(0, Math.ceil((guildOrderSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: guildOrderSkipping ? Math.floor(guildOrderSkipUntil / 1000) : null,
+        skipNotice: false,
+      },
+      guildShip: {
+        ...gateSummary(guildShipOn, guildShipEvery, lastGuildShipAt, tickAt),
+        throttled: guildShipOn && !guildShipDue && !guildShipSkipping,
+        // 「船位满了在等释放」跟「间隔未到」是两回事，页面上要分得清。
+        skipped: guildShipSkipping,
+        skipReason: guildShipSkipping ? guildShipSkipReason : '',
+        skipForever: false,
+        skipLeftSeconds: guildShipSkipping ? Math.max(0, Math.ceil((guildShipSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: guildShipSkipping ? Math.floor(guildShipSkipUntil / 1000) : null,
+        // 静默窗可以很长（一场 9 小时的超凡船），但只在设窗那轮报一次，之后每 30 分钟提醒。
+        skipNotice: guildShipSkipping && tickAt - guildShipSkipNoticedAt >= SKIP_NOTICE_MS,
+      },
     };
 
     // 本轮耗时：页面上直接能看到「一轮 12 秒」，据此判断间隔是否够用。
@@ -1034,6 +1263,9 @@ const KIND_TEXT = {
   tradeTask: '领联盟任务',
   tradeReportReward: '领商情奖励',
   tradePass: '领海商王战令',
+  guildOrder: '交联盟订单',
+  guildShipOrder: '商船补货',
+  guildShipSeek: '应聘船长',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -1098,7 +1330,9 @@ function detailLines(part, limit = 4) {
 // 海面备注：以前一个都印不出来，工厂为什么空着全靠猜。这里最多印 4 条，
 // 并且先印「排产相关」的（空闲/缺料/自选包/存量上限），其余（拾荒额度、农田、订单保留）排后面。
 // 农田相关的放进热名单：撞了单种上限、被服务端拒过之后，这 4 条就是你唯一能看到原因的出口。
-const WORLD_NOTE_HOT = /空闲|缺料|自选包|排产|存量上限|单种上限|播种|被服务端拒/;
+// 「用过剩作物排产」和「作物都到安全水位」也要算热 —— 前者是农产品终于被吃掉的证据，
+// 后者是地块空着的唯一原因（不写进前 4 条的话，看日志的人只会觉得农田又不动了）。
+const WORLD_NOTE_HOT = /空闲|缺料|自选包|排产|存量上限|单种上限|播种|被服务端拒|安全水位|过剩作物/;
 function worldNoteLines(world) {
   const notes = (world?.notes ?? []).filter((note) => typeof note === 'string' && note);
   if (notes.length === 0) return [];
@@ -1204,6 +1438,20 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.trade),
         ...(summary.trade.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 联盟订单：探测过就印一行（「今天这单已交」也要印，否则看不出开关有没有生效）。
+    ...(summary.guildOrder && (summary.guildOrder.summary || (summary.guildOrder.notes ?? []).length > 0)
+      ? [`${line('联盟订单', summary.guildOrder)}${summary.guildOrder.summary ? `  ${summary.guildOrder.summary}` : ''}`,
+        ...detailLines(summary.guildOrder),
+        ...(summary.guildOrder.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
+    // 联盟商船：探测过就印一行（「船位满了在等释放」「缺料没补」也要印，
+    // 否则看不出开关有没有生效，也看不出为什么一条都没补）。
+    ...(summary.guildShip && (summary.guildShip.summary || (summary.guildShip.notes ?? []).length > 0)
+      ? [`${line('联盟商船', summary.guildShip)}${summary.guildShip.summary ? `  ${summary.guildShip.summary}` : ''}`
+          + (summary.guildShip.gain ? `  ${summary.guildShip.gain}` : ''),
+        ...detailLines(summary.guildShip),
+        ...(summary.guildShip.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
     ...[gateLine('海盗', summary.gates?.pirate)].filter(Boolean),
@@ -1211,6 +1459,8 @@ export function formatLoopRound(summary) {
     ...[gateLine('海兽培育', summary.gates?.pet)].filter(Boolean),
     ...[gateLine('贸易港口', summary.gates?.cargo)].filter(Boolean),
     ...[gateLine('海商王', summary.gates?.trade)].filter(Boolean),
+    ...[gateLine('联盟订单', summary.gates?.guildOrder)].filter(Boolean),
+    ...[gateLine('联盟商船', summary.gates?.guildShip)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),

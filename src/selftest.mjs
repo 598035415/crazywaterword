@@ -12,6 +12,20 @@ import {
   viewTradeKing,
   planTradeKing,
 } from './tradeKing.mjs';
+import {
+  bigNum,
+  gsParams,
+  gsShipSpec,
+  nextRefreshAt as gsNextRefreshAt,
+  seekCheck,
+  viewGuildShip,
+  planGuildShip,
+  summarizeGuildShip,
+  formatGuildShipGain,
+  formatGuildShipSummary,
+  GS_STATE_MOVING,
+  GS_STATE_PREPARED,
+} from './guildShip.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -610,6 +624,47 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   thin.equipBag = [{ ...describeThinEquip(), uid: 31 }, { ...describeThinEquip(), uid: 32 }];
   const thinPlan = planHeroGrowth(thin, { onlyFront: false, switches: { badgeReplace: false, badgeEnhance: false, equipRefine: false, equipStar: false, equipReplace: true } });
   assert.equal(thinPlan.actions.filter((one) => one.kind === 'equipLevel').length, 1, 'a shared iron budget is spent once, not per hero');
+
+  // 失败隔离粒度：同一个英雄的两件装备必须是两个 group。
+  // group 是 runWorld 的「同类失败就跳过」单位 —— 曾经按「英雄+类型」分组，实测一件装备
+  // 被瞬时拒（prompt=74）就把同英雄另外两件装备的 18 条动作一起废掉了。
+  {
+    const two = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 60 });
+    two.stock.set('精铁', 5000);
+    two.heroes = [{
+      ...two.heroes[0], front: true, badges: [], equips: [
+        { uid: 41, equipId: '蓝武器1', type: '武器', quality: 'BLUE', qualityName: '蓝', qualityIndex: 1, level: 1, star: 0, refineLv: 0, score: 1 },
+        { uid: 42, equipId: '蓝武器1', type: '武器', quality: 'BLUE', qualityName: '蓝', qualityIndex: 1, level: 1, star: 0, refineLv: 0, score: 1 },
+      ],
+    }];
+    two.equipBag = [];
+    const twoPlan = planHeroGrowth(two, {
+      onlyFront: false,
+      switches: { badgeReplace: false, badgeEnhance: false, equipRefine: false, equipStar: false, equipReplace: false, exclusiveLevel: false, exclusiveStar: false },
+    });
+    const uidGroups = new Set(twoPlan.actions.filter((one) => one.kind === 'equipLevel').map((one) => one.group));
+    assert.equal(uidGroups.size, 2, 'two equips on the same hero get two isolation groups');
+
+    // 瞬时拒绝（忙 / 太快 / 活动切换）不该封锁整组：每一条都该真的发出去。
+    const { runWorld } = await import('./world.mjs');
+    const steps = [1, 2, 3].map((n) => ({
+      kind: 'equipLevel', request: 'EnhanceEquipRequest', response: null, body: { uid: 41 },
+      key: `equipLevel:41:${n}`, group: 'hero:A:equipLevel:41', transient: true, label: `lv${n}`,
+    }));
+    const prompt = (id) => {
+      throw Object.assign(new Error(`server prompt: prompt=${id}`), { prompt: { prompt: id } });
+    };
+    const busy = await runWorld({ sendWatch: async () => prompt(74) }, { EnhanceEquipRequest: 1 }, { actions: steps }, {
+      allowMutate: true, window: 0, timeout: 100,
+    });
+    assert.equal(busy.results.filter((one) => one.skipped).length, 0, 'a transient prompt does not block the rest of the group');
+
+    // 资源不足（36）就该停掉这件装备剩下的级数：下一级只会更贵。
+    const broke = await runWorld({ sendWatch: async () => prompt(36) }, { EnhanceEquipRequest: 1 }, { actions: steps }, {
+      allowMutate: true, window: 0, timeout: 100,
+    });
+    assert.equal(broke.results.filter((one) => one.skipped).length, 2, 'out-of-material blocks the rest of that equipment');
+  }
 
   function describeThinEquip() {
     return { uid: 0, equipId: '蓝武器1', type: '武器', quality: 'BLUE', qualityName: '蓝', qualityIndex: 1, level: 1, star: 0, refineLv: 0, score: 10000 };
@@ -1335,7 +1390,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   // 种子只够一块：种一块，剩下的写成 notes 说清楚。
   const short = planWorld(surveyFor({ plots: [idle, idle, idle], seeds: { 小麦种子: 1 } }), { config });
   assert.equal(of(short, 'farmPlant')[0].body.args.length, 1, 'only as many plots as the seeds can cover');
-  assert.ok(short.notes.some((note) => note.includes('没种子可种')), 'the unplanted plots are explained');
+  assert.ok(short.notes.some((note) => note.includes('没有种子')), 'the unplanted plots are explained');
 
   // 游戏内「自动种植」开着：服务端自己播，计划里只许收、不许播。
   const auto = planWorld(surveyFor({ plots: [ripe, idle], seeds: { 小麦种子: 10 }, autoFarming: true }), { config });
@@ -1346,6 +1401,94 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   // 开关关掉就完全不碰农田（连收都不收）—— 循环按自己的间隔传 farm:false。
   const off = planWorld(surveyFor({ plots: [ripe, idle], seeds: { 小麦种子: 10 } }), { config, farm: false });
   assert.equal(of(off, 'farmHarvest').length + of(off, 'farmPlant').length, 0, 'farm:false touches nothing');
+  checked += 1;
+}
+
+// 用「过剩的作物」驱动排产（2026-10-28）：农田产出远大于工厂消耗时（实测一天 400+ 个
+// vs 食品厂只吃掉 39 个小麦），作物会一路堆到单种上限 250，然后农田永久停摆。
+// 修法：把「超出安全水位」的那部分作物折成成品需求注入 demand，
+// 让 180~300 分钟的长配方（平时永远排在淡水/布匹这些瞬成配方后面）也能排上。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '食品厂' }] },
+    BuildingProduceCfg: { data: [
+      // 长配方：只有它吃小麦（另外还要鱼，用来测「料不齐不加需求」）
+      { buildType: '食品厂', itemId: '面包', produceTime: 5400, unlockLevel: 1, costItem: [['小麦', 5], ['鱼', 5]] },
+      // 短配方：不吃作物。无需求时它会因为「产出时间短」一直赢，正好用来验证需求有没有生效
+      { buildType: '食品厂', itemId: '鱼汤', produceTime: 600, unlockLevel: 1, costItem: [['鱼', 5]] },
+    ] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    FarmlandPlantCfg: { data: [{ id: '小麦', time: 1800, produceNum: 5, material: ['小麦种子', 1] }] },
+  } };
+  const surveyFor = (stockObj) => {
+    const stock = new Map(Object.entries(stockObj));
+    const shop = {
+      buildingId: '1食品厂', type: '食品厂', level: 1, product: [], buildFinishTime: 0,
+      factory: { autoProductId: '', factoryQ: [], finishedProducts: [] }, farm: null,
+    };
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6, autoFarming: false,
+      buildings: [shop], factories: [shop], orders: [], produce: { reduce: 0, instant: [] },
+    };
+  };
+  const made = (plan) => plan.actions.filter((a) => a.kind === 'startProduce').map((a) => a.items[0][0]);
+
+  // 小麦只有 3 个（远低于水位 40）→ 不算过剩，不加需求 → 短配方鱼汤照旧赢。
+  const lean = planWorld(surveyFor({ 小麦: 3, 鱼: 99 }), { config });
+  assert.deepEqual(made(lean), ['鱼汤'], 'a crop below its waterline does not get fed to the factory');
+
+  // 小麦 200（水位 40）→ 过剩 160 个能折 32 份面包，但有上限 3 份 → 面包顶到鱼汤前面。
+  const fat = planWorld(surveyFor({ 小麦: 200, 鱼: 99 }), { config });
+  assert.deepEqual(made(fat), ['面包'], 'surplus crops pull their long recipe ahead of the short one');
+  assert.ok(fat.notes.some((note) => note.includes('用过剩作物排产')), 'it says which crops are being burned');
+
+  // 料不齐时**不加需求** —— 加了需求工厂就会拿自选包去兑，而「无需求不烧包」是硬规则。
+  const noMat = planWorld(surveyFor({ 小麦: 200 }), { config });
+  assert.equal(made(noMat).includes('面包'), false, 'a recipe missing materials never gets a demand boost');
+  checked += 1;
+}
+
+// 种子厂留余量（2026-10-28）：种子一炉只出 1 个，堆到上限就是纯浪费 ——
+// 实测小麦种子 45/50 还被连排 4 个（6 个队列位占掉 4 个、一占 2 小时），
+// 而真正缺的番茄种子（0 个）只排上 1 个。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '种子厂' }] },
+    BuildingProduceCfg: { data: [
+      { buildType: '种子厂', itemId: '小麦种子', produceTime: 1800, unlockLevel: 1, costItem: [['种子', 100]] },
+      { buildType: '种子厂', itemId: '番茄种子', produceTime: 2400, unlockLevel: 4, costItem: [['种子', 100]] },
+    ] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    // 空的作物表：只测 out pool 的上限过滤，不让「农田缺种子」那段需求插进来
+    FarmlandPlantCfg: { data: [] },
+  } };
+  const surveyFor = (stockObj) => {
+    const stock = new Map(Object.entries(stockObj));
+    const factory = {
+      buildingId: '1种子厂', type: '种子厂', level: 4, product: [], buildFinishTime: 0,
+      factory: { autoProductId: '', factoryQ: [], finishedProducts: [] }, farm: null,
+    };
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6, autoFarming: false,
+      buildings: [factory], factories: [factory], orders: [], produce: { reduce: 0, instant: [] },
+    };
+  };
+  const made = (plan) => plan.actions.filter((a) => a.kind === 'startProduce').map((a) => a.items[0][0]);
+
+  // 小麦种子 45，离上限只差 5（余量线 = 50 - 5 = 45）→ 不排它；番茄种子 0 → 排番茄。
+  const nearCap = planWorld(surveyFor({ 种子: 9999, 小麦种子: 45, 番茄种子: 0 }), { config });
+  assert.deepEqual(made(nearCap), ['番茄种子'],
+    'a seed sitting on the cap margin is skipped so the scarce one gets the queue slot');
+
+  // 对照组：小麦种子只有 40（余量线以下）→ 仍按「产出时间短的先」排小麦。
+  const under = planWorld(surveyFor({ 种子: 9999, 小麦种子: 40 }), { config });
+  assert.deepEqual(made(under), ['小麦种子'], 'seeds below the margin still get produced');
   checked += 1;
 }
 
@@ -1382,15 +1525,17 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
     FarmlandPlantCfg: { data: [
       { id: '土豆', time: 2400, produceNum: 5, material: ['土豆种子', 1] },
       { id: '小麦', time: 1800, produceNum: 5, material: ['小麦种子', 1] },
+      { id: '玉米', time: 1800, produceNum: 5, material: ['玉米种子', 1] },
+      { id: '番茄', time: 2400, produceNum: 5, material: ['番茄种子', 1] },
     ] },
   } };
-  const surveyFor = (stockObj) => {
+  const surveyFor = (stockObj, plots = 2) => {
     const stock = new Map(Object.entries(stockObj));
     return {
       now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
       stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6, autoFarming: false,
-      buildings: [1, 2].map((i) => ({
-        buildingId: `${i}农田`, type: '农田', level: 1, product: [], buildFinishTime: 0,
+      buildings: Array.from({ length: plots }, (_, i) => ({
+        buildingId: `${i + 1}农田`, type: '农田', level: 1, product: [], buildFinishTime: 0,
         factory: null, farm: { productId: '', plantAt: 0, ripeAt: 0 },
       })),
       factories: [], orders: [], produce: { reduce: 0, instant: [] },
@@ -1411,10 +1556,48 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(plants(noCap).length, 1, 'farmCropCap:0 disables the stock-cap guard');
   assert.equal(plants(noCap)[0].body.args[0].productId, '土豆', 'without the guard the valuable crop wins');
 
-  // 软线（cap 的 8 成）：土豆 210 还没到上限但已越过软线 → 先种小麦，避免撞线后反复横跳。
-  const rotated = planWorld(surveyFor({ 土豆: 210, 小麦: 12, 土豆种子: 9, 小麦种子: 9 }), { config });
-  assert.equal(plants(rotated)[0].body.args[0].productId, '小麦',
-    'a crop close to its cap gives way to the low-stock one (natural rotation)');
+  // 库存少的先种：土豆 210、小麦 12 → 先种小麦（不再只看「时长长的更值钱」）。
+  const lowFirst = planWorld(surveyFor({ 土豆: 210, 小麦: 12, 土豆种子: 9, 小麦种子: 9 }), { config });
+  assert.equal(plants(lowFirst)[0].body.args[0].productId, '小麦',
+    'the crop with less stock is planted first');
+
+  // **分散铺开 + 目标水位**（2026-10-28 策略）：4 块地 + 3 种种子 → 先每种各占一块，
+  // 多出来的那块给「离水位最远」的那种；同一种作物不能一口吃光所有地。
+  // 三种作物库存都低于水位（测试配置里没有成品配方 → 水位退回 40），所以都能种。
+  const spread = planWorld(
+    surveyFor({ 土豆: 30, 小麦: 20, 玉米: 5, 土豆种子: 9, 小麦种子: 9, 玉米种子: 9 }, 4),
+    { config },
+  );
+  const spreadCrops = plants(spread).flatMap((a) => a.body.args.map((arg) => arg.productId));
+  assert.equal(spreadCrops.length, 4, 'all four plots get planted');
+  assert.deepEqual([...new Set(spreadCrops)].sort(), ['土豆', '小麦', '玉米'].sort(),
+    'every crop with seeds gets a plot before one of them takes a second plot');
+  assert.equal(spreadCrops.filter((c) => c === '玉米').length, 2,
+    'the leftover plot goes to the crop furthest below its waterline');
+  // 番茄没有种子 → 不种，也不该把地浪费在它身上。
+  assert.equal(spreadCrops.includes('番茄'), false, 'crops without seeds are never planted');
+
+  // **目标水位**：库存到水位的作物不再种（否则 13 种会一起堆到单种上限 250，
+  // 然后上限过滤把每一种都剔掉 —— 地块永久空着，这是死局）。
+  const atLine = planWorld(
+    surveyFor({ 土豆: 60, 小麦: 40, 玉米: 5, 土豆种子: 9, 小麦种子: 9, 玉米种子: 9 }, 4),
+    { config },
+  );
+  const atLineCrops = plants(atLine).flatMap((a) => a.body.args.map((arg) => arg.productId));
+  assert.deepEqual([...new Set(atLineCrops)], ['玉米'],
+    'crops already at their waterline give way to the one still short');
+
+  // 全部到水位：一块都不种，并且说清「是等工厂消化，不是没种子」。
+  const allFull = planWorld(
+    surveyFor({
+      土豆: 60, 小麦: 45, 玉米: 45, 番茄: 45,
+      土豆种子: 9, 小麦种子: 9, 玉米种子: 9, 番茄种子: 9,
+    }, 2),
+    { config },
+  );
+  assert.equal(plants(allFull).length, 0, 'nothing is planted once every crop reaches its waterline');
+  assert.ok(allFull.notes.some((note) => note.includes('安全水位')),
+    'when everything is at the waterline the empty plots are explained');
 
   // 两种作物各一条请求：group 不同，失败隔离才能生效。
   const mixed = planWorld(surveyFor({ 土豆种子: 1, 小麦种子: 1 }), { config });
@@ -1430,6 +1613,120 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(plants(blocked).length, 0, 'a crop rejected by the server is skipped until it expires');
   assert.ok(blocked.notes.some((note) => note.includes('刚被服务端拒过')),
     'the loop explains the temporary skip');
+  checked += 1;
+}
+
+// 联盟订单：一天一单，交齐 3 种物品换功勋。
+// 硬约束（配置 + 客户端 proto 双向确认）：`FinishGuildOrderRequest` **只有 cityId 一个字段** ——
+// 不能顺手把物品清单/货币塞进去，否则就是把「不花额外资源」这条边界搞丢了。
+{
+  const { surveyGuildOrder: _survey, viewGuildOrder, planGuildOrder, maxOrderPerDay, orderQuota } = await import('./guildOrder.mjs');
+  const config = { tables: {
+    GuildOrderNumCfg: { data: [
+      { season: 1, playerLevel: 1, maxNum: -1 },
+      { season: 3, playerLevel: 1, maxNum: 10 },
+      { season: 3, playerLevel: 30, maxNum: 30 },
+    ] },
+    GuildOrderCfg: { data: [{ itemId: '日用品', guildExp: 20, reward: ['功勋', 35] }] },
+  } };
+  const surveyFor = ({ stock = {}, city = { cityId: 49, recommended: true }, doneToday = 0, maxNum = -1 } = {}) => ({
+    requirements: [{ id: '日用品', num: 4 }, { id: '海藻汁', num: 6 }],
+    nextRefreshTime: 1793203200,
+    city,
+    cities: city ? [city] : [],
+    doneToday,
+    maxNum,
+    quota: orderQuota(maxNum, doneToday),
+    stock: new Map(Object.entries(stock)),
+  });
+
+  // 料齐 → 一条动作，body 里**只有 cityId**。
+  const ok = planGuildOrder(viewGuildOrder(surveyFor({ stock: { 日用品: 50, 海藻汁: 47 } })), { config });
+  assert.equal(ok.actions.length, 1, 'enough stock means exactly one finish request');
+  assert.deepEqual(ok.actions[0].body, { cityId: 49 },
+    'FinishGuildOrderRequest carries cityId only — no item list, no currency');
+  assert.equal(ok.actions[0].request, 'FinishGuildOrderRequest');
+  assert.equal(ok.actions[0].transient, true, 'a failed order must not be remembered forever');
+  assert.deepEqual(ok.actions[0].items, [['日用品', 4], ['海藻汁', 6]], 'the log shows what was handed in');
+
+  // 料不齐 → 不发请求，说明缺什么（而且绝不走「去商店买」那条路）。
+  const short = planGuildOrder(viewGuildOrder(surveyFor({ stock: { 日用品: 50, 海藻汁: 2 } })), { config });
+  assert.equal(short.actions.length, 0, 'missing stock means no request at all');
+  assert.ok(short.notes.some((note) => note.includes('海藻汁 2/6')), 'it says exactly what is short');
+
+  // 今日已达上限 → 不交。
+  const capped = planGuildOrder(viewGuildOrder(surveyFor({
+    stock: { 日用品: 50, 海藻汁: 47 }, doneToday: 10, maxNum: 10,
+  })), { config });
+  assert.equal(capped.actions.length, 0, 'daily quota reached means no request');
+  assert.ok(capped.notes.some((note) => note.includes('上限')), 'it says the daily cap was hit');
+
+  // 没读到联盟城市 → 交单需要 cityId，跳过。
+  const noCity = planGuildOrder(viewGuildOrder(surveyFor({ stock: { 日用品: 50, 海藻汁: 47 }, city: null })), { config });
+  assert.equal(noCity.actions.length, 0, 'without a guild city there is no cityId to send');
+
+  // -1 = 不限次数；配额算法本身也要对。
+  assert.equal(maxOrderPerDay(config, 25), -1, 'maxNum:-1 means unlimited');
+  assert.equal(orderQuota(-1, 5), Number.POSITIVE_INFINITY, 'unlimited quota stays unlimited');
+  assert.equal(orderQuota(10, 3), 7, 'finite quota subtracts what was already done');
+  checked += 1;
+}
+
+// 农田缺口 → 种子厂排产需求（2026-10-28）：
+// 「分散铺开」要的是那些库存为 0 的作物有种子，而种子厂按 pool 顺序慢慢轮要好几天。
+// 所以把农田的缺口当需求喂进 demand，让种子厂先产真正缺的那种。
+{
+  const { planWorld } = await import('./world.mjs');
+  const config = { tables: {
+    BuildingCfg: { data: [{ buildingType: '农田' }, { buildingType: '种子厂' }] },
+    BuildingUpgradeCfg: { data: [] },
+    SelectPackLibCfg: { data: [] },
+    BuildingProduceCfg: { data: [
+      { buildType: '种子厂', itemId: '小麦种子', unlockLevel: 1, produceTime: 1800, costItem: [['种子', 1700]] },
+      { buildType: '种子厂', itemId: '番茄种子', unlockLevel: 4, produceTime: 2400, costItem: [['种子', 2700]] },
+    ] },
+    FarmlandPlantCfg: { data: [
+      { id: '小麦', time: 1800, produceNum: 5, material: ['小麦种子', 1] },
+      { id: '番茄', time: 2400, produceNum: 5, material: ['番茄种子', 1] },
+    ] },
+  } };
+  const surveyFor = ({ stock: stockObj = {}, seedLevel = 4, queued = [] } = {}) => {
+    const stock = new Map(Object.entries(stockObj));
+    const seedFactory = {
+      buildingId: '1种子厂', type: '种子厂', level: seedLevel, product: [], buildFinishTime: 0,
+      farm: null,
+      factory: { factoryQ: queued.map((id, i) => ({ idx: i + 1, productId: id, finishTime: 0 })), finishedProducts: [] },
+    };
+    const farm = {
+      buildingId: '1农田', type: '农田', level: 1, product: [], buildFinishTime: 0, factory: null,
+      farm: { productId: '', plantAt: 0, ripeAt: 0 },
+    };
+    return {
+      now: 1000, player: { level: 30 }, population: 10, maxPopulation: 99,
+      stock, have: (id) => stock.get(id) ?? 0, stockCap: 50, factorySlots: 6, autoFarming: false,
+      buildings: [seedFactory, farm], factories: [seedFactory],
+      orders: [], produce: { reduce: 0, instant: [] },
+    };
+  };
+  // 小麦堆到 208（不需要种子）、番茄 0（缺）→ 种子厂该产番茄种子。
+  const made = planWorld(surveyFor({ stock: { 小麦: 208, 小麦种子: 50, 番茄: 0, 番茄种子: 0, 种子: 100000 } }), { config });
+  const seeds = made.actions.filter((a) => a.kind === 'startProduce');
+  assert.equal(seeds.length, 1, 'exactly one seed order this round');
+  assert.ok(seeds[0].label.includes('番茄种子'),
+    'the crop the farm is short of drives the seed factory, not the one already piling up');
+  assert.equal(seeds[0].label.includes('小麦种子'), false, 'the piled-up crop does not pull more seeds');
+  assert.ok(made.notes.some((note) => note.includes('番茄') && note.includes('加需求')),
+    'the log says which crop pulled the seed order');
+
+  // 作物库存够（≥40）就不该再加种子需求，种子厂回到 pool 顺序（这里小麦种子时间短，先排小麦）。
+  const full = planWorld(surveyFor({ stock: { 小麦: 60, 小麦种子: 0, 番茄: 60, 番茄种子: 0, 种子: 100000 } }), { config });
+  assert.equal(full.actions.some((a) => a.label.includes('番茄种子')), false,
+    'a crop that is comfortably stocked must not pull extra seeds');
+
+  // 种子厂等级不够（Lv3 < 番茄种子 Lv4）→ 不许提这个需求，否则等于给排产下假需求。
+  const lowLevel = planWorld(surveyFor({ stock: { 番茄: 0, 番茄种子: 0, 种子: 100000 }, seedLevel: 3 }), { config });
+  assert.equal(lowLevel.actions.some((a) => a.label.includes('番茄种子')), false,
+    'a seed recipe above the factory level is never demanded');
   checked += 1;
 }
 
@@ -4767,26 +5064,31 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
       ],
     }),
   ]);
+  // 货轮港口：reward.asset 是返航奖励；同一条回包里的 ship.orderItem[].reward 是**下一单预览**，
+  // 不能算成收益（这层最容易写错，所以专门卡一条）。
+  write('DrawShipRewardResponse', [
+    inFrame('DrawShipRewardResponse', {
+      reward: { asset: [{ type: 0, id: '藏品大师经验', num: i64(3) }] },
+      ship: { orderItem: [{ asset: { id: '香煎鱼排', num: i64(4) }, filled: false, reward: { asset: [{ id: 'GOLD', num: i64(3332) }] } }] },
+    }),
+  ]);
+
   // 活动次数：只数 out；in 混一条进来也不该被计。
   write('GainFactoryProduceRequest', [outFrame('GainFactoryProduceRequest', { buildingId: '1海水厂' }), outFrame('GainFactoryProduceRequest', { buildingId: '1材料厂' }), inFrame('GainFactoryProduceRequest', {})]);
 
-  // 邮件：两行快照，只有最后一行算数；里面塞一封今天的已领、一封今天没领、一封昨天的。
-  const todaySec = Math.floor(now / 1000);
-  const mailOf = (subject, sendTime, got, gold) => ({
-    subject,
-    sendTime,
+  // 邮件：**靠快照里 got 由 false 变 true 判断领取时刻**（服务端不给领取时间）。
+  // 四行快照依次是：两封未领 → 第 1 封领了 + 塞进一封"早就领过"的 → 第 2 封也领了
+  // → 第 1 封的 got 回滚成 false（服务端会重复推全量快照，不能因此重算）。
+  const mailOf = (id, got, gold) => ({
+    emailId: { low: id, high: 0, unsigned: false },
     got,
     attachment: { assets: { asset: [{ type: 1, id: 'GOLD', num: i64(gold) }] } },
   });
   write('EmailBoxResponse', [
-    inFrame('EmailBoxResponse', { email: [mailOf('旧的快照', todaySec - 60, true, 1)] }),
-    inFrame('EmailBoxResponse', {
-      email: [
-        mailOf('今天的已领', todaySec, true, 15000),
-        mailOf('今天的没领', todaySec, false, 500),
-        mailOf('昨天的', todaySec - 86400, true, 700),
-      ],
-    }),
+    inFrame('EmailBoxResponse', { email: [mailOf(1, false, 15000), mailOf(2, false, 500)] }),
+    inFrame('EmailBoxResponse', { email: [mailOf(1, true, 15000), mailOf(2, false, 500), mailOf(3, true, 700)] }),
+    inFrame('EmailBoxResponse', { email: [mailOf(1, true, 15000), mailOf(2, true, 500)] }),
+    inFrame('EmailBoxResponse', { email: [mailOf(1, false, 15000), mailOf(2, true, 500)] }),
   ]);
 
   const view = stats.collectStats({ day, acc: ACC, root });
@@ -4798,9 +5100,12 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(factory.hours.reduce((sum, n) => sum + n, 0), 11, '小时分布的总和要等于件数');
 
   assert.equal(view.kpi.produced, 474, '建筑产出要把 reward[].product.asset 全部摊平（469+5）');
-  assert.equal(view.kpi.mails, 1, '邮件只算「今天发出 + 已领取」的那封');
+  const ship = view.sources.find((entry) => entry.key === 'ship');
+  assert.equal(ship.total, 3, '货轮港口只算 reward.asset，ship.orderItem[].reward 是下一单预览，算进来就是凭空多出 3332 金币');
+  assert.equal(ship.items[0].id, '藏品大师经验');
+  assert.equal(view.kpi.mails, 2, '邮件要按「未领 → 已领」的变化记两封（第一次见就是已领的不算，回滚也不重算）');
   const mail = view.sources.find((entry) => entry.key === 'mail');
-  assert.deepEqual(mail.items, [{ id: 'GOLD', num: 15000 }], '邮件数量取附件里的值');
+  assert.deepEqual(mail.items, [{ id: 'GOLD', num: 15500 }], '两封的附件要合并（15000+500）');
 
   const gain = view.activity.find((entry) => entry.key === 'gain');
   assert.equal(gain.count, 2, '活动次数只数请求（out），不受回包影响');
@@ -4810,7 +5115,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const pastDay = dayOf(Date.now() - 86400000);
   const past = stats.collectStats({ day: pastDay, acc: ACC, root });
   assert.equal(past.isToday, false);
-  assert.equal(past.sources.some((entry) => entry.key === 'mail'), false, '查历史日期时不显示邮件那一栏');
+  assert.equal(past.sources.find((entry) => entry.key === 'mail').count, 0, '历史日期同样能算邮件，只是那天没有归档就是 0');
   assert.equal(past.kpi.made, 0, '那天没有归档就是 0，不能借当天的数');
   assert.equal(past.trend.length, 7, '趋势固定 7 根柱子');
 
@@ -4819,8 +5124,274 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(tail.day, day);
   assert.equal(tail.total, 11, `趋势最后一天要等于今天的制造量，实际 ${tail.total}`);
 
+  // 查一个不存在的账号：不能因为"聚合里有别人"就把别人的数画到自己头上（趋势图以前会串号）。
+  const ghost = stats.collectStats({ day, acc: 'zzzzzzzz', root });
+  assert.equal(ghost.kpi.made, 0, '查不存在的账号不能拿到别人的制造数');
+  assert.equal(ghost.trend[ghost.trend.length - 1].total, 0, '趋势图按 acc 查不到就是 0，不能兜底成第一个账号');
+
   fs.rmSync(root, { recursive: true, force: true });
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);
+// --- 联盟商船（活动 GuildShip） --------------------------------------------
+// 判据来自客户端 TipsDescCfg 原文 + 反编译 GuildShipModel/GuildShipLeaderPop/GuildShipCargoPop
+// + 协议表 + 2026-10-28 12:36 实盘（4 艘船 + 一次被拒的补货）。
+{
+  const cfg = {
+    tables: {
+      GuildShipParamCfg: { data: [{ shipNum: 2, duration: 30, time: [8, 11, 14, 17, 20, 23] }] },
+      GuildShipCfg: { data: [
+        { shipId: 1, quality: 'PURPLE', num: 2, time: 150 },
+        { shipId: 2, quality: 'ORANGE', num: 4, time: 300 },
+        { shipId: 3, quality: 'RED', num: 6, time: 540 },
+      ] },
+    },
+  };
+  // 实盘我的 playerId 是 34191176546778（int64，low 是有符号负数）。
+  const ME = 34191176546778;
+  const NOW = new Date(2026, 9, 28, 12, 36, 0).getTime();
+  const NOW_S = Math.floor(NOW / 1000);
+
+  // 1. int64：low 是有符号 int32，直接 low + high*2^32 会算出负数，
+  //    导致「我是不是这艘船的船长」判错 → 计划器让船长补自己的船（必被 prompt 拒）。
+  assert.equal(bigNum({ low: -1058096678, high: 7960 }), ME, 'int64 用无符号 low 拼回来要等于原值');
+  assert.equal(bigNum(ME), ME, 'number 原样返回');
+  assert.equal(bigNum(undefined), 0, 'undefined → 0');
+  assert.equal(bigNum(null), 0, 'null → 0');
+
+  // 2. 参数与刷新点。
+  const params = gsParams(cfg);
+  assert.equal(params.maxShips, 2, '同时最多登 2 艘（GuildShipParamCfg.shipNum）');
+  assert.equal(params.prepareMinutes, 30, '补货窗口 30 分钟');
+  assert.equal(gsNextRefreshAt(NOW, params), new Date(2026, 9, 28, 14, 0, 0).getTime() / 1000,
+    '12:36 之后的下一个刷新点是 14:00');
+  assert.equal(gsNextRefreshAt(new Date(2026, 9, 28, 23, 30, 0).getTime(), params),
+    new Date(2026, 9, 29, 8, 0, 0).getTime() / 1000, '23:30 之后是次日 8 点');
+  const spec = gsShipSpec(cfg, 2);
+  assert.equal(spec.qualityName, '传说', 'ORANGE = 传说');
+  assert.equal(spec.minutes, 300, '传说航行 5 小时 = 300 分钟');
+  assert.equal(spec.cabins, 4, '传说是 4 个货舱');
+
+  // 3. 应聘条件：每一条 leaderCond 都要 `英雄星 + 专武星 >= star + exStar`。
+  const conds = [{ heroId: '机器警察', star: 10, exStar: 0 }, { heroId: '瑞文', star: 10, exStar: 0 }];
+  assert.equal(seekCheck(conds, new Map([['机器警察', { star: 11, exStar: 0 }], ['瑞文', { star: 9, exStar: 0 }]])).ok,
+    false, '瑞文 9 星 < 10 星 → 不能应聘');
+  assert.equal(seekCheck(conds, new Map([['机器警察', { star: 11, exStar: 0 }], ['瑞文', { star: 9, exStar: 1 }]])).ok,
+    true, '专武星也算：9+1=10 星刚好够');
+  assert.equal(seekCheck([{ heroId: '马斯克', star: 5, exStar: 0 }], new Map()).ok, false, '没有这个英雄 → 不能应聘');
+  assert.equal(seekCheck([], new Map()).ok, true, '没有条件 → 谁都能当');
+
+  // 4. 视图：名额、船长不能补货、无船长不能补货、缺料要拦。
+  const stock = new Map([['鱼皮风筝', 3], ['睡袋', 3], ['冲浪板', 2], ['吊床', 50], ['预制板', 39], ['煎锅', 0]]);
+  const heroes = new Map([['机器警察', { star: 11, exStar: 0 }], ['瑞文', { star: 9, exStar: 0 }]]);
+  const ship24 = {
+    shipId: 24, type: 1, state: GS_STATE_PREPARED, pos: 0,
+    leaderCond: [{ heroId: '弓箭手', star: 10, exStar: 0 }],
+    leader: { playerId: { low: -1058096678, high: 7960 }, nickname: '我' },
+    cabin: [
+      { crewId: 1, order: [{ type: 0, id: '吊床', num: 7 }, { type: 0, id: '预制板', num: 4 }], player: { playerId: 111, nickname: '队友' } },
+      { crewId: 2, order: [{ type: 0, id: '鱼皮风筝', num: 3 }, { type: 0, id: '睡袋', num: 2 }] },
+    ],
+    reward: { asset: [{ type: 0, id: '水姆币', num: 25 }, { type: 1, id: 'GOLD', num: 7500 }] },
+    preparedEndTime: NOW_S + 15 * 60,
+  };
+  const ship29 = {
+    shipId: 29, type: 1, state: GS_STATE_PREPARED, pos: 1,
+    leaderCond: conds,
+    cabin: [
+      { crewId: 1, order: [{ type: 0, id: '冲浪板', num: 2 }, { type: 0, id: '吊床', num: 7 }] },
+      { crewId: 2, order: [{ type: 0, id: '煎锅', num: 2 }, { type: 0, id: '吊床', num: 7 }] },
+    ],
+    reward: { asset: [{ type: 0, id: '水姆币', num: 10 }] },
+    preparedEndTime: 0,
+  };
+  const survey = { now: NOW, period: 10001, ships: [ship24, ship29], ownRun: [] };
+  const view = viewGuildShip(survey, { config: cfg, stock, heroes, playerId: ME, now: NOW });
+  assert.equal(view.open, true, 'period > 0 就是开着');
+  assert.equal(view.myShips.length, 1, '名额要认出「我是 #24 的船长」');
+  assert.equal(view.myShips[0].role, 'leader', '#24 的身份是船长');
+  assert.equal(view.slotsLeft, 1, '2 个名额用了 1 个');
+  const v24 = view.ships.find((r) => r.shipId === 24);
+  const v29 = view.ships.find((r) => r.shipId === 29);
+  assert.equal(v24.mineLeader, true, '#24 的船长是我');
+  assert.equal(v24.fillable.length, 0, '船长不能给自己那条船补货（实盘 captain cannot resupply）');
+  assert.equal(v24.blocked.length, 0, '船长不做补货判断，别报缺料');
+  assert.equal(v29.fillable.length, 0, '没有船长的船还没开启补货，不能补');
+  // 舱1 材料齐、舱2 缺煎锅 —— 缺料要如实列出来（有船长之后才看这个）。
+  assert.equal(v29.cabins.find((c) => c.crewId === 2).short[0].id, '煎锅', '缺料要指名道姓');
+  assert.equal(view.seekable.length, 0, '瑞文 9 星不够 → 不能应聘 #29');
+  // 船长条件满足时才进 seekable。
+  const heroes2 = new Map([['机器警察', { star: 11, exStar: 0 }], ['瑞文', { star: 10, exStar: 0 }]]);
+  const view2 = viewGuildShip(survey, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(view2.seekable.length, 1, '瑞文补到 10 星就能应聘 #29');
+  assert.equal(view2.seekable[0].shipId, 29, '能应聘的是 #29');
+
+  // 5. 计划：名额满了就一条都不发（哪怕有空舱、有缺料也别动）。
+  const fullSurvey = {
+    now: NOW,
+    period: 10001,
+    ships: [ship24, { ...ship24, shipId: 30, leader: { playerId: 222, nickname: '别人' } }],
+    ownRun: [],
+  };
+  // #24 我当船长、#30 我补过舱 → 2 个名额都占了。
+  const crew30 = {
+    ...ship24,
+    shipId: 30,
+    leader: { playerId: 222, nickname: '别人' },
+    cabin: [
+      { crewId: 4, order: [{ type: 0, id: '吊床', num: 7 }], player: { playerId: { low: -1058096678, high: 7960 }, nickname: '我' } },
+      { crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] },
+    ],
+  };
+  const fullView = viewGuildShip({ ...fullSurvey, ships: [ship24, crew30] }, {
+    config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW,
+  });
+  assert.equal(fullView.myShips.length, 2, '#24 船长 + #30 船员 = 2 艘');
+  assert.equal(fullView.slotsLeft, 0, '名额用满');
+  const fullPlan = planGuildShip(fullView, { config: cfg });
+  assert.equal(fullPlan.actions.length, 0, '名额满了就一条都不发');
+  assert.ok(fullPlan.notes.some((n) => n.includes('已占满')), '要说清是名额满了');
+
+  // 6. 计划：名额够 → 先补货（挑空舱少 = 快启航的）→ 剩余名额才当船长。
+  const emptyMine = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: [
+      { ...ship24, shipId: 40, leader: { playerId: 333, nickname: '甲' },
+        cabin: [
+          { crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] },
+          { crewId: 2, order: [{ type: 0, id: '吊床', num: 7 }] },
+        ] },
+      { ...ship24, shipId: 41, leader: { playerId: 444, nickname: '乙' },
+        cabin: [
+          { crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] },
+          { crewId: 2, order: [{ type: 0, id: '吊床', num: 7 }] },
+          { crewId: 3, order: [{ type: 0, id: '吊床', num: 7 }] },
+          { crewId: 4, order: [{ type: 0, id: '吊床', num: 7 }] },
+        ] },
+    ],
+    ownRun: [],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  const emptyPlan = planGuildShip(emptyMine, { config: cfg });
+  const orderActions = emptyPlan.actions.filter((a) => a.kind === 'guildShipOrder');
+  assert.equal(orderActions.length, 2, '2 个名额都拿去补货（船员是稳赚的）');
+  assert.equal(orderActions[0].body.shipId, 40, '空舱少的 #40 排在前面（越快启航，名额释放越快）');
+  assert.equal(orderActions[0].request, 'GuildShipOrderRequest', '补货走 GuildShipOrderRequest');
+  // 补货动作的 key 要按 shipId+crewId 区分，否则多条动作会被 rejected 集合当成同一条。
+  assert.ok(orderActions.every((a) => a.key.startsWith('guildShipOrder:') && a.key.split(':').length === 3),
+    'key 必须按船+舱区分');
+  assert.ok(orderActions.every((a) => a.transient === true), '舱位是动态的 → transient（失败不该跨轮拉黑）');
+
+  // 7. 剩余名额当船长：1 个名额去补货，另 1 个去应聘没人当的船。
+  const mixed = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: [
+      { ...ship24, shipId: 40, leader: { playerId: 333, nickname: '甲' },
+        cabin: [
+          { crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] },
+          { crewId: 2, order: [{ type: 0, id: '吊床', num: 7 }] },
+        ] },
+      { ...ship29, shipId: 50 },
+    ],
+    ownRun: [],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  const mixedPlan = planGuildShip(mixed, { config: cfg });
+  assert.equal(mixedPlan.actions.filter((a) => a.kind === 'guildShipOrder').length, 1, '先拿 1 个名额补货');
+  const seekAction = mixedPlan.actions.find((a) => a.kind === 'guildShipSeek');
+  assert.ok(seekAction, '剩下的名额去当船长');
+  assert.equal(seekAction.body.shipId, 50, '应聘的是没人当船长的 #50');
+  assert.equal(seekAction.request, 'GuildShipSeekRequest', '应聘走 GuildShipSeekRequest');
+  // 关掉「应聘船长」就只剩补货。
+  const noSeek = planGuildShip(mixed, { config: cfg, allowSeek: false });
+  assert.ok(!noSeek.actions.some((a) => a.kind === 'guildShipSeek'), 'allowSeek=false 时不当船长');
+
+  // 8. 在航的船不能补货、也不能应聘（state=2）。
+  const sailing = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: [{ ...ship24, shipId: 60, state: GS_STATE_MOVING,
+      leader: { playerId: 555, nickname: '丙' },
+      cabin: [{ crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] }] }],
+    ownRun: [{ shipId: 60, type: 1, state: GS_STATE_MOVING, mvEndTime: NOW_S + 3600 }],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(planGuildShip(sailing, { config: cfg }).actions.length, 0, '航行中的船什么都不做');
+  assert.equal(sailing.ownRun[0].moveEndAt, NOW_S + 3600, '在航信息要透出来（名额什么时候释放）');
+
+  // 9. 本期没开：一条都不发，说明原因。
+  const closed = viewGuildShip({ now: NOW, period: 0, ships: [ship24], ownRun: [] },
+    { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(closed.open, false, 'period=0 = 本期没开');
+  const closedPlan = planGuildShip(closed, { config: cfg });
+  assert.equal(closedPlan.actions.length, 0, '没开就一条都不发');
+  assert.ok(closedPlan.notes.some((n) => n.includes('未开启')), '要说清本期未开启');
+
+  // 10. 结算文案。
+  const gain = formatGuildShipGain(summarizeGuildShip([
+    { step: { kind: 'guildShipOrder', label: '补货' }, ok: true },
+    { step: { kind: 'guildShipSeek', label: '应聘' }, ok: true },
+    { step: { kind: 'guildShipOrder', label: '补货失败' }, ok: false, error: 'x' },
+    { step: { kind: 'guildShipOrder', label: '跳过' }, ok: false, skipped: true },
+  ]));
+  assert.ok(gain.includes('补货 1 舱'), `要统计补了几舱，实际：${gain}`);
+  assert.ok(gain.includes('当船长 1 艘'), `要统计当了几艘船长，实际：${gain}`);
+  assert.ok(gain.includes('失败 1'), `失败要单独计数（跳过不算失败），实际：${gain}`);
+
+  // 11. ⚠ 名额必须把**在航的船**算进去：它们还没到港，一样锁着名额。
+  // 实盘 2026-10-28 14:41：码头 0 艘是我的、ownRun 里 2 艘在航 → 旧算法 slotsLeft=2，
+  // 补货与应聘**双双**被 `server prompt: ship slot limit` 拒掉（日志：计划 2 / 成功 0 / 失败 2）。
+  const dockOthers = () => [
+    { ...ship24, shipId: 40, leader: { playerId: 333, nickname: '甲' },
+      cabin: [
+        { crewId: 1, order: [{ type: 0, id: '睡袋', num: 2 }] },
+        { crewId: 2, order: [{ type: 0, id: '吊床', num: 7 }] },
+      ] },
+    { ...ship29, shipId: 50 },
+  ];
+  const busy = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: dockOthers(),
+    ownRun: [
+      { shipId: 24, type: 1, state: GS_STATE_MOVING, mvEndTime: NOW_S + 1800 },
+      { shipId: 30, type: 2, state: GS_STATE_MOVING, mvEndTime: NOW_S + 9000 },
+    ],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(busy.myShips.length, 0, '码头上的船没有一艘是我的');
+  assert.equal(busy.runningMine.length, 2, '在航的 2 艘都是我的');
+  assert.equal(busy.slotsUsed, 2, '名额占用 = 码头我的 + 在航我的');
+  assert.equal(busy.slotsLeft, 0, '在航的船照样占名额（旧算法在这里错成 2）');
+  const busyPlan = planGuildShip(busy, { config: cfg });
+  assert.equal(busyPlan.actions.length, 0, '名额占满时一条都不发（否则必被 ship slot limit 拒）');
+  assert.ok(busyPlan.notes.some((n) => n.includes('在航')), `要说清名额被在航的船占着，实际：${busyPlan.notes.join(' | ')}`);
+  assert.ok(busyPlan.notes.some((n) => n.includes('已占满')), '要说清是占满了');
+
+  // 只占一半（在航 1 艘）→ 还剩 1 个名额，可以补 1 个舱。
+  const half = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: dockOthers(),
+    ownRun: [{ shipId: 24, type: 1, state: GS_STATE_MOVING, mvEndTime: NOW_S + 1800 }],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(half.slotsLeft, 1, '在航 1 艘只占 1 个名额');
+  const halfPlan = planGuildShip(half, { config: cfg });
+  assert.equal(halfPlan.actions.filter((a) => a.kind === 'guildShipOrder').length, 1, '还剩 1 个名额拿去做船员');
+  assert.ok(!halfPlan.actions.some((a) => a.kind === 'guildShipSeek'), '名额只有 1 个时不再去应聘船长');
+
+  // 同一艘船既在码头又在 ownRun（理论上不会）→ 不能重复计名额。
+  const dup = viewGuildShip({
+    now: NOW,
+    period: 10001,
+    ships: [{ ...ship24, shipId: 24 }],
+    ownRun: [{ shipId: 24, type: 1, state: GS_STATE_MOVING, mvEndTime: NOW_S + 600 }],
+  }, { config: cfg, stock, heroes: heroes2, playerId: ME, now: NOW });
+  assert.equal(dup.slotsUsed, 1, '同一艘船不能算两次名额');
+
+  // 概览文案也要把在航的船算进「我的名额」。
+  assert.ok(formatGuildShipSummary(busy).includes('我的名额 2/2'), `概览要显示 2/2，实际：${formatGuildShipSummary(busy)}`);
+  assert.ok(formatGuildShipSummary(busy).includes('在航'), '概览要标出在航');
+
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 联盟商船 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);

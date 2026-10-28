@@ -22,6 +22,15 @@ import { surveyEquip, planEquip, formatEquipPlan } from './equip.mjs';
 import { surveyPet, planPet, formatPetPlan, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
 import { surveyTreasure, viewTreasure, planTreasure, formatTreasureSummary, formatTreasurePlan, rewardCountText, DEFAULT_MAX_FLEETS, DEFAULT_COLORS, colorsOf, colorsText } from './treasure.mjs';
+import {
+  surveyGuildShip,
+  viewGuildShip,
+  planGuildShip,
+  formatGuildShipSummary,
+  summarizeGuildShip,
+  formatGuildShipGain,
+  bigNum,
+} from './guildShip.mjs';
 import { surveyCargo, fetchStock, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, safeCargoDemand, CARGO_SLOTS } from './tradePort.mjs';
 import {
   surveyTradeKing,
@@ -178,13 +187,23 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         cargoEnabled: true,
         cargoEveryMs: 60_000,
         lastCargoAt: null,
+        guildShipEnabled: true,
+        guildShipEveryMs: 120_000,
+        lastGuildShipAt: null,
+        guildShipSeek: true,
         // 海商王（活动「Trade」，每天 10~22 点）：在港就卖 + 买本港特产 + 开去紧缺港口。
         // 只花活动内的商会币（不花钻石），商会指针是免费道具 —— 默认全用。
-        tradeEnabled: true,
+        // 海商王活动 2026-10-28 已下线，loop 里那一段整段注释，这里也跟着默认关。
+        tradeEnabled: false,
         tradeEveryMs: 60_000,
         lastTradeAt: null,
         tradeAllowSpeed: true,
         tradePass: true,
+        // 联盟订单：每天 0 点刷一单，交齐 3 种物品换公会经验 + 功勋（+联盟城市兵力）。
+        // 请求体只有 cityId，不花货币/钻石，唯一成本是仓库里那 3 样货 —— 默认开，10 分钟看一次。
+        guildOrderEnabled: true,
+        guildOrderEveryMs: 600_000,
+        lastGuildOrderAt: null,
         minPowerRatio: DEFAULT_MIN_POWER_RATIO,
         // 运行中可改的执行范围（以前只在 start 时生效，改完必须停掉重开）：
         // 拾荒开关、材料不齐时用不用自选包、加速器/拒单/付费这些允许项。
@@ -694,6 +713,97 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         text: formatTradeSummary(view) + (plan.actions.length > 0
           ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
           : `\n没有可做的（${plan.notes[0] ?? '等下一个刷新点'}）`),
+      },
+    };
+  }
+
+  // 拉英雄星级（只为了判断「能不能应聘某艘船的船长」）。拿不到就当没有英雄，
+  // 只是这次不当船长 —— 补货不受影响，所以这里吞掉错误。
+  async function fetchHeroStars(instance) {
+    const body = await instance.request('AllHeroRequest', {}, 'AllHeroResponse', 12_000).catch(() => null);
+    const heroes = new Map();
+    for (const hero of body?.heroes ?? []) {
+      const id = String(hero.heroId ?? hero.name ?? hero.id ?? '');
+      if (id) heroes.set(id, { star: Number(hero.star) || 0, exStar: Number(hero.exclusive?.star) || 0 });
+    }
+    return heroes;
+  }
+
+  // 联盟商船（活动「GuildShip」）：只读视图 + 补货/应聘计划，真正的写走 /api/guildship/run。
+  async function guildShip(session, account, options = {}) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const [stock, heroes] = await Promise.all([
+      fetchStock(instance, protocol),
+      options.heroes ?? fetchHeroStars(instance),
+    ]);
+    const survey = await surveyGuildShip(instance, protocol);
+    const view = viewGuildShip(survey, {
+      config,
+      stock,
+      heroes,
+      // int64 必须走 bigNum，否则大 id 会算成负数，「我是不是船长」判错。
+      playerId: bigNum(session.player?.playerId),
+    });
+    const plan = planGuildShip(view, { config, allowSeek: options.allowSeek !== false });
+    return {
+      survey,
+      view,
+      plan,
+      payload: {
+        period: view.period,
+        open: view.open,
+        maxShips: view.maxShips,
+        prepareMinutes: view.prepareMinutes,
+        refreshHours: view.refreshHours,
+        nextRefreshAt: view.nextRefreshAt,
+        summary: formatGuildShipSummary(view),
+        slotsLeft: view.slotsLeft,
+        myShips: view.myShips,
+        ownRun: view.ownRun,
+        ships: view.ships.map((ship) => ({
+          shipId: ship.shipId,
+          pos: ship.pos,
+          type: ship.type,
+          quality: ship.quality,
+          qualityName: ship.qualityName,
+          cabinTotal: ship.cabinTotal,
+          minutes: ship.minutes,
+          state: ship.state,
+          stateName: ship.stateName,
+          leaderName: ship.leaderName,
+          mineLeader: ship.mineLeader,
+          myCabinId: ship.myCabinId,
+          mine: ship.mine,
+          filledCount: ship.filledCount,
+          emptyCount: ship.emptyCount,
+          passLine: ship.passLine,
+          filling: ship.filling,
+          endAt: ship.endAt,
+          leftSeconds: ship.leftSeconds,
+          reward: ship.rewardAsset,
+          rewardScore: ship.rewardScore,
+          seekOk: ship.seekCheck.ok,
+          seekWhy: ship.seekCheck.why,
+          cabins: ship.cabins.map((c) => ({
+            crewId: c.crewId,
+            filled: c.filled,
+            byMe: c.byMe,
+            ownerName: c.ownerName,
+            needs: c.needs,
+            short: c.short,
+            canFill: c.canFill,
+          })),
+          fillable: ship.fillable,
+          blocked: ship.blocked,
+        })),
+        seekable: view.seekable.map((s) => s.shipId),
+        fillableShips: view.fillableShips.map((s) => s.shipId),
+        actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+        notes: plan.notes,
+        text: formatGuildShipSummary(view) + (plan.actions.length > 0
+          ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
+          : `\n没有可做的（${plan.notes[0] ?? '等下一条船刷新'}）`),
       },
     };
   }
@@ -1224,6 +1334,42 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
+      // 联盟商船（活动「GuildShip」）：只读视图 + 补货/应聘计划，真正的写走 /api/guildship/run。
+      if (route === 'GET /api/guildship') {
+        const { account, session } = scoped_(parsed);
+        json((await guildShip(session, account)).payload);
+        return;
+      }
+      // 立刻跑一段联盟商船（补货 → 应聘船长），判据与循环里那套完全一样。
+      if (route === 'POST /api/guildship/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const allowSeek = payload.allowSeek !== false;
+        const before = await guildShip(session, account, { allowSeek });
+        const instance = await ensureConnected(session, account);
+        const plan = before.plan;
+        let results = [];
+        if (plan.actions.length > 0) {
+          ({ results } = await runWorld(instance, protocol, plan, {
+            allowMutate: true,
+            window: 1200,
+            onStep: (entry) => {
+              if (entry.skipped) emit(session, 'warn', `联盟商船「${entry.step.label}」跳过：${entry.error}`);
+              else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `联盟商船 ${entry.step.label}` : `联盟商船 ${entry.step.label} 失败：${entry.error}`);
+            },
+          }));
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          const gain = formatGuildShipGain(summarizeGuildShip(results));
+          if (gain) emit(session, 'info', gain);
+        }
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          gain: summarizeGuildShip(results),
+          ...(await guildShip(session, account, { allowSeek })).payload,
+        });
+        return;
+      }
       if (route === 'GET /api/trade') {
         const { account, session } = scoped_(parsed);
         json((await trade(session, account)).payload);
@@ -1751,6 +1897,15 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.tradeEveryMs = secondsArg(payload.tradeEverySeconds, 60) * 1000;
         loop.tradeAllowSpeed = payload.tradeSpeed !== false;
         loop.tradePass = payload.tradePass !== false;
+        // 联盟商船默认开，间隔默认 120 秒：补货窗口只有 30 分钟、好舱位会被队友抢，
+        // 但商船 3 小时才刷新一次，探太勤也只是白打请求。
+        loop.guildShipEnabled = payload.guildShip !== false;
+        loop.guildShipEveryMs = secondsArg(payload.guildShipEverySeconds, 120) * 1000;
+        loop.guildShipSeek = payload.guildShipSeek !== false;
+        // 联盟订单默认开，间隔默认 600 秒：料是工厂产的加工品（30~300 分钟一炉），
+        // 看太勤只是白打 3 个请求（GuildOrder + GuildCityInfo + CounterInfo）。
+        loop.guildOrderEnabled = payload.guildOrder !== false;
+        loop.guildOrderEveryMs = secondsArg(payload.guildOrderEverySeconds, 600) * 1000;
         loop.minPowerRatio = Number(payload.powerRatio) > 0 ? Number(payload.powerRatio) : DEFAULT_MIN_POWER_RATIO;
         // 执行范围也存进 loop：运行中改「拾荒 / 自选包 / 加速器 / 拒单」下一轮就能生效。
         // 注意 allowPaid 只影响日常里的点金/折扣店，热更新同样安全（每段都重新读）。
@@ -1774,6 +1929,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           loop.lastTreasureAt = null;
           loop.lastCargoAt = null;
           loop.lastTradeAt = null;
+          loop.lastGuildShipAt = null;
+          loop.lastGuildOrderAt = null;
         }
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
         const farmText = loop.farmEnabled
@@ -1803,12 +1960,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const tradeText = loop.tradeEnabled
           ? (loop.tradeEveryMs > 0 ? `海商王每 ${Math.round(loop.tradeEveryMs / 1000)} 秒跑一段（指针${loop.tradeAllowSpeed ? '全用' : '不用'}）` : '海商王每轮都跑')
           : '海商王关';
+        const guildShipText = loop.guildShipEnabled
+          ? (loop.guildShipEveryMs > 0 ? `联盟商船每 ${Math.round(loop.guildShipEveryMs / 1000)} 秒看一眼（补货${loop.guildShipSeek ? ' + 应聘船长' : ''}）` : '联盟商船每轮都看')
+          : '联盟商船关';
+        const guildOrderText = loop.guildOrderEnabled
+          ? (loop.guildOrderEveryMs > 0 ? `联盟订单每 ${Math.round(loop.guildOrderEveryMs / 1000)} 秒看一眼` : '联盟订单每轮都看')
+          : '联盟订单关';
         const pirateText = loop.pirateEnabled
           ? `海盗${loop.pirateEveryMs > 0 ? `每 ${Math.round(loop.pirateEveryMs / 1000)} 秒` : '每轮'}讨伐一次`
             + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×）`
           : '海盗关';
         const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
-        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
+        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${guildShipText}；${guildOrderText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
         // 热更新到此为止：正在跑的那个 runLoop 会从 live() 读到新值，下一轮自动生效。
         if (hot) {
           json({ ok: true, running: true, hot: true, note: '设置已应用，下一轮生效' });
@@ -1852,6 +2015,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           tradeEveryMs: loop.tradeEveryMs,
           tradeAllowSpeed: loop.tradeAllowSpeed,
           tradePass: loop.tradePass,
+          guildShipEnabled: loop.guildShipEnabled,
+          guildShipEveryMs: loop.guildShipEveryMs,
+          guildShipSeek: loop.guildShipSeek,
+          guildOrderEnabled: loop.guildOrderEnabled,
+          guildOrderEveryMs: loop.guildOrderEveryMs,
           minPowerRatio: loop.minPowerRatio,
           useSelectPack: loop.useSelectPack,
           maxPackPerRound: loop.maxPackPerRound,
@@ -1879,6 +2047,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastTreasureAt = summary.gates?.treasure?.lastAt ?? loop.lastTreasureAt;
             loop.lastCargoAt = summary.gates?.cargo?.lastAt ?? loop.lastCargoAt;
             loop.lastTradeAt = summary.gates?.trade?.lastAt ?? loop.lastTradeAt;
+            loop.lastGuildShipAt = summary.gates?.guildShip?.lastAt ?? loop.lastGuildShipAt;
+            loop.lastGuildOrderAt = summary.gates?.guildOrder?.lastAt ?? loop.lastGuildOrderAt;
             // 奖励次数只有真的探测过才有新值（静默窗里是上一轮的旧值，保留着给页面显示）。
             loop.treasureStats = summary.gates?.treasure?.stats ?? loop.treasureStats;
             loop.history.push(summary);
@@ -1987,6 +2157,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       lastTradeAt: loop.lastTradeAt,
       tradeAllowSpeed: loop.tradeAllowSpeed,
       tradePass: loop.tradePass,
+      guildShipEnabled: loop.guildShipEnabled,
+      guildShipEveryMs: loop.guildShipEveryMs,
+      lastGuildShipAt: loop.lastGuildShipAt,
+      guildShipSeek: loop.guildShipSeek,
+      guildOrderEnabled: loop.guildOrderEnabled,
+      guildOrderEveryMs: loop.guildOrderEveryMs,
+      lastGuildOrderAt: loop.lastGuildOrderAt,
       minPowerRatio: loop.minPowerRatio,
       // 执行范围也回给页面：运行中回填勾选，避免「页面勾着、服务端其实关着」。
       useSelectPack: loop.useSelectPack !== false,

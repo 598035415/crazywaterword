@@ -291,7 +291,7 @@ export const PAGE = `<!doctype html>
 
     <h2>农田</h2>
     <div class="bar">
-      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（离库存上限越远的越先种）">
+      <label class="dim" title="农田默认开：成熟的作物一次性收掉，空出来的地同一轮补种（分散铺开：库存少的先种）">
         <input type="checkbox" id="world-farm" checked> 自动农田
       </label>
       <label class="dim">时间间隔 <input id="farm-every" value="120" style="width:64px"> 秒</label>
@@ -300,10 +300,21 @@ export const PAGE = `<!doctype html>
     <pre id="farm-view">农田跟拾荒一样按自己的节奏跑，但方向相反：默认就开着，只有命令行加 --no-farm 才关。
 作物最快 30 分钟成熟，所以默认 120 秒看一眼就够；只有**真的排出了收/种动作**才记时间，地里没熟、也没空地时不占用间隔。
 收：熟一片全收（一条 FarmHarvestRequest）；种：空地和刚收的地同一轮补种，**一种作物一条 FarmPlantRequest**（土豆被拒不会连累小麦）。
-选种顺序：离库存上限越远的越先种 → 同档按价值（成熟时长长的更贵）→ 订单/货船缺的优先。
-服务端对单种作物有库存上限（实测土豆 245 能种、260 起回 item limit reached），而**收获不校验上限**，
-所以播种前会先卡一道 250 的线：到线的作物直接跳过、让位给库存少的；真被拒过的作物歇 30 分钟再试。
-地不够种子时逐块列出原因。游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。</pre>
+选种策略是**分散铺开 + 目标水位**：每放一块地就重挑一次「离水位最远的那种」——
+订单/货船有缺口的最优先（可以突破水位），其余按「安全水位 − 当前库存」降序，一轮之内每种作物先各占一块地。
+安全水位按这种作物被几条成品配方用来分档（小麦/番茄各 6 条 → 200，南瓜/茄子只有 1 条 → 40）：
+**到水位就不种了，地块宁可空着**。因为只按「库存少的先种」会把十来种作物一起推向单种上限 250，
+然后上限过滤把每一种都剔掉，地块永久空着 —— 而仓库里全是工厂吃不掉的存货。
+空着不是故障：工厂把这些库存吃下去之后水位自动让出来，下一轮就恢复种（闭环）。
+服务端对单种作物有库存上限（实测土豆 245 能种、260 起回 item limit reached，取 250），而**收获不校验上限**，
+所以播种前还会算「种下去会不会超线」：会超就跳过；真被拒过的作物歇 30 分钟再试。
+地块空着时日志会写明是「没种子」还是「作物都到安全水位」，别再混着理解。
+游戏内「自动种植」（VIP 功能）开着时只收不种 —— 那时服务端自己播，重复播只是白费种子。
+**过剩作物怎么消化**：库存超过水位的作物会折成「这条配方还能做几份」喂给工厂排产（每种成品最多 3 份），
+只喂**料已经齐**的配方 —— 料不齐还给需求的话，工厂会拿自选包去兑，那就破了「无需求不烧包」这条线。
+**种子从哪来**：农田缺哪种作物（库存 < 40）且它的种子不足 8 个，就把「该种子」当成排产需求喂给种子厂；
+种子厂的存量上限留 5 个余量（50 → 排到 45 就停），接近上限的种子不再占队列位，让给真正缺的那种。
+种子厂等级决定能产哪几种种子（每级解锁一种，当前 Lv4 = 小麦/玉米/土豆/番茄），产一炉只出 1 个。</pre>
 
     <h2>挂机收益 / 邮件</h2>
     <div class="bar">
@@ -356,10 +367,12 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 排在挂机最后一段：前面几段（交单/排产）先把材料用掉，剩下的才拿来贸易，避免互相抢料。
 间隔填 0 = 每轮都看。</pre>
 
-    <h2>海商王（港口贸易）</h2>
+    <!-- 海商王（活动 Trade）2026-10-28 已下线：loop.mjs 里第 10 段整段注释停用，这里默认不勾。
+         活动重开时：把 loop.mjs 那段解注释、勾上这个开关即可，控件与接口都还在。 -->
+    <h2>海商王（港口贸易 · 活动已下线）</h2>
     <div class="bar">
-      <label class="dim" title="每天 10~22 点的港口贸易活动：在港就卖掉手上的货、买本港特产、开去「把这件货当紧缺」的港口">
-        <input type="checkbox" id="trade-on" checked> 自动跑海商王
+      <label class="dim" title="每天 10~22 点的港口贸易活动。⚠ 活动已于 2026-10-28 下线，挂机里那一段已注释停用">
+        <input type="checkbox" id="trade-on"> 自动跑海商王（已下线）
       </label>
       <label class="dim">时间间隔 <input id="trade-every" value="60" style="width:64px"> 秒</label>
       <label class="dim" title="商会指针（免费道具，联盟任务/战令产出）每个缩短 30 分钟航程。关掉就老实等 2 小时一趟">
@@ -368,7 +381,10 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
       <button id="trade-run">立刻跑一段</button>
       <span id="trade-state" class="dim">还没跑过</span>
     </div>
-    <pre id="trade-view">17 个港口，每个港口有一种「特产」（固定不变，价格最低）和一种「紧缺货物」（每天 10 点变，价格最高）。
+    <pre id="trade-view">⚠ 2026-10-28 活动已下线，这段代码整段注释停用，不再探测也不再发请求。
+   下面规则留档，活动重开时按「loop.mjs 解注释 + 勾上开关」即可恢复。
+
+17 个港口，每个港口有一种「特产」（固定不变，价格最低）和一种「紧缺货物」（每天 10 点变，价格最高）。
 赚钱的路子：**在「特产 = g」的港口买 g → 开到「紧缺 = g」的港口卖掉**，单趟价差约 +25~30%，再乘商船加成（lv1 +3%）。
 ⚠ 紧缺货每天 10 点重置，雷达里只有「今天有人到过并共享过」的港口才有值 —— 所以要边跑边把未知港口点亮。
 - 库存全联盟共享、先到先得，每 2 小时（10/12/14/16/18/20 点）刷价格与库存 → 刷新后越快抢到越好。
@@ -377,6 +393,48 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - 只花活动内的商会币，**不花钻石**：升船（300/600/1200/2000 钻）和买指针（50 钻/次）都不做。
 - 顺手领：个人累计利润成就、联盟任务、商情共享奖励、海商王战令免费档。
 - 一趟「卖 + 买 + 起航」算一轮，间隔填 0 = 每轮都跑；在航且没指针、不在 10~22 点时会静默，不白打请求。</pre>
+
+    <h2>联盟商船</h2>
+    <div class="bar">
+      <label class="dim" title="全联盟一起凑货舱：给已有船长的船补一个货舱（材料得够，缺料绝不买），顺带应聘没人当的船长">
+        <input type="checkbox" id="guild-ship-on" checked> 自动跑联盟商船
+      </label>
+      <label class="dim">时间间隔 <input id="guild-ship-every" value="120" style="width:64px"> 秒</label>
+      <label class="dim" title="没人当船长的船可以直接应聘（零成本：凑不齐只遣返船长，不扣资源）。船长不能给自己那条船补货，所以船位有限时优先做船员">
+        <input type="checkbox" id="guild-ship-seek" checked> 应聘船长
+      </label>
+      <button id="guild-ship-run">立刻跑一段</button>
+      <span id="guild-ship-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="guild-ship-view">联盟商船是**全联盟一起凑货舱**的日常：商船停在联盟码头，凑齐所有货舱就立刻启航，
+船长和登船成员拿**一样**的奖励（水姆币 / 专武材料 / GOLD / RUBY / 英雄经验…）。
+- 三档规格：史诗 2.5 小时（2 舱）／传说 5 小时（4 舱）／超凡 9 小时（6 舱），规格越高奖励越好。
+- 刷新：每天 8／11／14／17／20／23 点，史诗与传说各补满 2 艘并重置船长与货舱；超凡每天 2 艘、港口同时只停 1 艘。
+- 补货窗口只有 **30 分钟**，到点没达标的船会被重置并遣返船长（已交的商品退还）。达标线：史诗 1 舱／传说 2 舱／超凡 3 舱。
+- **两条硬限制**：船长不能给自己那条船补货；每人最多同时登 2 艘，而且一旦上船就被锁到船到港（2.5~9 小时）才释放名额。
+- 所以策略是「**船员优先 + 挑空舱少的船**（快启航、名额释放快）」，剩余名额才去当船长。
+- **缺料一律不补、绝不花钻石买料**（客户端那条路会弹「购买」，这里不接），等工厂产出来再说。</pre>
+
+    <h2>联盟订单</h2>
+    <div class="bar">
+      <label class="dim" title="每天 0 点刷一单：交齐 3 种物品换公会经验 + 功勋（外加联盟城市兵力）。请求体只有 cityId，不花货币/钻石">
+        <input type="checkbox" id="guild-order-on" checked> 自动交联盟订单
+      </label>
+      <label class="dim">时间间隔 <input id="guild-order-every" value="600" style="width:64px"> 秒</label>
+      <span id="guild-order-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="guild-order-view">联盟订单是「联盟城市驻军」弹窗里的那一单，**每天 0 点刷新，一天一单**。
+- 要什么：3 种物品（实测 2026-10-28 是 日用品×4、海藻汁×6、木板×3），数量由服务端随机，配置表里查不到。
+  物品池 135 条：**加工品 123 条 + 农产品 12 条**（小麦/玉米/土豆/番茄/…/可可豆，没有橡胶）。
+- 花什么：**什么都不额外花**。FinishGuildOrderRequest 只有 cityId 一个必填字段，
+  没有物品清单、没有货币、没有钻石，服务端按订单要求直接从仓库扣那 3 样货。
+- 给什么：按 GuildOrderCfg 每种物品一份公会经验 + 功勋（小麦 25/45、土豆 40/65、番茄 45/70…），
+  另外交单会给联盟城市加兵力。
+- 次数：GuildOrderNumCfg 按赛季/等级给上限（-1 = 不限），今天交过几次看计数器
+  DAILY_FINISH_GUILD_ORDER。交成功后本机就睡到次日 00:00 刷新点。
+- 料不齐就跳过并写明缺什么（缺料会等你工厂补齐，**不会去商店买**）。
+- 间隔 600 秒的理由：订单料多是加工品，工厂一炉 30~300 分钟，看太勤只是白打 3 个请求
+  （GuildOrder + GuildCityInfo + CounterInfo），看太慢又会错过刚补齐那一刻。</pre>
 
     <h2>海兽培育</h2>
     <div class="bar">
@@ -560,9 +618,12 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 那是待收，不是到手。同一张表也能回答「这些料够不够交订单」，因为交单扣的就是这份仓库。
 「建筑产出」是训练营的英雄经验、精铁厂的精铁、民居的金币这些非工厂建筑（CollectBuildingProductResponse）。
 
-拾荒、居民订单、挂机收益、邮件奖励各有各的回包，逐条加起来的。邮件那栏是反推的：
-QuickGotReadEmailRequest 没有回包，只能从当前邮件快照里挑「今天发出且已领取」的邮件，所以它只在查「今天」时出现。
-货轮 / 情报 / 海盗的奖励都走邮件，落到那一栏里；农田收获、海兽这两段协议只有请求没有回包，只能在「今日活动次数」里看做了几次。
+拾荒、居民订单、挂机收益、货轮港口、邮件奖励各有各的回包，逐条加起来的。邮件那栏是反推的：
+QuickGotReadEmailRequest 没有回包，只能靠邮件快照里「未领 → 已领」的变化判断领取时刻 ——
+所以它算的是「当天真领到手」几封，跟邮件哪天发的无关：昨天发、今天领的，归今天。
+第一次打开某一天会把这天的邮件快照整份扫一遍（实测 74MB 约 1 秒），之后只读新增的部分。
+情报 / 海盗的奖励走邮件，落到邮件那栏；农田收获、海兽成熟、免战扫荡这些协议只有请求没有回包，
+只能靠「今日活动次数」看做了几次 —— 次数是请求条数，像不像"收益"要自己判断。
 
 「今日活动次数」数的是请求条数，不是收益 —— 服务端拒了的请求也在里面，它说明的是「挂机试过几次」。
 查历史日期时，趋势图仍然按那一天往前数 7 天，方便跟今天对比。</pre>
@@ -1038,7 +1099,8 @@ const LOOP_FIELDS = [
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
   'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
   'cargo-on', 'cargo-every',
-  'trade-on', 'trade-every', 'trade-speed',
+  'trade-on', 'trade-every', 'trade-speed', 'guild-ship-on', 'guild-ship-every', 'guild-ship-seek',
+  'guild-order-on', 'guild-order-every',
 ];
 for (const id of LOOP_FIELDS) {
   const node = $(id);
@@ -1082,6 +1144,8 @@ function renderLoop(data) {
   syncInterval('treasure-every', data.treasureEveryMs);
   syncInterval('cargo-every', data.cargoEveryMs);
   syncInterval('trade-every', data.tradeEveryMs);
+  syncInterval('guild-ship-every', data.guildShipEveryMs);
+  syncInterval('guild-order-every', data.guildOrderEveryMs);
   // 状态行一律按**服务端实际生效**的开关算（未挂机时才看页面勾选）——
   // 页面勾着但服务端关着时，写「还差 20 秒」会误导。
   const gateOn = (id, serverValue) => (data.running && typeof serverValue === 'boolean' ? serverValue : $(id).checked);
@@ -1101,6 +1165,11 @@ function renderLoop(data) {
   renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, gateOn('treasure-on', data.treasureEnabled), data.running);
   renderGate('cargo-state', data.lastCargoAt, data.cargoEveryMs, gateOn('cargo-on', data.cargoEnabled), data.running);
   renderGate('trade-state', data.lastTradeAt, data.tradeEveryMs, gateOn('trade-on', data.tradeEnabled), data.running);
+  renderGate('guild-ship-state', data.lastGuildShipAt, data.guildShipEveryMs, gateOn('guild-ship-on', data.guildShipEnabled), data.running);
+  if (data.running && typeof data.guildShipSeek === 'boolean' && !loopDirty.has('guild-ship-seek')) {
+    $('guild-ship-seek').checked = data.guildShipSeek;
+  }
+  renderGate('guild-order-state', data.lastGuildOrderAt, data.guildOrderEveryMs, gateOn('guild-order-on', data.guildOrderEnabled), data.running);
   // 运行中把「用商会指针」回填（默认开），标脏的不动。
   if (data.running && typeof data.tradeAllowSpeed === 'boolean' && !loopDirty.has('trade-speed')) {
     $('trade-speed').checked = data.tradeAllowSpeed;
@@ -1181,9 +1250,16 @@ $('loop-start').onclick = async () => {
         cargo: $('cargo-on').checked,
         cargoEverySeconds: Number($('cargo-every').value || 0),
         // 海商王：默认开、60 秒一段、商会指针全用（免费道具）。
+        // 联盟商船：默认开、120 秒一段、允许应聘船长。
+        guildShip: $('guild-ship-on').checked,
+        guildShipEverySeconds: Number($('guild-ship-every').value || 0),
+        guildShipSeek: $('guild-ship-seek').checked,
         trade: $('trade-on').checked,
         tradeEverySeconds: Number($('trade-every').value || 0),
         tradeSpeed: $('trade-speed').checked,
+        // 联盟订单：默认开、600 秒看一眼（料是加工品，工厂一炉 30~300 分钟）。
+        guildOrder: $('guild-order-on').checked,
+        guildOrderEverySeconds: Number($('guild-order-every').value || 0),
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -1353,6 +1429,27 @@ $('trade-run').onclick = async () => {
     refreshLoop();
   } catch (error) {
     $('trade-state').textContent = error.message;
+  }
+};
+
+// 手动「立刻跑一段联盟商船」：补货 → 应聘船长，跟挂机里那套完全一样。
+$('guild-ship-run').onclick = async () => {
+  $('guild-ship-state').textContent = '执行中 ...';
+  try {
+    const data = await call('/api/guildship/run', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, allowSeek: $('guild-ship-seek').checked }),
+    });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : String.fromCharCode(10, 10) + '这一段没有要做的事（船位满 / 缺料 / 没有空舱 / 本期末开启）';
+    $('guild-ship-view').textContent = (data.text || '') + tail;
+    $('guild-ship-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  } catch (error) {
+    $('guild-ship-state').textContent = error.message;
   }
 };
 
@@ -2092,11 +2189,12 @@ function renderStats(data) {
   const floater = of('floater');
   const mail = of('mail');
   kpi.appendChild(kpiItem('制造件数', fmt(data.kpi.made), data.kpi.madeKinds + ' 种产品'));
-  kpi.appendChild(kpiItem('收成品', fmt(made ? made.count : 0) + ' 次', '工厂逐座收取'));
+  // 「收了几次」用请求数（activity 里的 gain），「成功几次」用回包数：两者差出来的就是被服务端拒掉的。
+  const gainAct = (data.activity || []).find((act) => act.key === 'gain');
+  kpi.appendChild(kpiItem('收成品', fmt(gainAct ? gainAct.count : 0) + ' 次', '成功 ' + fmt(made ? made.count : 0) + ' 次'));
   kpi.appendChild(kpiItem('建筑产出', fmt(data.kpi.produced), (building ? building.items.length : 0) + ' 种'));
   kpi.appendChild(kpiItem('拾荒', fmt(data.kpi.looted), floater ? floater.items.length + ' 种' : ''));
-  // 邮件是"当前快照反推"的，只有今天这一份说得通；看历史日期时这条不显示，免得写成 0。
-  if (data.isToday) kpi.appendChild(kpiItem('邮件奖励', fmt(data.kpi.mails) + ' 封', '含货轮/情报/海盗'));
+  kpi.appendChild(kpiItem('邮件奖励', fmt(data.kpi.mails) + ' 封', '含货轮/情报/海盗'));
   kpi.appendChild(kpiItem('活动', fmt(data.kpi.acts) + ' 次', '挂机请求条数'));
 
   $('stats-made-title').textContent = data.isToday ? '今日制造' : data.day + ' 制造';
@@ -2105,7 +2203,7 @@ function renderStats(data) {
 
   // 其他收益：每类一行图标格 —— 拾荒品种多但每样就几个，用表格反而占满一屏。
   const other = clear($('stats-other'));
-  for (const source of data.sources.filter((entry) => ['floater', 'order', 'afk', 'mail'].includes(entry.key))) {
+  for (const source of data.sources.filter((entry) => ['floater', 'order', 'afk', 'ship', 'mail'].includes(entry.key))) {
     if (!source.items.length) continue;
     const group = el('div', 'mat-group');
     group.appendChild(el('div', 'gname', source.label + ' · ' + source.count + ' 笔 · ' + fmt(source.total) + ' 件'));
@@ -2150,11 +2248,16 @@ function renderStats(data) {
 }
 
 async function refreshStats() {
+  // 第一次打开某一天要把它一整天的邮件快照扫一遍（实测 74MB 约 1 秒），
+  // 不提示一下会以为按钮没反应。
+  $('stats-stamp').textContent = '读取中…';
   try {
     const query = statsDay ? '?day=' + encodeURIComponent(statsDay) : '';
     const data = await call('/api/stats' + query);
     renderStats(data);
-    $('stats-hint').textContent = data.isToday ? '' : '看的是历史（' + data.day + '），邮件那栏只有今天才有';
+    // 看"今天"时服务端可能已经跨到新的一天，把日期框同步过来，免得页面上写着昨天。
+    if (!statsDay && $('stats-day').value !== data.day) $('stats-day').value = data.day;
+    $('stats-hint').textContent = data.isToday ? '' : '看的是历史（' + data.day + '）';
     $('stats-stamp').textContent = '数据截至 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
   } catch (error) {
     $('stats-hint').textContent = error.message;

@@ -11,7 +11,7 @@ import { getConfig } from './config.mjs';
 import { planHeroes, runHeroPlan, formatHeroPlan } from './heroes.mjs';
 import { surveyDailies, runDailies, formatSurvey, planChests, planDailyGift } from './dailies.mjs';
 import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
-import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow } from './world.mjs';
+import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, planFieldOccupy, planFieldGiveUp, summarizeFloaters, formatFloaters, SPEED_UP_ITEM, makeTypeResolver as resolveBuildingType, upgradeRow, assetCount } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyPirates, viewPirates, planPirates, formatPiratePlan } from './pirate.mjs';
@@ -38,6 +38,15 @@ import {
   summarizeTrade,
   formatTradeGain,
 } from './tradeKing.mjs';
+import {
+  surveyGuildShip,
+  viewGuildShip,
+  planGuildShip,
+  formatGuildShipSummary,
+  summarizeGuildShip,
+  formatGuildShipGain,
+  bigNum,
+} from './guildShip.mjs';
 import {
   surveyCargo,
   fetchStock,
@@ -938,6 +947,80 @@ async function cargoCli({ allowMutate, dryRun }) {
 }
 
 // 海商王：只读探测 + 计划，「--run」才真执行（会改账号状态，需要 --yes）。
+// 联盟商船：只读探测 + 计划，「--yes」才真补货/应聘（会改账号状态）。
+async function guildShipCli({ allowMutate, dryRun, allowSeek = true }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  try {
+    const response = await client.connect(login);
+    const role = describeRole(response.playerInfo);
+    console.log(`login ok: ${role?.nickname} lv${role?.level}`);
+    const config = getConfig();
+    const [itemBody, heroBody] = await Promise.all([
+      client.request('AllItemRequest', {}, 'AllItemResponse', 12_000).catch(() => null),
+      client.request('AllHeroRequest', {}, 'AllHeroResponse', 12_000).catch(() => null),
+    ]);
+    const stock = new Map();
+    for (const it of itemBody?.items ?? []) stock.set(String(it.itemId ?? it.id), assetCount(it.num ?? it.count));
+    const heroes = new Map();
+    for (const hero of heroBody?.heroes ?? []) {
+      const id = String(hero.heroId ?? hero.name ?? hero.id ?? '');
+      if (id) heroes.set(id, { star: Number(hero.star) || 0, exStar: Number(hero.exclusive?.star) || 0 });
+    }
+    const survey = await surveyGuildShip(client, protocol);
+    const view = viewGuildShip(survey, {
+      config,
+      stock,
+      heroes,
+      playerId: bigNum(response.playerInfo?.playerId),
+    });
+    console.log(`\n${formatGuildShipSummary(view)}`);
+    console.log(`  我的船位 ${view.myShips.length}/${view.maxShips}，剩 ${view.slotsLeft} 个`);
+    for (const ship of view.ships) {
+      console.log(`  #${String(ship.shipId).padStart(3)} ${ship.qualityName}(${ship.type}) ${ship.cabinTotal}舱`
+        + ` ${ship.stateName} 已补 ${ship.filledCount}/${ship.cabinTotal} 空 ${ship.emptyCount}`
+        + ` 船长 ${ship.leaderName || '无'}${ship.mineLeader ? '(我)' : ''}`
+        + `${ship.myCabinId !== null ? ` 我舱${ship.myCabinId}` : ''}`
+        + ` 剩 ${Math.ceil(ship.leftSeconds / 60)} 分 奖励 ${ship.rewardScore} 分`);
+      for (const cabin of ship.fillable) {
+        console.log(`      可补 舱${cabin.crewId}: ${cabin.needs.map((n) => `${n.id}×${n.num}`).join(' ')}`);
+      }
+      for (const cabin of ship.blocked) {
+        console.log(`      缺料 舱${cabin.crewId}: ${cabin.short.map((x) => `${x.id} ${x.have}/${x.need}`).join('、')}`);
+      }
+      if (!ship.leaderId) console.log(`      应聘: ${ship.seekCheck.ok ? '可以' : ship.seekCheck.why}`);
+    }
+    const plan = planGuildShip(view, { config, allowSeek });
+    console.log(`\n计划 ${plan.actions.length} 条`);
+    for (const action of plan.actions) console.log(`  ${action.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+
+    if (dryRun) {
+      console.log('\n--dry：只列计划，未执行');
+      return;
+    }
+    if (plan.actions.length === 0) return;
+
+    console.log('\n执行:');
+    const { results } = await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 1200,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+    const gain = formatGuildShipGain(summarizeGuildShip(results));
+    if (gain) console.log(`\n${gain}`);
+  } finally {
+    client.stop();
+  }
+}
+
 async function tradeCli({ allowMutate, dryRun, allowSpeed = true }) {
   const { url, login } = loadCredentials();
   const protocol = loadProtocol();
@@ -1181,8 +1264,9 @@ async function loopCli({
   // 贸易港口（建筑「货轮港口」）：3 艘货船逐格交货换 EXP/金币，返航后领藏品奖励。
   cargoEnabled = true,
   cargoEverySeconds = 60,
-  // 海商王（每天 10~22 点的港口贸易）：在港就卖、买本港特产、开去「把这件货当紧缺」的港口。
-  tradeEnabled = true,
+  // 海商王（每天 10~22 点的港口贸易）：**活动 2026-10-28 已下线**，loop 里那一段也整段注释了。
+  // 默认关；活动重开时把它改回 true（或 CLI 加 --trade），并把 loop.mjs 里那段解注释。
+  tradeEnabled = false,
   tradeEverySeconds = 60,
   treasureEnabled = true,
   treasureEverySeconds = 60,
@@ -1217,7 +1301,7 @@ async function loopCli({
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     console.log(`贸易港口=${cargoEnabled ? (cargoEverySeconds > 0 ? `开(每 ${cargoEverySeconds}s 看一眼：逐格交货换经验金币 + 返航领奖)` : '开(每轮都看)') : '关'}`);
-    console.log(`海商王=${tradeEnabled ? (tradeEverySeconds > 0 ? `开(每 ${tradeEverySeconds}s 跑一段：卖→买特产→起航，指针全用)` : '开(每轮都跑)') : '关'}`);
+    console.log(`海商王=${tradeEnabled ? (tradeEverySeconds > 0 ? `开(每 ${tradeEverySeconds}s 跑一段：卖→买特产→起航，指针全用)` : '开(每轮都跑)') : '关(活动已下线)'}`);
     await runLoop(client, protocol, {
       config,
       player,
@@ -1486,9 +1570,13 @@ async function main() {
       // 贸易港口：--no-cargo 关，--cargo-every 秒（默认 60）。
       cargoEnabled: !process.argv.includes('--no-cargo'),
       cargoEverySeconds: at('--cargo-every', 60),
-      // 海商王：--no-trade 关，--trade-every 秒（默认 60）。
-      tradeEnabled: !process.argv.includes('--no-trade'),
+      // 海商王：活动已下线（2026-10-28），默认关；要开得显式加 --trade。
+      tradeEnabled: process.argv.includes('--trade'),
       tradeEverySeconds: at('--trade-every', 60),
+      // 联盟商船：--no-guildship 关，--guildship-every 秒（默认 120），--no-seek 不当船长。
+      guildShipEnabled: !process.argv.includes('--no-guildship'),
+      guildShipEverySeconds: at('--guildship-every', 120),
+      guildShipSeek: !process.argv.includes('--no-seek'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -1600,6 +1688,15 @@ async function main() {
     await cargoCli({
       dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+    });
+    return;
+  }
+
+  if (mode === 'guildship') {
+    await guildShipCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      allowSeek: !process.argv.includes('--no-seek'),
     });
     return;
   }
