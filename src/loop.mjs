@@ -25,6 +25,19 @@ import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
 import { surveyCargo, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, cargoDemandOf } from './tradePort.mjs';
 import { surveyGuildOrder, viewGuildOrder, planGuildOrder, formatGuildOrderSummary } from './guildOrder.mjs';
 import {
+  surveyCityWar,
+  viewCityWar,
+  planCityWar,
+  formatCityWarSummary,
+  formatCityWarGain,
+  nextWarStartAt,
+  DEFAULT_CW_PREP_LEAD_SEC,
+  DEFAULT_CW_REPAIR_BELOW,
+  DEFAULT_CW_MIN_POWER_RATIO,
+  DEFAULT_CW_PETROL_RESERVE,
+  DEFAULT_CW_MAX_FLEETS_PER_CITY,
+} from './cityWar.mjs';
+import {
   surveyGuildShip,
   viewGuildShip,
   planGuildShip,
@@ -33,6 +46,16 @@ import {
   formatGuildShipGain,
   bigNum,
 } from './guildShip.mjs';
+import {
+  surveyYoudu,
+  viewYoudu,
+  planYoudu,
+  runYouduSigns,
+  settleYouduEdict,
+  formatYouduSummary,
+  summarizeYoudu,
+  formatYouduGain,
+} from './youdu.mjs';
 // ⚠ 海商王（活动 Trade）2026-10-28 已下线：第 10 段整段注释，下面这几个导入暂时用不到，
 // 但**故意保留** —— 活动重开时解注释那一段就能直接跑，不用回来补 import（ESM 允许未使用的导入）。
 import {
@@ -221,6 +244,32 @@ export async function runLoop(initialClient, protocol, {
   guildShipEnabled = true,
   guildShipEveryMs = 120_000,
   guildShipSeek = true,
+  // 国战（联盟攻城）：每天 20:00–21:00。这一段的动作只有「派兵」和「修船」——
+  // 舰队进城就自动驻守、战期内由服务端排进战斗点，不需要脚本在战期里反复派兵（10/28 实盘验证）。
+  // 不宣战（脚本账号是普通成员，且取消宣战要 200 钻石），只跟随联盟已经宣好的城。
+  // 平时整段静默：不在「战前 10 分钟 ~ 战期结束」之间就直接睡到下一场布署点。
+  cityWarEnabled = true,
+  cityWarEveryMs = 180_000,
+  cityWarRepair = true,
+  // 战前提前多少秒开始布署（默认 600 = 10 分钟，够修一次満耐久）。
+  cityWarPrepLeadSec = DEFAULT_CW_PREP_LEAD_SEC,
+  // 耐久低于这个比例就修（0.8 = 1600/2000，配置表 TipsDescCfg 的衰减线）。
+  cityWarRepairBelow = DEFAULT_CW_REPAIR_BELOW,
+  // 派兵的最低战力比：0 = 不拦（进城就能拿战斗点，打不过也有功勋）。
+  cityWarMinPowerRatio = DEFAULT_CW_MIN_POWER_RATIO,
+  // 派兵后至少留这么多汽油。
+  cityWarPetrolReserve = DEFAULT_CW_PETROL_RESERVE,
+  // 每座城最多派几艘。
+  cityWarMaxFleetsPerCity = DEFAULT_CW_MAX_FLEETS_PER_CITY,
+  // 酆都诡事（捞尸人联动）：只剩 4 个免费板块要做 —— 灭基地邪祟 + 领累计奖、转龙王罗盘 + 领积分奖、
+  // 酆都法旨（服务端把答案放在 session.rune 里，0 显化直接提交 → 耐心满值拿最高档）、签到 + 每日活跃奖。
+  // 付费板块（累充 / 每日特惠 / 礼遇战令 / 满减商店）一个请求都不会发。
+  // 节奏 5 分钟：邪祟每 3 分钟刷 1 个（上限 6），罗盘券和贡品都是签到/日常给的，半天才凑够一张。
+  youduEnabled = true,
+  youduEveryMs = 300_000,
+  // 关掉就只灭邪祟/签到，不动罗盘和法旨（保守模式）。
+  youduSpin = true,
+  youduEdict = true,
   // 用商会指针加速航程（免费道具）。关掉就是老老实实等 2 小时一趟。
   tradeAllowSpeed = true,
   // 领海商王战令的免费奖励（BattlePassGotRewardRequest type=3，只会发免费档）。
@@ -259,7 +308,7 @@ export async function runLoop(initialClient, protocol, {
   // 下面十几处 `client.request(...)` 自动就跟上新的，不用逐个改。
   let client = initialClient;
   let linkError = '';
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set(), guildOrder: new Set(), guildShip: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set(), guildOrder: new Set(), guildShip: new Set(), cityWar: new Set(), youdu: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -279,11 +328,23 @@ export async function runLoop(initialClient, protocol, {
   let guildShipSkipNoticedAt = 0;
   let gsHeroes = null;
   let gsHeroesAt = 0;
+  // 国战：上次探测时间 + 静默窗（不在布署窗/战中就睡到下一场开战前）。
+  // 静默窗可以长达一整天，所以只在「设窗/换窗」那一轮报一次，不按 30 分钟重复刷屏。
+  let lastCityWarAt = 0;
+  let cityWarSkipUntil = 0;
+  let cityWarSkipReason = '';
+  // 酆都诡事：上次探测时间。活动没开（服务端回 ACTIVE_END/74）也照常计时，
+  // 否则每轮都要多打 3 个必败请求。
+  let lastYouduAt = 0;
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
   // 海盗讨伐同理：探测（海盗列表 + 舰队 + 击杀记录）成功就计时。
   let lastPirateAt = 0;
+  // 免战扫荡被服务端拒过（`PromptResponse = sweep times not enough`，已实测）就到今天结束为止不再扫：
+  // 次数是服务端管的，我们的「上限 = 配置 10 + VIP」可能比真实上限低，被拒一次说明已经到顶，
+  // 每 60 秒再试一次只会把日志刷成同一句失败。
+  let sweepBlockedUntil = 0;
   // 锻造同理：探测是一整套「读装备厂 → 收取 → 排产」，探测成功就计时。
   let lastForgeAt = 0;
   // 培育同理：探测成功就计时（哪怕这一轮没有空位、也没有成熟的）。
@@ -396,7 +457,7 @@ export async function runLoop(initialClient, protocol, {
       tasks: part(), dailies: part(), world: { ...part(), population: '-', floaterLoot: null },
       idle: part(), treasure: part(), radar: part(), pirate: part(), forge: part(), pet: part(), cargo: part(),
       trade: part(),
-      guildOrder: part(), guildShip: part(),
+      guildOrder: part(), guildShip: part(), cityWar: part(), youdu: part(),
     };
 
     // 一轮的统一收尾：补耗时 → 进历史 → 交给页面/日志。
@@ -749,10 +810,17 @@ export async function runLoop(initialClient, protocol, {
           // 但耐久 <80% 会降输出、挨打更疼，输了白烧 300 汽油。
           duraFloor: repairBelowNow,
         });
-        const piratePlan = planPirates(pirateView, { maxPerRound: pirateCapNow });
+        const piratePlan = planPirates(pirateView, {
+          maxPerRound: pirateCapNow,
+          // 被拒过就今天不扫（真出战照常）。
+          sweep: sweepBlockedUntil <= tickAt,
+        });
         summary.pirate.planned = piratePlan.actions.length;
         summary.pirate.notes = piratePlan.notes;
         summary.pirate.summary = formatPirateSummary(pirateView);
+        if (sweepBlockedUntil > tickAt) {
+          summary.pirate.notes = [...(summary.pirate.notes ?? []), '免战扫荡今天已被服务端拒绝过，不再尝试（明天 0 点重置）'];
+        }
         if (piratePlan.actions.length > 0) {
           const { results, rejected: stillRejected } = await runWorld(client, protocol, piratePlan, {
             allowMutate,
@@ -762,6 +830,16 @@ export async function runLoop(initialClient, protocol, {
           });
           rejected.pirate = stillRejected;
           summary.pirate.results = results;
+          // 扫荡被拒 → 到明天 0 点前不再扫。失败原因通常是 `sweep times not enough`
+          //（服务端上限比我们算的高/低都会走到这里），此时已经到顶，继续试没有意义。
+          const sweepFail = results.find((entry) => entry.step?.kind === 'pirateSweep' && !entry.ok && !entry.skipped);
+          if (sweepFail) {
+            const nextDay = new Date(tickAt);
+            nextDay.setHours(24, 0, 0, 0); // 明天 0 点（本地时间，服务端按自然日重置）
+            sweepBlockedUntil = nextDay.getTime();
+            summary.pirate.notes = [...(summary.pirate.notes ?? []),
+              `免战扫荡被拒（${sweepFail.error}），今天不再扫`];
+          }
         }
         // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
         lastPirateAt = tickAt;
@@ -1139,6 +1217,153 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
+    // 13. 国战（联盟攻城）：每天 20:00–21:00 一场，联盟宣战最多 3 座城。
+    //     **这一段只做「派兵 + 修船」两件事**，不写任何战斗逻辑：
+    //     舰队进城后自动驻守，战期内由服务端排进战斗点（10/28 实盘：派一次就够，
+    //     21:48 复查船仍 IDLE 驻在城 73，联盟 3 城全占）。
+    //     ⛔ 不宣战/不取消宣战（取消要 200 钻石）/不募兵 —— 只跟随联盟已宣的城。
+    //     平时整段静默：不在「战前 10 分钟 ~ 战期结束」之间就睡到下一场布署点，
+    //     所以白天不会每小时多打几条请求。
+    const cityWarOn = pickAt(conf, 'cityWarEnabled', cityWarEnabled);
+    const cityWarEvery = pickAt(conf, 'cityWarEveryMs', cityWarEveryMs);
+    const cityWarRepairOn = pickAt(conf, 'cityWarRepair', cityWarRepair) === true;
+    const cityWarPrepLead = Math.max(60, Number(pickAt(conf, 'cityWarPrepLeadSec', cityWarPrepLeadSec)) || DEFAULT_CW_PREP_LEAD_SEC);
+    // ⚠ 局部名不能和同名参数一样：`const cityWarRepairBelow = ... pickAt(conf, '…', cityWarRepairBelow)`
+    // 右边引用的是自己 → TDZ「Cannot access before initialization」→ 整轮 loop 直接抛错。
+    const cwRepairBelow = Number(pickAt(conf, 'cityWarRepairBelow', cityWarRepairBelow)) || DEFAULT_CW_REPAIR_BELOW;
+    const cityWarMinRatio = Number(pickAt(conf, 'cityWarMinPowerRatio', cityWarMinPowerRatio)) || 0;
+    const cityWarReserve = Number(pickAt(conf, 'cityWarPetrolReserve', cityWarPetrolReserve)) || 0;
+    const cityWarPerCity = Math.max(1, Number(pickAt(conf, 'cityWarMaxFleetsPerCity', cityWarMaxFleetsPerCity)) || DEFAULT_CW_MAX_FLEETS_PER_CITY);
+    const cityWarSkipping = cityWarOn && cityWarSkipUntil > tickAt;
+    const cityWarDue = cityWarOn && !cityWarSkipping && gateDue(lastCityWarAt, cityWarEvery, tickAt);
+    // 静默窗可长达一整天（白天 → 次日 19:50），只在「设窗/换窗」那一轮报一次。
+    let cityWarSkipNotice = false;
+    if (halted()) break;
+    if (cityWarDue) {
+      try {
+        const cwSurvey = await linkRetry(() => surveyCityWar(client, protocol, {
+          config,
+          // 复用海面那一段的库存表（物品 + 资源），零额外请求。
+          stock: worldSurvey?.stock ?? null,
+          player,
+          prepLead: cityWarPrepLead,
+          repairBelow: cwRepairBelow,
+          now: tickAt,
+        }));
+        const cwView = viewCityWar(cwSurvey, { config, player, now: tickAt });
+        const cwPlan = planCityWar(cwView, {
+          repair: cityWarRepairOn,
+          minPowerRatio: cityWarMinRatio,
+          petrolReserve: cityWarReserve,
+          maxFleetsPerCity: cityWarPerCity,
+        });
+        summary.cityWar.planned = cwPlan.actions.length;
+        summary.cityWar.notes = cwPlan.notes;
+        summary.cityWar.summary = formatCityWarSummary(cwView);
+        if (cwPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, cwPlan, {
+            allowMutate,
+            rejected: rejected.cityWar,
+            // 派兵/修船都没有配套 Response，靠 sendWatch 等 PromptResponse。1.5 秒足够。
+            window: 1500,
+            onStep: (entry) => onStep?.({ round, phase: 'cityWar', ...entry }),
+          });
+          rejected.cityWar = stillRejected;
+          summary.cityWar.results = results;
+          summary.cityWar.gain = formatCityWarGain(results);
+        }
+        // 静默窗：算下一次该醒的时刻。
+        //   waiting/done → 睡到下一场「开战前 N 分钟」；战期是按天固定的，所以直接按整日推。
+        //   unknown      → 服务端没给战期（没宣战 / 还没到 0 点推送），每小时探一次。
+        //   战中被拒     → 退避 5 分钟，别每 3 分钟拿同一条必败请求撞墙。
+        const failedNow = (summary.cityWar.results ?? []).filter((entry) => entry.ok === false && !entry.skipped).length;
+        const nextSkip = (() => {
+          if (cwView.phase === 'waiting' || cwView.phase === 'done') {
+            const nextStart = nextWarStartAt(cwSurvey.rawStart, cwSurvey.rawEnd, Math.floor(tickAt / 1000));
+            if (nextStart > 0) {
+              const at = nextStart * 1000 - cityWarPrepLead * 1000;
+              return { until: Math.max(tickAt + 60_000, at), why: `未到布署时间（下一场 ${new Date(nextStart * 1000).toLocaleString('zh-CN', { hour12: false })} 开战，提前 ${Math.round(cityWarPrepLead / 60)} 分钟布署）` };
+            }
+            return { until: tickAt + 3_600_000, why: '服务端没给战期（每小时探一次）' };
+          }
+          if (cwView.phase === 'unknown') {
+            return { until: tickAt + 3_600_000, why: '服务端没给战期（每小时探一次）' };
+          }
+          if (failedNow > 0) {
+            return { until: tickAt + 5 * 60_000, why: '派兵/修船被拒，5 分钟后再试' };
+          }
+          return { until: 0, why: '' };
+        })();
+        // 「换窗」也算新消息（白天一次，次日 19:50 一次），两种情况都要印一行。
+        cityWarSkipNotice = nextSkip.until > 0 && Math.abs(nextSkip.until - cityWarSkipUntil) > 60_000;
+        cityWarSkipUntil = nextSkip.until;
+        cityWarSkipReason = nextSkip.why;
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastCityWarAt = tickAt;
+      } catch (error) {
+        summary.cityWar.notes = [`国战探测失败：${error.message}`];
+      }
+    }
+
+    // 14. 酆都诡事（《疯狂水世界》×《捞尸人》联动）：只做 4 个免费板块 ——
+    //     ① 驱邪除祟：基地里的邪祟，一个请求杀一只，杀完领累计里程碑奖（15 档，打满 75 只）
+    //     ② 龙王罗盘：花「抽奖券」转盘，抽完领累计积分档位奖
+    //     ③ 酆都法旨：花「入场券」开一局；**服务端把答案放在 session.rune 里**（客户端用它渲染
+    //        符纸图案，shown 只是遮罩掩码），所以 0 显化直接提交 → 耐心留满 100 → 最高档奖励。
+    //        显化一次扣 5 耐心、猜错扣 10，自动化里一次都不该显化。
+    //     ④ 签到（14 天）+ 每日活跃度里程碑：签到靠回包推进（already checked in / not time yet），
+    //        不能塞进静态计划，所以单独走 runYouduSigns。
+    //     ⛔ 付费板块（每日累充 / 每日特惠 / 酆都礼遇战令 / 满减商店结账）一个请求都不发。
+    //     节奏 5 分钟：邪祟每 3 分钟刷 1 个（同时最多 6 个），券和入场券半天才凑够一张。
+    const youduOn = pickAt(conf, 'youduEnabled', youduEnabled);
+    const youduEvery = pickAt(conf, 'youduEveryMs', youduEveryMs);
+    const youduSpinNow = pickAt(conf, 'youduSpin', youduSpin) === true;
+    const youduEdictNow = pickAt(conf, 'youduEdict', youduEdict) === true;
+    const youduDue = youduOn && gateDue(lastYouduAt, youduEvery, tickAt);
+    if (halted()) break;
+    if (youduDue) {
+      try {
+        const ydSurvey = await linkRetry(() => surveyYoudu(client, { config }));
+        const ydView = viewYoudu(ydSurvey, { config });
+        const ydPlan = planYoudu(ydView, { config, spin: youduSpinNow, edict: youduEdictNow });
+        summary.youdu.planned = ydPlan.actions.length;
+        summary.youdu.notes = ydPlan.notes;
+        summary.youdu.summary = formatYouduSummary(ydView);
+        if (ydPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runWorld(client, protocol, ydPlan, {
+            allowMutate,
+            rejected: rejected.youdu,
+            window: 1000,
+            onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
+          });
+          rejected.youdu = stillRejected;
+          summary.youdu.results = results;
+          // 法旨：开局回包里就带答案，当轮直接交，不用白等一个间隔。
+          const edictFix = await settleYouduEdict(client, results, {
+            allowMutate,
+            onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
+          });
+          if (edictFix.results.length > 0) summary.youdu.results = [...results, ...edictFix.results];
+          if (edictFix.notes.length > 0) summary.youdu.notes = [...(summary.youdu.notes ?? []), ...edictFix.notes];
+          summary.youdu.gain = formatYouduGain(summarizeYoudu(summary.youdu.results));
+        }
+        // 签到单独走：它得看回包决定「继续下一天 / 今天到此为止」。
+        if (ydView.open) {
+          const signs = await runYouduSigns(client, {
+            config,
+            onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
+          });
+          summary.youdu.results = [...(summary.youdu.results ?? []), ...signs.results];
+          if (signs.notes.length > 0) summary.youdu.notes = [...(summary.youdu.notes ?? []), ...signs.notes];
+          summary.youdu.gain = formatYouduGain(summarizeYoudu(summary.youdu.results));
+        }
+        // 探测成功（含「活动没开」）都算用掉这一格时间；网络异常不记时，下一轮立刻重试。
+        lastYouduAt = tickAt;
+      } catch (error) {
+        summary.youdu.notes = [`酆都诡事探测失败：${error.message}`];
+      }
+    }
+
     // 计时以「本轮开始时刻」为准：动作已经排进计划，就算执行过，失败也不立刻重试
     // （下一轮照样被 rejected 或间隔挡住），避免失败时高频撞服务端。
     if (pickDue && worldPlan?.actions.some((action) => action.kind === 'pickUpFloater')) lastPickAt = tickAt;
@@ -1220,6 +1445,21 @@ export async function runLoop(initialClient, protocol, {
         // 静默窗可以很长（一场 9 小时的超凡船），但只在设窗那轮报一次，之后每 30 分钟提醒。
         skipNotice: guildShipSkipping && tickAt - guildShipSkipNoticedAt >= SKIP_NOTICE_MS,
       },
+      cityWar: {
+        ...gateSummary(cityWarOn, cityWarEvery, lastCityWarAt, tickAt),
+        throttled: cityWarOn && !cityWarDue && !cityWarSkipping,
+        // 「战斗还没开始/已经打完，睡到下一场布署点」跟「间隔未到」是两回事，页面上要分得清。
+        skipped: cityWarSkipping,
+        skipReason: cityWarSkipping ? cityWarSkipReason : '',
+        skipForever: false,
+        skipLeftSeconds: cityWarSkipping ? Math.max(0, Math.ceil((cityWarSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: cityWarSkipping ? Math.floor(cityWarSkipUntil / 1000) : null,
+        skipNotice: cityWarSkipNotice,
+      },
+      youdu: {
+        ...gateSummary(youduOn, youduEvery, lastYouduAt, tickAt),
+        throttled: youduOn && !youduDue,
+      },
     };
 
     // 本轮耗时：页面上直接能看到「一轮 12 秒」，据此判断间隔是否够用。
@@ -1246,6 +1486,7 @@ const KIND_TEXT = {
   radarDispatch: '派舰队',
   radarRepair: '维修舰队',
   pirateChallenge: '讨伐海盗',
+  pirateSweep: '免战扫荡',
   treasureDispatch: '抢货轮',
   equipPick: '收装备',
   equipMake: '锻造',
@@ -1266,6 +1507,8 @@ const KIND_TEXT = {
   guildOrder: '交联盟订单',
   guildShipOrder: '商船补货',
   guildShipSeek: '应聘船长',
+  cityWarMove: '国战派兵',
+  cityWarRepair: '国战修船',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -1452,6 +1695,21 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.guildShip),
         ...(summary.guildShip.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 国战：探测过就印一行（「还没到布署时间」「无需派兵」也要印，
+    // 否则白天整天看不到这一段，会以为开关没生效）。
+    ...(summary.cityWar && (summary.cityWar.summary || (summary.cityWar.notes ?? []).length > 0)
+      ? [`${line('国战', summary.cityWar)}${summary.cityWar.summary ? `  ${summary.cityWar.summary}` : ''}`
+          + (summary.cityWar.gain ? `  ${summary.cityWar.gain}` : ''),
+        ...detailLines(summary.cityWar),
+        ...(summary.cityWar.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
+    // 酆都诡事：探测过就印一行（「没邪祟」「券不够」也要印，否则看不出这一段有没有生效）。
+    ...(summary.youdu && (summary.youdu.summary || (summary.youdu.notes ?? []).length > 0)
+      ? [`${line('酆都诡事', summary.youdu)}${summary.youdu.summary ? `  ${summary.youdu.summary}` : ''}`
+          + (summary.youdu.gain ? `  ${summary.youdu.gain}` : ''),
+        ...detailLines(summary.youdu),
+        ...(summary.youdu.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     ...[gateLine('货轮', summary.gates?.treasure)].filter(Boolean),
     ...[gateLine('情报', summary.gates?.radar)].filter(Boolean),
     ...[gateLine('海盗', summary.gates?.pirate)].filter(Boolean),
@@ -1461,6 +1719,8 @@ export function formatLoopRound(summary) {
     ...[gateLine('海商王', summary.gates?.trade)].filter(Boolean),
     ...[gateLine('联盟订单', summary.gates?.guildOrder)].filter(Boolean),
     ...[gateLine('联盟商船', summary.gates?.guildShip)].filter(Boolean),
+    ...[gateLine('国战', summary.gates?.cityWar)].filter(Boolean),
+    ...[gateLine('酆都诡事', summary.gates?.youdu)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),
     ...[gateLine('拾荒', summary.gates?.pick)].filter(Boolean),
     ...[gateLine('农田', summary.gates?.farm)].filter(Boolean),

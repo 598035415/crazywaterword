@@ -48,6 +48,26 @@ import {
   bigNum,
 } from './guildShip.mjs';
 import {
+  surveyCityWar,
+  viewCityWar,
+  planCityWar,
+  formatCityWarSummary,
+  formatCityWarGain,
+  cityWarBlockedReason,
+  cityNameOf,
+  CW_STATE_TEXT,
+  CW_TITLE_TEXT,
+} from './cityWar.mjs';
+import {
+  surveyYoudu,
+  viewYoudu,
+  planYoudu,
+  runYouduSigns,
+  formatYouduSummary,
+  summarizeYoudu,
+  formatYouduGain,
+} from './youdu.mjs';
+import {
   surveyCargo,
   fetchStock,
   viewCargo,
@@ -1021,8 +1041,123 @@ async function guildShipCli({ allowMutate, dryRun, allowSeek = true }) {
   }
 }
 
-async function tradeCli({ allowMutate, dryRun, allowSpeed = true }) {
+async function cityWarCli({ allowMutate, dryRun, force = false, repair = true }) {
   const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  try {
+    const response = await client.connect(login);
+    const role = describeRole(response.playerInfo);
+    console.log(`login ok: ${role?.nickname} lv${role?.level}`);
+    const config = getConfig();
+    const stock = await fetchStock(client, protocol);
+    const survey = await surveyCityWar(client, protocol, { config, stock, player: response.playerInfo });
+    const view = viewCityWar(survey, { config, player: response.playerInfo });
+    // --force：非布署窗也照派（试跑用）。只改时间判断，汽油/名额/委任的闸照旧。
+    const plan = planCityWar(force ? { ...view, phase: 'prep' } : view, { repair });
+    console.log(`\n${formatCityWarSummary(view)}`);
+    console.log(`  我的联盟下标 idx=${view.myIdx}  职位=${CW_TITLE_TEXT[view.myTitle] ?? view.myTitle}`
+      + `${view.canDeclare ? '（有宣战权）' : '（不能宣战，只跟随联盟已宣的城）'}`);
+    console.log(`  出生城 ${view.bornCity ? `${view.bornCity.name}(${view.bornCity.cityId})` : '未配置'}（派兵汽油按这里算）`);
+    if (view.assembleCityId) console.log(`  集结城 ${view.assembleCityName}(${view.assembleCityId})`);
+    if (view.targets.length === 0) console.log('  联盟今天没有宣战城市');
+    for (const target of view.targets) {
+      console.log(`  目标 ${target.name}(${target.cityId}) ${target.kind === 'defend' ? '守城' : '攻城'}`
+        + `  守军 ${target.defenceKnown ? `${target.defenceCount} 支（兵力 x${target.defenceUnits}）/ 战力 ${target.defencePower}` : '未知（不在布署窗，没查守军）'}`
+        + `  单程约 ${target.petrolCost == null ? '?' : target.petrolCost} 汽油`);
+    }
+    for (const fleet of view.fleets) {
+      console.log(`  舰队 ${fleet.buildingId} ${CW_STATE_TEXT[fleet.state] ?? `状态${fleet.state}`}`
+        + `  在 ${fleet.cityId ? cityNameOf(config, fleet.cityId) : '—'}  耐久 ${fleet.durability}/${fleet.maxDurability}`
+        + `  战力 ${fleet.power}${fleet.autoFight ? '  委任中' : ''}${fleet.needsRepair ? '  该修' : ''}`);
+    }
+    console.log(`\n计划 ${plan.actions.length} 条`);
+    for (const action of plan.actions) console.log(`  ${action.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+    const blocked = cityWarBlockedReason(view);
+    if (blocked) console.log(`  未到时间：${blocked}`);
+
+    if (dryRun) {
+      console.log('\n--dry：只列计划，未执行');
+      return;
+    }
+    if (plan.actions.length === 0) return;
+
+    console.log('\n执行:');
+    const { results } = await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 1500,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+    const gain = formatCityWarGain(results);
+    if (gain) console.log(`\n${gain}`);
+  } finally {
+    client.stop();
+  }
+}
+
+// 酆都诡事（捞尸人联动）：免费 4 块 —— 驱邪除祟 / 龙王罗盘 / 酆都法旨 / 签到+活跃。
+// 付费板块（累充、每日特惠、礼遇战令、满减商店结账）一律不碰。
+async function youduCli({ allowMutate, dryRun, spin = true, edict = true }) {
+  const { url, login } = loadCredentials();
+  const protocol = loadProtocol();
+  const client = new GameClient({ url, protocol });
+  client.on('warn', (message) => console.log(`warn: ${message}`));
+  client.on('fatal', (info) => console.log(`fatal: ${JSON.stringify(info)}`));
+
+  try {
+    const response = await client.connect(login);
+    console.log(`login ok: ${describeRole(response.playerInfo)?.nickname} lv${describeRole(response.playerInfo)?.level}`);
+    const config = getConfig();
+    const survey = await surveyYoudu(client, { config });
+    const view = viewYoudu(survey, { config });
+    console.log(`\n${formatYouduSummary(view)}`);
+    if (view.open) {
+      console.log(`  邪祟 ${view.evil.alive}/${view.evil.maxAlive}（今日 ${view.evil.todayKill}，累计 ${view.evil.killTotal}，已领到累计 ${view.evil.claimed} 只的档）`);
+      console.log(`  罗盘 ${view.wheel.coinHeld} 券 → 可转 ${view.wheel.spins} 次，积分 ${view.wheel.score}，距龙纹 ${view.wheel.dragonIn} 抽`);
+      console.log(`  法旨 ${view.edict.session ? '有一局未交' : '空闲'}，${view.edict.ticketId} 持 ${view.edict.ticketHeld}（开一局 ${view.edict.ticketNum}）`);
+    }
+    // --no-spin / --no-edict 只做驱邪与签到的保守模式。
+    const plan = planYoudu(view, { config, spin, edict });
+    console.log(`\n计划 ${plan.actions.length} 条`);
+    for (const action of plan.actions) console.log(`  ${action.label}`);
+    for (const note of plan.notes) console.log(`  跳过 ${note}`);
+
+    if (dryRun) {
+      console.log('\n--dry：只列计划，未执行');
+      return;
+    }
+    if (plan.actions.length === 0) return;
+
+    console.log('\n执行:');
+    const { results } = await runWorld(client, protocol, plan, {
+      allowMutate,
+      window: 1200,
+      onStep: (entry) => {
+        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+      },
+    });
+    // 签到按回包决定进度，不能进静态计划（见 runYouduSigns 注释）。
+    const signs = await runYouduSigns(client, {
+      config,
+      onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
+    });
+    for (const note of signs.notes) console.log(`  · ${note}`);
+    const gain = formatYouduGain(summarizeYoudu([...results, ...signs.results]));
+    if (gain) console.log(`\n${gain}`);
+  } finally {
+    client.stop();
+  }
+}
+
+async function tradeCli({ allowMutate, dryRun, allowSpeed = true }) {  const { url, login } = loadCredentials();
   const protocol = loadProtocol();
   const client = new GameClient({ url, protocol });
   client.on('warn', (message) => console.log(`warn: ${message}`));
@@ -1272,6 +1407,20 @@ async function loopCli({
   treasureEverySeconds = 60,
   // 抢哪些货轮等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）；默认只抢万吨。
   treasureColors = DEFAULT_COLORS,
+  // 联盟商船：CLI 的 --no-guildship / --guildship-every / --no-seek 以前没接进来（参数被静默忽略），
+  // 这里补上，否则 README 写的开关是假的。
+  guildShipEnabled = true,
+  guildShipEverySeconds = 120,
+  guildShipSeek = true,
+  // 国战（联盟攻城）：只派兵 + 修船，平时整段静默。
+  cityWarEnabled = true,
+  cityWarEverySeconds = 180,
+  cityWarRepair = true,
+  // 酆都诡事（捞尸人联动，2026-10-29 ~ 11-11）：四个免费板块全做，付费板块一个请求都不发。
+  youduEnabled = true,
+  youduEverySeconds = 300,
+  youduSpin = true,
+  youduEdict = true,
   minPowerRatio = 1.2,
 }) {
   const { url, login } = loadCredentials();
@@ -1301,6 +1450,9 @@ async function loopCli({
     console.log(`挂机领取=${idleEnabled ? (idleEverySeconds > 0 ? `开(每 ${idleEverySeconds}s 看一眼：邮件/本段收益/等级奖励/升级)` : '开(每轮都看)') : '关'}`);
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     console.log(`贸易港口=${cargoEnabled ? (cargoEverySeconds > 0 ? `开(每 ${cargoEverySeconds}s 看一眼：逐格交货换经验金币 + 返航领奖)` : '开(每轮都看)') : '关'}`);
+    console.log(`联盟商船=${guildShipEnabled ? `开(每 ${guildShipEverySeconds}s 看一眼，${guildShipSeek ? '补货 + 应聘船长' : '只补货'})` : '关'}`);
+    console.log(`国战=${cityWarEnabled ? `开(战前 10 分钟布署，每 ${cityWarEverySeconds}s 看一眼${cityWarRepair ? ' + 耐久低自动修' : ''})` : '关'}`);
+    console.log(`酆都诡事=${youduEnabled ? (youduEverySeconds > 0 ? `开(每 ${youduEverySeconds}s 看一眼：灭邪祟 + 领累计奖${youduSpin ? ' + 转罗盘' : ''}${youduEdict ? ' + 开法旨' : ''} + 签到/活跃，付费板块不碰)` : `开(每轮都看：灭邪祟 + 领累计奖${youduSpin ? ' + 转罗盘' : ''}${youduEdict ? ' + 开法旨' : ''} + 签到/活跃，付费板块不碰)`) : '关'}`);
     console.log(`海商王=${tradeEnabled ? (tradeEverySeconds > 0 ? `开(每 ${tradeEverySeconds}s 跑一段：卖→买特产→起航，指针全用)` : '开(每轮都跑)') : '关(活动已下线)'}`);
     await runLoop(client, protocol, {
       config,
@@ -1340,13 +1492,23 @@ async function loopCli({
       cargoEveryMs: Math.max(0, Number(cargoEverySeconds) || 0) * 1000,
       tradeEnabled,
       tradeEveryMs: Math.max(0, Number(tradeEverySeconds) || 0) * 1000,
+      guildShipEnabled,
+      guildShipEveryMs: Math.max(0, Number(guildShipEverySeconds) || 0) * 1000,
+      guildShipSeek,
+      cityWarEnabled,
+      cityWarEveryMs: Math.max(0, Number(cityWarEverySeconds) || 0) * 1000,
+      cityWarRepair,
+      youduEnabled,
+      youduEveryMs: Math.max(0, Number(youduEverySeconds) || 0) * 1000,
+      youduSpin,
+      youduEdict,
       stop,
       onRound: (summary) => console.log(`\n${formatLoopRound(summary)}`),
       onStep: (entry) => {
         if (entry.phase === 'tasks') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'pirate' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure' || entry.phase === 'cargo' || entry.phase === 'trade') {
+        } else if (entry.phase === 'world' || entry.phase === 'radar' || entry.phase === 'pirate' || entry.phase === 'forge' || entry.phase === 'pet' || entry.phase === 'idle' || entry.phase === 'treasure' || entry.phase === 'cargo' || entry.phase === 'trade' || entry.phase === 'cityWar' || entry.phase === 'guildShip' || entry.phase === 'youdu') {
           if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
           else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
         } else if (entry.skipped) {
@@ -1577,6 +1739,15 @@ async function main() {
       guildShipEnabled: !process.argv.includes('--no-guildship'),
       guildShipEverySeconds: at('--guildship-every', 120),
       guildShipSeek: !process.argv.includes('--no-seek'),
+      // 国战：--no-citywar 关，--citywar-every 秒（默认 180），--no-citywar-repair 只派兵不修船。
+      cityWarEnabled: !process.argv.includes('--no-citywar'),
+      cityWarEverySeconds: at('--citywar-every', 180),
+      cityWarRepair: !process.argv.includes('--no-citywar-repair'),
+      // 酆都诡事：--no-youdu 关，--youdu-every 秒（默认 300），--no-youdu-spin 不抽罗盘，--no-youdu-edict 不开法旨。
+      youduEnabled: !process.argv.includes('--no-youdu'),
+      youduEverySeconds: at('--youdu-every', 300),
+      youduSpin: !process.argv.includes('--no-youdu-spin'),
+      youduEdict: !process.argv.includes('--no-youdu-edict'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
     });
     return;
@@ -1697,6 +1868,26 @@ async function main() {
       dryRun: process.argv.includes('--dry'),
       allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
       allowSeek: !process.argv.includes('--no-seek'),
+    });
+    return;
+  }
+
+  if (mode === 'citywar') {
+    await cityWarCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      force: process.argv.includes('--force'),
+      repair: !process.argv.includes('--no-repair'),
+    });
+    return;
+  }
+
+  if (mode === 'youdu') {
+    await youduCli({
+      dryRun: process.argv.includes('--dry'),
+      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+      spin: !process.argv.includes('--no-spin'),
+      edict: !process.argv.includes('--no-edict'),
     });
     return;
   }

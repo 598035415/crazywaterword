@@ -328,21 +328,27 @@ export const DAILY_DRIVERS = {
     id: 1010,
     title: '累计击败野怪',
     probes: [['AllPirateRequest', {}]],
-    evaluate({ task, probe }) {
+    evaluate({ task, probe, config }) {
       if (task.progress >= task.targetProgress) return { status: 'done' };
       const all = probe('AllPirateRequest');
       const pirates = all?.pirates ?? [];
       if (!pirates.length) return { status: 'blocked', reason: '世界地图上没有海盗部队可扫荡' };
-      // sweepTimes 跟 pirates 一起下发，是**免战扫荡**的剩余次数。为 0 时发 PirateSweepRequest
-      // 一律被服务端回 PromptResponse「cannot sweep」——这里以前只判断「有没有海盗」，
-      // 于是进度卡在 1/5 的账号每轮都白试一次，日志每 60 秒一行红字。
-      // 次数用完要接着做只能真出战（PirateFightRequest，得算战力和战损），没做自动化，所以直接报 blocked。
-      const sweepTimes = Math.max(0, Math.floor(Number(all?.sweepTimes) || 0));
-      if (sweepTimes === 0) {
+      // ⚠️ `sweepTimes` 是**今天已经用掉的**扫荡次数，不是剩余次数！
+      // 实证：客户端 `WarPirateModel.initDate(e)` 直接 `this.pirateSweepTimes = e.sweepTimes`，
+      // 它算剩余用的是 `maxSweepTimes() - pirateSweepTimes`，每日重置时把 pirateSweepTimes 归 0。
+      // 2026-10-28 全天 3930 条回包该字段恒为 0，而那天一次扫荡都没发过（若是剩余应该是 10）。
+      // 旧写法 `sweepTimes === 0 → 次数已用完` 正好把「满次数」判成「用完」，
+      // 于是每天 10 次免战扫荡一次都没扫，日志还一直说「扫荡次数已用完（0 次）」。
+      const sweepUsed = Math.max(0, Math.floor(Number(all?.sweepTimes) || 0));
+      const sweepMax = Number(
+        (config?.tables?.PirateParamCfg?.data ?? []).find((row) => row.paramName === '每日野怪扫荡次数')?.paramValue,
+      ) || 10;
+      const sweepLeft = Math.max(0, sweepMax - sweepUsed);
+      if (sweepLeft === 0) {
         const left = task.targetProgress - task.progress;
-        return { status: 'blocked', reason: `扫荡次数已用完（0 次），还差 ${left} 次击败野怪，只能手动出战` };
+        return { status: 'blocked', reason: `扫荡次数已用完（已用 ${sweepUsed}/${sweepMax}），还差 ${left} 次击败野怪，只能手动出战` };
       }
-      const remaining = Math.min(task.targetProgress - task.progress, sweepTimes);
+      const remaining = Math.min(task.targetProgress - task.progress, sweepLeft);
       const actions = pirates.slice(0, remaining).map((pirate) => ({
         request: 'PirateSweepRequest',
         body: { uid: pirate.uid, cityId: pirate.cityId },

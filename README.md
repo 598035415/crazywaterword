@@ -36,6 +36,8 @@
 | 搁浅的货轮 | 世界宝藏：按勾选的等级（多选，默认只抢万吨）抢货轮，已经有人占领的也派（打赢守军就换我们占），一条请求把空闲舰队压上去推占领进度（一天 3 次奖励）；循环里默认开启 |
 | 贸易港口 | 建筑「货轮港口」（界面显示「贸易港口」）：3 艘货船各采购 4 种物品，攒够的格子一条请求全交（拿玩家经验 + 金币），4 格交满船出发、几小时后返航领 4 份藏品奖励；**缺的货会并进工厂排产需求**，工厂优先产它；缺料不买货、不动钻石与加速器；循环里默认开启 |
 | 联盟商船 | 全联盟一起凑货舱的日常活动：给「已有船长、舱还空着」的商船补一个货舱（**只补材料齐的，缺料绝不花钻石买**），剩余船位去应聘没人当的船长（零成本赌队友）。优先挑「空舱少 = 快启航」的船，因为上船就锁名额 2.5~9 小时；循环里默认开启 |
+| 国战（联盟攻城） | 每天 20:00–21:00：把**空闲舰队派到联盟已宣战的城市**（按「出生城 → 目标城」距离烧汽油），耐久低于 80% 的船先修。**舰队进城就自动驻守、战期内由服务端排进战斗点**，不用自己写战斗逻辑（实测派一次就够，联盟 3 城全占）。不宣战/不取消宣战（200 钻石）/不募兵 —— 宣战是盟主/副盟主权限，本工具只跟随。平时整段静默（没到布署窗就睡到下一场），循环里默认开启 |
+| 酆都诡事 | 《捞尸人》联动活动（2026-10-29 ~ 11-11）：四项免费内容全自动 —— **驱邪除祟**（基地里刷出的邪祟一船一只打掉，杀完按累计杀数领档位奖励）、**龙王罗盘**（有抽奖券就抽，70 抽保底出龙纹）、**酆都法旨**（开一局后按服务端下发的符纸答案直接提交，**0 显化 = 耐心满 = 最高档**，不猜不赌）、**签到 + 每日活跃**（签到按回包推到「今天」，活跃度领下一档）。**付费板块（累充 / 特惠 / 战令 / 满减商店）一律不碰**；循环里默认开启 |
 | 海商王（**已下线**） | ⚠ 活动 2026-10-28 下线，`loop.mjs` 第 10 段已整段注释停用（代码留档，不发任何请求）。下面这些是停用前的能力说明：每天 10~22 点的 17 港口贸易：在港就卖掉手上的货、买**已知航线**上的货、开去「把它当紧缺」的港口（单趟价差约 +25~30%，资金=初始 10000+累计利润，滚得很快）；紧缺货每天 10 点重置，所以会把未知港口逐个「探路+共享」点亮；顺手领成就/联盟任务/商情共享/战令免费档；只花活动内商会币，**不动钻石**；商会指针（免费道具）默认全用；循环里默认开启 |
 | 自动循环 | 上面几块按轮执行，可只读探测、可长期挂机 |
 | 回包归档 | 每条请求/推送按接口全量落盘到 `data/responses/<日期>/`，时序流水另存 `data/protocol.log`，页面日志存 `data/console/<日期>.log` |
@@ -44,7 +46,8 @@
 ## 它不是什么
 
 - 不做手机端抓包，不做云端同步。
-- 不做资源田之外的地图争夺（占田需要舰队，多数账号不满足前置条件）。
+- 不做资源田之外的地图争夺：国战只「把舰队派到联盟已经宣战的城市」，**不宣战、不取消宣战（200 钻石）、不募兵**；占田仍然只做只读报告与手动触发（需要闲置舰队）。
+- 不碰酆都诡事的付费板块：每日累充、每日特惠、酆都礼遇（战令）、满减商店结账，一个请求都不发（计划里根本不生成）。
 - 不为没有图标的美术资源做手工绘制或猜测映射，找不到就退回纯文字。
 
 ---
@@ -111,7 +114,7 @@ node src/app.mjs            # 默认就是这个
 - **总览** —— 账号卡、资源与库存（带游戏自己的图标）、一键领取；
 - **挂机** —— 只放自动化：轮数、循环间隔、加速/重刷开关，下面是运行记录；再往下是各自动模块自己的开关与
   **时间间隔**（「自动联盟情报」默认 60s、「搁浅的货轮」默认 60s、「贸易港口」默认 60s、「拾荒」默认 300s、「农田」默认 120s、
-  「锻造」默认 180s、「海兽培育」默认 300s、「挂机领取」默认 300s、「联盟商船」默认 120s；「海商王」原默认 60s，活动下线后已停用）——
+  「锻造」默认 180s、「海兽培育」默认 300s、「挂机领取」默认 300s、「联盟商船」默认 120s、「国战」默认 180s（但它**只在战前 10 分钟 ~ 战期结束之间动**，其余时间整段静默）、「酆都诡事」默认 300s；「海商王」原默认 60s，活动下线后已停用）——
   自动循环每轮都会看一次，但只有「距上次执行」超过这个间隔才真的发请求，其余轮次直接跳过并说明还差多久
   （状态显示成「上次 3 分钟前 · 还差 1 分 20 秒」）；
 - **英雄** —— 默认只列**主战英雄**（主线出战阵容 `GetFormationResponse` 的 5 个位置）：每个英雄一行，
@@ -179,10 +182,17 @@ node src/app.mjs            # 默认就是这个
   打输白烧汽油/耐久）。被闸留下的船会进 `groundedFleets` 并在日志逐艘写明原因。
   海商王是纯跑商不战斗（代码里没有 fleet），不受影响。
 
-- **海盗讨伐（默认开，`--no-pirate` 关）** —— 世界地图上常驻的海盗部队，派空闲舰队**真出战**
-  （`ChallengePirateRequest{uid, fleetBuildingIds, cityId}`，一艘船打一个）。
-  **跟日常里的「免战扫荡」是两回事**：扫荡是 `PirateSweepRequest`（每日任务「累计击败野怪」，一天 10 次、
-  不动舰队也不烧汽油，在 `dailies` 里做）；**跟「联盟情报」也不是一回事**：那边打的是雷达刷出来的事件。
+- **海盗讨伐（默认开，`--no-pirate` 关）** —— 世界地图上常驻的海盗部队，**先免战扫荡、再真出战**。
+  **① 免战扫荡** `PirateSweepRequest{uid, cityId}`：不动舰队、不烧汽油，只吃「每日野怪扫荡次数」，
+  **只能打已通关等级**（客户端 `PiratePop` 的扫荡分支条件就是 `level <= maxKilledLevel`），拿该等级 `fixedReward`。
+  上限 = `PirateParamCfg.每日野怪扫荡次数`(10) + `VipLevelCfg.effects` 里的「野怪扫荡次数」（VIP2 = +2 → 12 次）。
+  ⚠️ `AllPirateResponse.sweepTimes` 是**今天已用**的次数，不是剩余 —— 客户端 `WarPirateModel.initDate`
+  直接把它赋给 `pirateSweepTimes`，判剩余用 `maxSweepTimes() - pirateSweepTimes`，每日重置归 0。
+  这个字段曾被当「剩余」读，`=== 0` 被判成「用完」，导致每天 10 次扫荡一次都没扫过（2026-10-28 修）。
+  被服务端拒时回 `PromptResponse = sweep times not enough`，挂机据此**当天不再试**（`transient` + group 隔离）。
+  `dailies` 的「累计击败野怪」先用扫荡凑任务进度，剩下的次数由这一段补完（等级高的先扫）。
+  **② 真出战** `ChallengePirateRequest{uid, fleetBuildingIds, cityId}`，一艘船打一个。
+  **跟「联盟情报」不是一回事**：那边打的是雷达刷出来的事件。
   成本 `WorldParamCfg`「打野怪消耗汽油」= 300/次，「打野怪消耗耐久」= 0（**不掉耐久**）；
   收益是 `WorldPirateCfg` 的首杀（`firstKillReward` + `firstKillEquip`）+ 每次固定掉落（GOLD + 材料）。
   所以**默认只打没打过的下一个等级**：每种类型从 `PirateKillRecordResponse` 的 `maxKilledLevel + 1` 往上找，
@@ -296,16 +306,18 @@ node src/app.mjs <子命令> [参数]
 | `heroes [--dry]` | 英雄养成 |
 | `world [--dry] [--speed-up] [--reroll] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--no-farm]` | 海面世界一轮 |
 | `radar [--dry] [--power-ratio N] [--max N] [--repair-below N]` | 联盟情报：领奖 + 每艘空闲船各派一个事件 + 修耐久低于 N%（默认 80）的船（战力余量默认 1.2，`--max` 默认不限） |
-| `pirates [--dry] [--power-ratio N] [--max N] [--repeat] [--repair-below N]` | 海盗讨伐（世界地图**真出战**）：按「已击杀最高等级 + 1」找地图上的海盗，派空闲舰队打（300 汽油/次、不掉耐久）。`--repeat` 连已通关等级也刷（只剩固定掉落）；`--max` 限派几艘；`--repair-below` 耐久低于 N%（默认 80）的船不出战。跟日常里的免战扫荡（`PirateSweepRequest`）不是一回事 |
+| `pirates [--dry] [--power-ratio N] [--max N] [--repeat] [--repair-below N]` | 海盗讨伐（世界地图**真出战** + 免战扫荡）：先把每日剩余扫荡次数用完（不动舰队、不烧汽油、只打已通关等级），再按「已击杀最高等级 + 1」派空闲舰队真出战（300 汽油/次、不掉耐久）。`--repeat` 连已通关等级也真出战（只剩固定掉落，想刷它不如用扫荡）；`--max` 限派几艘；`--repair-below` 耐久低于 N%（默认 80）的船不出战 |
 | `forge [--dry]` | 装备厂：收取已锻好的装备 + 按部位均衡排下一件 |
 | `pet [--dry] [--pet-max-quality BLUE\|PURPLE\|ORANGE\|RED] [--no-pet-feed]` | 海兽培育室：收成熟 + 材料加速（默认开）+ 队列空位排产 |
 | `idle [--dry]` | 挂机领取：邮件附件 + 挂机本段收益 + 等级奖励 + 等级升级（只花挂机徽章） |
 | `treasure [--dry] [--max N] [--colors 3,4,5] [--repair-below N]` | 搁浅的货轮：按勾选等级抢货轮（无人占领优先，被占着的也派），空闲舰队压上去推占领进度。`--colors` 多选（3 小型 / 4 中型 / 5 万吨，默认只 5）；旧的 `--min-color 4` 仍认，等价于 `--colors 4,5`；`--repair-below` 耐久低于 N%（默认 80）的船不派去抢占 |
 | `cargo [--dry]` | 贸易港口（建筑「货轮港口」）：采购中的货船把「库存够的格子」一条请求全交（`FillCargoShipRequest`，拿经验+金币），已返航的船领 4 份藏品奖励（`DrawShipRewardRequest`）。缺料只报缺口不买货 |
 | `guildship [--dry] [--no-seek]` | 联盟商船：列码头上的船 → 给材料齐的空舱补货 → 剩余船位应聘船长。`--no-seek` 只补货不当船长 |
+| `citywar [--dry] [--force] [--no-repair]` | 国战（联盟攻城）：只读看「联盟宣了哪几座城 / 守军多强 / 我每艘船在哪 / 派过去多少汽油」，再按「派兵 + 修船」出计划。`--force` = 非布署窗也照派（试跑用，只改时间判断，汽油/名额的闸照旧）；`--no-repair` 只派兵不修船 |
+| `youdu [--dry] [--no-spin] [--no-edict]` | 酆都诡事（捞尸人联动）：灭基地邪祟 + 按累计杀数领档位奖 + 有券才转龙王罗盘 + 开一局酆都法旨（答案用服务端下发的 `session.rune`，0 显化直接提交拿最高档）+ 签到推到今天 + 每日活跃领下一档。`--no-spin` 不转罗盘、`--no-edict` 不开法旨（保守模式）。付费板块（累充/特惠/战令/满减商店）一个请求都不发 |
 | `trade [--dry] [--no-speed]` | ⚠ **活动已下线**（2026-10-28）：模块与命令都还在，配合 `--trade` 才进挂机。海商王：在港就卖手上的货 + 共享商情 + 买本港特产 + 起航去「这件货的紧缺港口」+ 用商会指针加速，顺带领成就 / 联盟任务 / 商情奖励 / 战令免费档。`--no-speed` 不用指针（就老实等 2 小时） |
 | `field [gridIdx]` | 资源田报告 / 占田 / 弃田 |
-| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--repair-below N] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-guildship] [--guildship-every 秒] [--no-seek] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--repair-below` = 耐久低于该百分比就修，默认 80，0 = 不修；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
+| `loop [--rounds N] [--every 秒] [--no-pack] [--max-pack N] [--pack-gap N] [--pick] [--pick-every 秒] [--no-farm] [--farm-every 秒] [--no-radar] [--radar-every 秒] [--repair-below N] [--no-pirate] [--pirate-every 秒] [--pirate-repeat] [--no-treasure] [--treasure-every 秒] [--no-cargo] [--cargo-every 秒] [--no-trade] [--trade-every 秒] [--no-guildship] [--guildship-every 秒] [--no-seek] [--no-citywar] [--citywar-every 秒] [--no-citywar-repair] [--no-youdu] [--youdu-every 秒] [--no-youdu-spin] [--no-youdu-edict] [--no-forge] [--forge-every 秒] [--pet-max-quality X] [--no-pet-feed] [--no-idle] [--idle-every 秒] [--power-ratio N]` | 自动循环（`--rounds 0` = 一直跑；`--repair-below` = 耐久低于该百分比就修，默认 80，0 = 不修；`--pick-every` / `--farm-every` / `--radar-every` / `--pirate-every` / `--treasure-every` / `--cargo-every` / `--trade-every` / `--forge-every` / `--idle-every` 见下） |
 
 **任何会改变账号状态的命令都必须显式授权**：CLI 加 `--yes` 或 `CW_ALLOW_MUTATE=1`，
 网页请求体里带 `confirm: true`。不加就只打印计划，一个字节都不发出去。
@@ -448,6 +460,9 @@ src/
   tradeKing.mjs  海商王（17 港口贸易）：特产→紧缺配对、按资金/舱位算买入量、领成就/任务/商情/战令
                  ⚠ 活动 2026-10-28 已下线，loop 里那段已整段注释；模块与 CLI 保留，重开时解注释即可
   guildShip.mjs  联盟商船：凑货舱（只补材料齐的）、应聘船长、船位与补货窗口判定
+  cityWar.mjs    国战（联盟攻城）：联盟宣战城 / 守军战力 / 派兵汽油（出生城→目标城）/ 战前布署与修船
+  youdu.mjs      酆都诡事（捞尸人联动）：邪祟击杀与累计档位、龙王罗盘抽奖、法旨按 session.rune 直答、签到与每日活跃
+                 （活动 id 固定 20261001；付费板块不出现在计划里）
   actions.mjs    动作目录（请求名、参数、是否改状态）
   server.mjs     HTTP + SSE，多会话
   page.mjs       控制台页面（单文件：CSS + HTML + 内联 JS）
@@ -577,7 +592,10 @@ node src/selftest.mjs
 联盟商船（int64 玩家 id / 刷新点 / 应聘条件含专武星 / 船长不能补货 / 无船长不能补货 / 缺料拦下 /
 航行中不动 / 船位满了不发 / 补货优先于当船长）、海商王（10~22 点闸门 / 特产系数与可买量 = maxCount−stock / 配对表与「卖点在本港」不算 / 卖出收入与客户端同款公式 /
 亏本不卖 / 在航只发加速 / 买入量按卖后舱位算 / 成就与任务与商情奖励的门槛 / 指针一次最多 4 个）、
-日志脱敏与回包归档（同步落盘、轮转、噪音过滤、目录切分）。
+国战攻城（联盟下标 = guildId%1000 / 汽油单价分档与像素距离 / 战期按整日滚动（回包会停在上一场）/ 只打我方宣战城 / 已在目标城不重派 / 汽油备用闸 / 修船与派兵不同轮 / 委任中的船不抢 / 没宣战不发）、
+酆都诡事（活动 id 固定 20261001 / `EvilExpelInfoResponse.claimed` 是「已领档位的累计杀数」不是档位号 / 杀完之后的档位要按投影算 /
+一船一只且只在有邪祟时发 / 罗盘按积分档位 key / 法旨答案取自 session.rune 且 0 显化直接提交 / 没有入场券就不开 / 活动没开一个请求都不发 /
+签到不进静态计划（already / not time 按回包推进））、日志脱敏与回包归档（同步落盘、轮转、噪音过滤、目录切分）。
 工具侧另有 `tools/selftest-mitm.mjs`、`tools/selftest-describe.mjs`、`tools/selftest-registry.mjs`。
 
 ---

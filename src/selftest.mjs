@@ -26,6 +26,19 @@ import {
   GS_STATE_MOVING,
   GS_STATE_PREPARED,
 } from './guildShip.mjs';
+import {
+  guildIndex,
+  rollWarWindow,
+  phaseOf,
+  nextWarStartAt,
+  attackPetrolUnit,
+  attackPetrolCost,
+  cityDistance,
+  planCityWar,
+  formatCityWarSummary,
+  CW_STATE_IDLE,
+} from './cityWar.mjs';
+import { viewYoudu, planYoudu, formatYouduSummary, YOUDU_ACTIVITY_ID } from './youdu.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -432,10 +445,13 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   client.on('unknown', (info) => unknown.push(info));
   client.on('drop', () => { dropped += 1; });
 
-  client.onMessage(rawFrame('FarmHarvestResponse', 101, new Uint8Array([8, 1])));
+  // 名字必须挑「协议表里一定没有」的：2026-10-29 游戏大版本更新后 FarmHarvestResponse
+  // 已经进了 proto 表（之前正是靠它复现的死循环），再用它就测不到 unknown 分支了。
+  const ghostName = 'FarmHarvestResponseXyz';
+  client.onMessage(rawFrame(ghostName, 101, new Uint8Array([8, 1])));
   assert.equal(client.recvSeqNo, 101, '未知消息帧要照常推进 recvSeqNo');
   assert.equal(unknown.length, 1, '未知消息帧发一次 unknown 事件');
-  assert.match(unknown[0].error, /Unknown message type: FarmHarvestResponse/);
+  assert.match(unknown[0].error, new RegExp(`Unknown message type: ${ghostName}`));
 
   client.onMessage(codec.encode('OkResponse', 102, {}));
   assert.equal(dropped, 0, '未知帧之后的正常帧不能被判成 gap');
@@ -801,18 +817,26 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(noPirates.status, 'blocked', 'an empty pirate map plans nothing');
   assert.equal(noPirates.actions, undefined);
 
-  // sweepTimes 是免战扫荡的剩余次数，跟 pirates 一起下发。为 0 还发 PirateSweepRequest，
-  // 服务端只会回 PromptResponse「cannot sweep」——归档里进度卡在 1/5 的账号每 60 秒撞一次。
-  const pirateProbe = (uids, sweepTimes) => () => ({ pirates: uids.map((uid) => ({ uid, cityId: 9 })), sweepTimes });
-  const outOfSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2], 0), items: new Map(), ruby: 0, now: 0, config });
-  assert.equal(outOfSweeps.status, 'blocked', '扫荡次数为 0 时不能再发 PirateSweepRequest');
+  // ⚠️ `AllPirateResponse.sweepTimes` 是今天**已经用掉**的扫荡次数（0 = 一次没用 = 满次数可用），
+  // 不是剩余次数。这条曾经写反过（把 0 当成「用完」），结果每天 10 次免战扫荡一次都没扫。
+  // 证据：客户端 `WarPirateModel.initDate` 直接 `pirateSweepTimes = e.sweepTimes`，
+  // 判剩余用 `maxSweepTimes() - pirateSweepTimes`，每日重置把 pirateSweepTimes 归 0；
+  // 2026-10-28 全天 3930 条回包该字段恒为 0，而那天一次扫荡都没发过（若是剩余应为 10）。
+  const pirateProbe = (uids, sweepUsed) => () => ({ pirates: uids.map((uid) => ({ uid, cityId: 9 })), sweepTimes: sweepUsed });
+  const freshDay = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2, 3, 4], 0), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(freshDay.status, 'ready', 'sweepTimes=0 表示一次没用过（满次数），必须能扫');
+  assert.equal(freshDay.actions.length, 4, '任务还差 4 次，就发 4 条（上限 10 次不用担心）');
+
+  const outOfSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2], 10), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(outOfSweeps.status, 'blocked', '已用满 10 次时不能再发 PirateSweepRequest');
   assert.equal(outOfSweeps.actions, undefined);
   assert.ok(outOfSweeps.reason.includes('扫荡次数已用完'), `原因要说清是次数用完，实际：${outOfSweeps.reason}`);
+  assert.ok(outOfSweeps.reason.includes('10/10'), `原因要带「已用/上限」，实际：${outOfSweeps.reason}`);
 
-  const fewSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 2), items: new Map(), ruby: 0, now: 0, config });
-  assert.equal(fewSweeps.actions.length, 2, '剩余次数不够时只发这么多次，剩下的留到下次');
+  const fewSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 1, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 8), items: new Map(), ruby: 0, now: 0, config });
+  assert.equal(fewSweeps.actions.length, 2, '已用 8 / 上限 10 → 只剩 2 次，剩下的留到明天');
 
-  const enoughSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 3, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 9), items: new Map(), ruby: 0, now: 0, config });
+  const enoughSweeps = DAILY_DRIVERS[1010].evaluate({ task: { id: 1010, progress: 3, targetProgress: 5 }, probe: pirateProbe([1, 2, 3], 1), items: new Map(), ruby: 0, now: 0, config });
   assert.equal(enoughSweeps.actions.length, 2, '次数够时按「还差几次」发，不把地图上的海盗全扫一遍');
 
   const stage = DAILY_DRIVERS[1003].evaluate({ task: { id: 1003, progress: 0, targetProgress: 1 }, probe: () => null, items: new Map(), ruby: 0, now: 0, config, player: { mainlineStage: 41, level: 11 } });
@@ -3529,6 +3553,32 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 段参数解析的「自引用 TDZ」红线（2026-10-28 踩过，整轮挂机直接死）。
+// 段里写 `const cityWarRepairBelow = pickAt(conf, 'cityWarRepairBelow', cityWarRepairBelow)`：
+// 局部 const 遮蔽了同名参数 → 右边读到自己 → 执行到这一行就抛
+// 「Cannot access 'x' before initialization」，页面只显示这一句，一轮都不跑。
+// ⚠ 这种错 runLoop 冒烟抓不到（那些用例为了快，前几段就 halt 了，走不到第 13 段），
+// 所以在这里做静态扫描 —— 宁可多一条源码级检查，也不要再让「自测全绿但挂机起不来」发生。
+{
+  const fs = await import('node:fs');
+  const url = new URL('./loop.mjs', import.meta.url);
+  const source = fs.readFileSync(url, 'utf8');
+  // 只认 `const X = … pickAt(<conf>, '<key>', X)` 这一种形状，避免把 `const a = obj.a` 误判。
+  const selfRef = /(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=[^;\n]*pickAt\(\s*[^,()]+,\s*['"][^'"]*['"]\s*,\s*\1\s*\)/g;
+  const hits = [];
+  for (const line of source.split('\n')) {
+    const trimmed = line.trim();
+    // 注释里会引用这条错误写法当反面例子，不能算命中。
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
+    selfRef.lastIndex = 0;
+    const m = selfRef.exec(line);
+    if (m) hits.push(`${m[1]} → ${trimmed.slice(0, 110)}`);
+  }
+  assert.deepEqual(hits, [],
+    `段参数不能用「和同名参数一样的局部变量名」接 pickAt（TDZ 会让整轮挂机一开始就抛错）：\n${hits.join('\n')}`);
+  checked += 1;
+}
+
 // 被间隔挡住的轮次要能在日志里看出来，否则像「勾了没反应」。
 {
   const summary = {
@@ -4529,7 +4579,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 // 海盗讨伐（世界地图真出战）：战力必须按赛季查、默认只打首杀等级、一船一海盗。
 // 这里钉死的都是「错了不会报错、只会白烧汽油」的地方，所以每条都要有断言。
 {
-  const { pirateOf, petrolCostOf, seasonOf, viewPirates, planPirates, formatPirateSummary } = await import('./pirate.mjs');
+  const { pirateOf, petrolCostOf, seasonOf, viewPirates, planPirates, formatPirateSummary, sweepMaxOf } = await import('./pirate.mjs');
   const config = { tables: {
     // 「打野怪消耗汽油」在 WorldParamCfg，不在 PirateParamCfg（后者只有「每日野怪扫荡次数」）。
     WorldParamCfg: { data: [{ paramName: '打野怪消耗汽油', paramValue: 300 }] },
@@ -4558,8 +4608,11 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(petrolCostOf({ tables: {} }), 300, '配置读不到时用兜底 300，不能变 0（0 等于无限次）');
 
   const fleet = (over) => ({ buildingId: '1远征船', state: 1, power: 3000000, durability: 2000, maxDurability: 2000, ...over });
-  const survey = ({ pirates = [], killed = new Map(), fleets = [], petrol = 5000, season = 1 } = {}) => ({
-    now: 1000, season, petrol, sweepTimes: 0, stock: new Map(), pirates, killed, fleets,
+  const survey = ({ pirates = [], killed = new Map(), fleets = [], petrol = 5000, season = 1,
+    sweepUsed = 0, sweepMax = 10, sweepLeft = 0 } = {}) => ({
+    // sweepTimes 是「已用」次数（服务端原义），sweepLeft 是派生出来的剩余；默认 0 剩余 = 旧行为。
+    now: 1000, season, petrol, sweepTimes: sweepUsed, sweepUsed, sweepMax, sweepLeft,
+    stock: new Map(), pirates, killed, fleets,
   });
   const pirate = (over) => ({ uid: 1, type: 1, level: 8, gridIdx: 100, cityId: 9, ...over });
 
@@ -4657,6 +4710,82 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const allLowPlan = planPirates(allLow);
   assert.equal(allLowPlan.actions.length, 0, '耐久不够就不出战');
   assert.ok(allLowPlan.notes.some((note) => note.includes('先去修')), `要说清是先去修，实际：${allLowPlan.notes.join(' / ')}`);
+
+  // ---- 免战扫荡（2026-10-28 加）----
+  // 只能扫「已通关等级」（客户端 PiratePop 的 case 2 条件就是 level <= maxKilledLevel），
+  // 次数按「已用 / 上限」算，扫荡不依赖舰队也不烧汽油。
+  const sweepConfig = { tables: { ...config.tables, PirateParamCfg: { data: [{ paramName: '每日野怪扫荡次数', paramValue: 10 }] } } };
+  assert.equal(sweepMaxOf(sweepConfig), 10, '上限来自 PirateParamCfg.每日野怪扫荡次数');
+  assert.equal(sweepMaxOf(config), 10, '配置缺行时兜底 10');
+
+  const sweepView = viewPirates(survey({
+    pirates: [
+      pirate({ uid: 1, type: 1, level: 7 }),
+      pirate({ uid: 2, type: 1, level: 6 }),
+      pirate({ uid: 3, type: 2, level: 11 }),
+      pirate({ uid: 4, type: 1, level: 20 }), // 没通关过，不能扫
+      pirate({ uid: 5, type: 1, level: 8 }), // 下一个首杀等级，真出战用
+    ],
+    killed: new Map([[1, 7], [2, 11]]),
+    fleets: [fleet()],
+    sweepUsed: 7,
+    sweepMax: 10,
+    sweepLeft: 3,
+  }), { config: sweepConfig });
+  assert.deepEqual(sweepView.sweepTargets.map((one) => one.uid), [3, 1, 2],
+    '只有「已通关等级」能扫，等级高的先扫（精锐 Lv11 → 先锋 Lv7 → 先锋 Lv6）');
+  assert.equal(sweepView.sweepLeft, 3, '剩余 = 上限 10 − 已用 7');
+
+  const sweepPlan = planPirates(sweepView);
+  const sweeps = sweepPlan.actions.filter((a) => a.kind === 'pirateSweep');
+  assert.equal(sweeps.length, 3, '剩 3 次就排 3 条');
+  assert.equal(sweeps[0].request, 'PirateSweepRequest');
+  assert.deepEqual(sweeps[0].body, { uid: 3, cityId: 9 }, 'body 是 uid + cityId（客户端同款）');
+  assert.equal(sweeps[0].response, null, '协议表里没有 PirateSweepResponse → 走 sendWatch');
+  assert.equal(sweeps[0].transient, true, '次数用完/目标没了都是临时状态，不能进跨轮 rejected');
+  assert.equal(sweeps[0].group, 'pirateSweep', '同一 group：一条被拒就停掉剩下的，不会连发十条刷屏');
+  assert.equal(new Set(sweeps.map((action) => action.key)).size, 3, 'key 带序号，重复扫同一个 uid 也不撞 key');
+  assert.ok(sweeps[0].label.includes('第 8/10 次'), `label 要写第几次，实际：${sweeps[0].label}`);
+  assert.ok(sweepPlan.actions.indexOf(sweeps[0]) < sweepPlan.actions.findIndex((a) => a.kind === 'pirateChallenge'),
+    '扫荡排在真出战前面（免费的先做）');
+
+  // 一艘空闲船都没有也要扫荡 —— 它不动舰队。
+  const noFleetSweep = planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1, type: 1, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [],
+    sweepLeft: 2,
+  }), { config: sweepConfig }));
+  assert.equal(noFleetSweep.actions.filter((a) => a.kind === 'pirateSweep').length, 2, '扫荡不依赖舰队');
+  assert.equal(noFleetSweep.actions.filter((a) => a.kind === 'pirateChallenge').length, 0);
+
+  // 默认 sweepLeft = 0（旧行为）不扫；有次数但没「已通关等级」要说清原因。
+  assert.equal(planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1, type: 1, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+  }), { config: sweepConfig })).actions.filter((a) => a.kind === 'pirateSweep').length, 0,
+  'sweepLeft=0 时一条扫荡都不排');
+
+  const nothingToSweep = planPirates(viewPirates(survey({
+    pirates: [pirate({ uid: 1, type: 1, level: 20 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+    sweepLeft: 5,
+  }), { config: sweepConfig }));
+  assert.equal(nothingToSweep.actions.filter((a) => a.kind === 'pirateSweep').length, 0, '没通关过的等级不能扫');
+  assert.ok(nothingToSweep.notes.some((note) => note.includes('已通关等级')),
+    `要说明没有可扫目标，实际：${nothingToSweep.notes.join(' / ')}`);
+
+  // 概览行要带「剩 x/上限」，别把已用次数当剩余。
+  const sweepSummary = formatPirateSummary(viewPirates(survey({
+    pirates: [pirate({ uid: 1, type: 1, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet()],
+    sweepUsed: 7,
+    sweepLeft: 3,
+  }), { config: sweepConfig }));
+  assert.ok(sweepSummary.includes('免战扫荡剩 3/10'), `概览要写剩余次数，实际：${sweepSummary}`);
 
   // 概览行：赛季、汽油单价、空闲船、三种 type 的击杀进度都要能看见。
   const summaryText = formatPirateSummary(noRepeat);
@@ -5394,4 +5523,238 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 联盟商船 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);
+// --- 国战（联盟攻城 CityWar） ----------------------------------------------
+// 判据来自客户端反编译（guildIndex = guildId % 1000、coordToPosition、getAttackCityPetrolCostUnit、
+// isDeclare 只认盟主/副盟主）+ 配置表 AttackCityConsumeCfg / CityCfg + 2026-10-28 实盘
+// （19:52 派 1 艘船到城 73，20:00 到达，21:48 仍 IDLE 驻守，联盟 3 城全占）。
+{
+  const cfg = {
+    tables: {
+      AttackCityConsumeCfg: { data: [
+        { dist: 1, cost: 0.4 },
+        { dist: 6000, cost: 0.5 },
+        { dist: 8400, cost: 0.6 },
+        { dist: 10800, cost: 0.7 },
+      ] },
+      CityCfg: { data: [
+        { id: 91, name: '水之都', guildIndex: 3 },
+        { id: 73, name: '堡垒H7', guildIndex: 0 },
+      ] },
+    },
+  };
+
+  // 1. 联盟身份是 idx 不是 guildId：客户端 guildIndex(e)=e%1e3。
+  //    实测 guildId 2001014410003 → 3，宣战列表里 attackGuildIdx===3 的才是我们联盟的战场。
+  assert.equal(guildIndex(2001014410003), 3, 'guildId → 联盟下标（%1000）');
+  // guildId 在回包里是 int64（low 是有符号 int32），必须走 bigNum 才能算对：
+  // 2001014410003 = 465 * 2^32 + 3854617363，而 3854617363 作有符号是 -440349933。
+  assert.equal(guildIndex({ low: -440349933, high: 465 }), 3, 'int64 形式的 guildId 也要算出 3');
+  assert.equal(guildIndex(0), 0, '没有联盟 → 0');
+
+  // 2. 汽油单价分档：客户端从第一档开始，dist < row.dist 就 break。
+  assert.equal(attackPetrolUnit(cfg, 0), 0.4, '<1 像素仍是第一档 0.4');
+  assert.equal(attackPetrolUnit(cfg, 5999), 0.4, '<6000 是 0.4');
+  assert.equal(attackPetrolUnit(cfg, 6000), 0.5, '>=6000 进第二档 0.5');
+  assert.equal(attackPetrolUnit(cfg, 8400), 0.6, '>=8400 进第三档 0.6');
+  assert.equal(attackPetrolUnit(cfg, 99999), 0.7, '超出最后一档沿用最大单价');
+
+  // 3. 距离 = 两座城格子中心的像素欧氏距离（coordToPosition）。
+  //    gridIdx 0 → col0/row0 → (50, -75)；gridIdx 10 → col10/row0 → (1050, -75) → 1000 像素。
+  const map = { width: 100, tileWidth: 100, tileHeight: 75, cityInfo: { 1: { gridIdx: 0 }, 2: { gridIdx: 10 } } };
+  assert.equal(Math.round(cityDistance(map, 1, 2)), 1000, '同一行相距 10 格 = 1000 像素');
+  assert.equal(cityDistance(map, 1, 999), null, '地图上没有这座城 → null（调用方降级，不能当成 0）');
+  assert.equal(attackPetrolCost(cfg, map, 1, 2), 400, '1000 像素 × 0.4 = 400 汽油');
+  assert.equal(attackPetrolCost(cfg, null, 1, 2), null, '没有地图 → 算不出来就返回 null，不能编一个数');
+
+  // 4. 战期按整日滚动。服务端回包会「停在上一场」（10/28 22:40 实测：战期还是当天 20:00–21:00，
+  //    但宣战列表已经是新一场的城 86）。不滚动的话明天 19:50 会被判成「今日已结束」→ 睡一整天。
+  const day1Start = Math.floor(new Date(2026, 9, 28, 20, 0, 0).getTime() / 1000);
+  const day1End = day1Start + 3600;
+  const lateToday = Math.floor(new Date(2026, 9, 28, 22, 40, 0).getTime() / 1000);
+  const rolled = rollWarWindow(day1Start, day1End, lateToday);
+  assert.equal(rolled.days, 1, '22:40 看的还是今天那场 → 滚到明天');
+  assert.equal(rolled.startAt, day1Start + 86400, '滚动后是次日 20:00');
+  assert.equal(nextWarStartAt(day1Start, day1End, lateToday), day1Start + 86400, '下一场开始时刻 = 次日 20:00');
+
+  const liveNow = day1Start + 600; // 20:10
+  assert.equal(rollWarWindow(day1Start, day1End, liveNow).days, 0, '战中不滚动');
+  assert.equal(phaseOf(day1Start, day1End, liveNow), 'live', '20:10 是战中');
+  assert.equal(phaseOf(day1Start, day1End, day1Start - 300), 'prep', '战前 5 分钟 = 布署窗');
+  assert.equal(phaseOf(day1Start, day1End, day1Start - 3600), 'waiting', '战前 1 小时还没到布署');
+  assert.equal(phaseOf(0, 0, liveNow), 'unknown', '没有战期 → unknown');
+
+  // 5. 计划器：只派到我们联盟宣的城、优先守军最弱的那座、已在目标城的船不动。
+  const nowSec = day1Start - 300; // 布署窗内
+  const view = {
+    phase: 'prep',
+    startAt: day1Start,
+    endAt: day1End,
+    petrol: 700_000,
+    petrolReserve: 20_000,
+    minPowerRatio: 0,
+    mapKnown: true,
+    repairParams: new Map(),
+    repairBelow: 0.8,
+    targets: [
+      { cityId: 68, name: '堡垒G7', kind: 'attack', defencePower: 900_000, defenceKnown: true, petrolCost: 5_200 },
+      { cityId: 73, name: '堡垒H7', kind: 'attack', defencePower: 490_000, defenceKnown: true, petrolCost: 1_200 },
+    ],
+    fleets: [
+      { buildingId: '1远征船', state: CW_STATE_IDLE, cityId: 72, targetCityId: 0, power: 2_615_152, durability: 1800, maxDurability: 2000, duraPct: 0.9, repairing: null, autoFight: false, needsRepair: false },
+      { buildingId: '2远征船', state: CW_STATE_IDLE, cityId: 73, targetCityId: 0, power: 1_343_307, durability: 1800, maxDurability: 2000, duraPct: 0.9, repairing: null, autoFight: false, needsRepair: false },
+    ],
+  };
+  view.idleFleets = view.fleets;
+
+  const plan = planCityWar(view, {});
+  assert.equal(plan.actions.length, 1, '2 号船已经在城 73 → 只派 1 号船');
+  assert.equal(plan.actions[0].request, 'MoveFleetsToCityRequest', '派兵走 MoveFleetsToCityRequest');
+  assert.deepEqual(plan.actions[0].body, { buildingId: ['1远征船'], cityId: 73 }, '挑守军最弱的城 73，且 buildingId 是数组');
+  assert.equal(plan.actions[0].transient, true, '派兵是瞬时动作（舰队状态每轮在变，不能永久拉黑）');
+  assert.ok(plan.actions[0].label.includes('490000'), `说明里要带守军战力，实际：${plan.actions[0].label}`);
+
+  // 6. 非战期一格动作都不发（白天不能每小时多打请求，更不能不宣战就派兵）。
+  assert.equal(planCityWar({ ...view, phase: 'waiting' }, {}).actions.length, 0, '未到布署窗不发派兵');
+  assert.equal(planCityWar({ ...view, phase: 'live' }, {}).actions.length, 1, '战中也允许补派');
+
+  // 7. 汽油不够（留 2 万备用后付不起单程）→ 不派，且要说明原因。
+  const poor = planCityWar({ ...view, petrol: 21_000 }, {});
+  assert.equal(poor.actions.length, 0, '汽油只够 1000 时不派（单程 1200）');
+  assert.ok(poor.notes.some((n) => n.includes('汽油')), `要说清是汽油不够，实际：${poor.notes.join(' | ')}`);
+
+  // 8. 耐久低于 80% → 先修；同一轮不能再派它（修船会把它置成 REPAIRING，派了必被拒）。
+  const needFix = {
+    ...view,
+    repairParams: new Map([['1远征船', { unitRepairCost: 5.76, unitRepairTime: 0.3 }]]),
+    fleets: [{ ...view.fleets[0], durability: 1400, duraPct: 0.7, needsRepair: true }, view.fleets[1]],
+  };
+  const fixPlan = planCityWar(needFix, {});
+  assert.equal(fixPlan.actions.length, 1, '只排维修，不排派兵');
+  assert.equal(fixPlan.actions[0].request, 'RepairFleetRequest', '维修走 RepairFleetRequest（无 Response）');
+  assert.deepEqual(fixPlan.actions[0].body, { buildingId: '1远征船' }, '维修的 buildingId 是单个字符串，不是数组');
+  assert.ok(fixPlan.actions[0].label.includes('3456'), `600 点 × 5.76 = 3456 汽油，实际：${fixPlan.actions[0].label}`);
+
+  // 9. 开了舰队委任（VIP3+）的船由服务端托管，脚本不抢。
+  const appointed = planCityWar({
+    ...view,
+    fleets: [{ ...view.fleets[0], autoFight: true }, view.fleets[1]],
+  }, {});
+  assert.equal(appointed.actions.length, 0, '委任中的船不派');
+
+  // 10. 联盟今天没宣战 → 一条都不发，并说清原因（脚本不代宣：那是盟主/副盟主的权限）。
+  const noWar = planCityWar({ ...view, targets: [] }, {});
+  assert.equal(noWar.actions.length, 0, '没有宣战城就不派');
+  assert.ok(noWar.notes.some((n) => n.includes('宣战')), '要说明「联盟今天没有宣战城市」');
+
+  // 11. 概览要点出战期与空闲船数，否则日志里看不出这一段在干什么。
+  const summary = formatCityWarSummary({ ...view, fleets: view.fleets, idleFleets: view.fleets });
+  assert.ok(summary.includes('20:00') && summary.includes('2 攻'), `概览要带战期和攻守城数，实际：${summary}`);
+  assert.ok(summary.includes('舰队 2/2'), `概览要带空闲船数，实际：${summary}`);
+
+  checked += 1;
+}
+
+
+// --- 酆都诡事（捞尸人联动）---------------------------------------------------
+// 判据来自反编译 LSRFengDuFaZhiPop / LSRFaZhiGuessItem / CompassWheelPop / EvilExpelPop
+// + 协议表 + 2026-10-29 实盘 3 轮（杀 6 只邪祟、1 局法旨、3 次罗盘、签到 2 条收工）。
+{
+  const cfg = {
+    tables: {
+      LinkageLSREvilExpelTotalRewardCfg: { data: [
+        { id: 1, totalCount: 5, rewards: [] },
+        { id: 2, totalCount: 10, rewards: [] },
+        { id: 3, totalCount: 15, rewards: [] },
+      ] },
+      LinkageLSRCompassWheelScoreRewardCfg: { data: [
+        { id: 1, score: 30 },
+        { id: 2, score: 200 },
+        { id: 3, score: 800 },
+      ] },
+      LinkageLSREdictPatienceCfg: { data: [{ patienceTotal: 100, askCost: 5, receiveCost: 10 }] },
+      LinkageLSREdictRewardCfg: { data: [
+        { id: 1, patience: 70, battlePassScore: 10, rewards: [['活动26捞尸人_货币', 20]] },
+        { id: 2, patience: 30, battlePassScore: 20, rewards: [] },
+        { id: 3, patience: 1, battlePassScore: 30, rewards: [] },
+      ] },
+      LinkageLSRActiveRewardCfg: { data: [{ rewardId: 1, score: 80 }] },
+    },
+  };
+  const stock = () => new Map([
+    ['活动26捞尸人_入场券', 1],
+    ['活动26捞尸人_抽奖券', 3],
+    ['活动26捞尸人_货币', 70],
+  ]);
+  const base = () => ({
+    open: true,
+    activityId: YOUDU_ACTIVITY_ID,
+    evil: { killTotal: 6, claimed: 5, todayKill: 6, alive: 4 },
+    wheel: { score: 113, claimedId: 1, times: 2, pity: 68, minScore: 30, maxScore: 50, outerGot: [], cost: { id: '活动26捞尸人_抽奖券', num: 1 } },
+    edict: { cost: { id: '活动26捞尸人_入场券', num: 1 }, session: null },
+    stock: stock(),
+  });
+
+  // 1. 活动 id：不是活动上线日 20261029（那个一律 prompt 74 = ACTIVE_END）。
+  assert.equal(YOUDU_ACTIVITY_ID, 20261001, '活动 id 是大版本容器 20261001');
+
+  // 2. `claimed` 是「已领档位的累计杀数」而不是档位 id：
+  //    实盘累计 6 只、领完第 1 档后 claimed=5（第 1 档 totalCount 就是 5）。
+  //    按 id 比的话会把 claimed=5 当成「已领到第 5 档」，之后 5/10/15 全被跳过。
+  const v1 = viewYoudu(base(), { config: cfg });
+  assert.equal(v1.evil.claimed, 5, 'claimed 原样保留');
+  assert.deepEqual(v1.evil.claimable.map((r) => r.id), [], '累计 6 只还差 4 只到第 2 档 → 当前没有可领档位');
+  assert.equal(v1.evil.next.totalCount, 10, '下一档是累计 10 只');
+
+  // 3. 邪祟：alive 几只就排几条 kill，且可领档位按「杀完之后」的累计数算。
+  const p1 = planYoudu(v1, { config: cfg });
+  const kills = p1.actions.filter((a) => a.kind === 'youduKill');
+  assert.equal(kills.length, 4, '基地 4 只 → 4 条 EvilExpelKillRequest');
+  assert.equal(kills[0].body.activityId, YOUDU_ACTIVITY_ID, 'kill 请求体带 activityId');
+  // 6 + 4 = 10 → 第 2 档（10 只）刚好达标，这一轮就该领，不用等下一轮。
+  assert.equal(p1.actions.filter((a) => a.kind === 'youduEvilClaim').length, 1, '杀完 10 只这一轮就能领第 2 档');
+
+  // 4. 罗盘：券 3 张、单抽 1 张 → 一次请求抽 3 发；积分 113 只够第 1 档（30 分），已领过 → 不重复领。
+  assert.equal(v1.wheel.spins, 3, '3 张券 / 单抽 1 → 能转 3 次');
+  assert.equal(v1.wheel.dragonIn, 2, 'pity 68 → 距龙纹还差 2 抽');
+  const spins = p1.actions.filter((a) => a.kind === 'youduSpin');
+  assert.equal(spins.length, 1, '一次请求抽 3 发（不拆成 3 条）');
+  assert.equal(spins[0].body.num, 3, 'body.num = 发数');
+  assert.equal(p1.actions.filter((a) => a.kind === 'youduWheelClaim').length, 0, '积分档位已领过就不重复领');
+
+  // 5. 法旨：服务端把答案放在 session.rune 里（客户端拿它渲染符纸图案），
+  //    所以有 4 位 rune 就直接提交、一次都不显化（显化 -5 耐心、猜错 -10）。
+  const withSession = viewYoudu({
+    ...base(),
+    edict: { cost: { id: '活动26捞尸人_入场券', num: 1 }, session: { rune: [2, 1, 6, 4], shown: [0, 0, 0, 0], patience: 100 } },
+  }, { config: cfg });
+  const p2 = planYoudu(withSession, { config: cfg });
+  const guesses = p2.actions.filter((a) => a.kind === 'youduEdictGuess');
+  assert.equal(guesses.length, 1, '有 session 就提交答案');
+  assert.deepEqual(guesses[0].body.guess, [2, 1, 6, 4], 'guess 直接就是 session.rune');
+  assert.equal(p2.actions.filter((a) => a.kind === 'youduEdictAsk').length, 0, '一次显化都不发');
+  assert.equal(p2.actions.filter((a) => a.kind === 'youduEdictStart').length, 0, '已经有局就不再开局');
+
+  // 6. 没有 session、有入场券 → 先开局；没有入场券 → 只提示、不发请求。
+  const p3 = planYoudu(v1, { config: cfg });
+  assert.equal(p3.actions.filter((a) => a.kind === 'youduEdictStart').length, 1, '有入场券就开一局');
+  const noTicket = viewYoudu({
+    ...base(),
+    stock: new Map([['活动26捞尸人_抽奖券', 0]]),
+  }, { config: cfg });
+  const p4 = planYoudu(noTicket, { config: cfg });
+  assert.equal(p4.actions.filter((a) => a.kind === 'youduEdictStart').length, 0, '没入场券不开局');
+  assert.ok(p4.notes.some((n) => n.includes('入场券')), '要在 notes 里说清为什么没开局');
+
+  // 7. 活动没开（服务端回 ACTIVE_END/74）→ 一条动作都不排，只留说明。
+  const closed = viewYoudu({ open: false, reason: 'server prompt: prompt=74' }, { config: cfg });
+  const p5 = planYoudu(closed, { config: cfg });
+  assert.equal(p5.actions.length, 0, '活动没开就不发请求');
+  assert.ok(formatYouduSummary(closed).includes('未开启'), '摘要里要说未开启');
+
+  // 8. 签到不放进静态计划：它得按回包推进（already checked in / not time yet），
+  //    否则每天白打 13 条必被拒的请求。
+  assert.equal(p1.actions.filter((a) => a.kind === 'youduSign').length, 0, '签到由 runYouduSigns 单独处理');
+  checked += 1;
+}
+
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 联盟商船 / 国战攻城 / 酆都诡事 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);

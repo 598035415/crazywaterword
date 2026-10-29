@@ -1655,6 +1655,10 @@ export function loadMapAsset(scenarioId) {
     scenarioId: scenarioId > 0 ? scenarioId : 1,
     width: mapInfo?.width ?? 0,
     height: mapInfo?.height ?? 0,
+    // 格子像素尺寸：算「城与城之间的距离」要用（客户端 coordToPosition 的 tileWidth/tileHeight）。
+    // 缺这两个数就只能按 gridIdx 顶替，距离会错得很离谱，所以一并带出来。
+    tileWidth: mapInfo?.tileWidth ?? 0,
+    tileHeight: mapInfo?.tileHeight ?? 0,
     cityInfo,
     fieldCount: mapData.reduce((n, v) => n + (Math.floor(v / 10000) % 10 ? 1 : 0), 0),
     fieldAt(gridIdx) {

@@ -255,7 +255,7 @@ export const PAGE = `<!doctype html>
 
     <h2>自动海盗讨伐</h2>
     <div class="bar">
-      <label class="dim" title="派空闲舰队真出战打世界地图上的海盗。每次烧 300 汽油、不掉耐久，收益是首杀奖励 + 固定掉落">
+      <label class="dim" title="先把每日免战扫荡次数用完（不动舰队、不烧汽油、只打已通关等级），再派空闲舰队真出战打首杀等级。真出战每次烧 300 汽油、不掉耐久">
         <input type="checkbox" id="pirate-on" checked> 自动讨伐海盗
       </label>
       <label class="dim">时间间隔 <input id="pirate-every" value="60" style="width:64px"> 秒</label>
@@ -265,20 +265,24 @@ export const PAGE = `<!doctype html>
       <button id="pirate-run">立刻讨伐一次</button>
       <span id="pirate-state" class="dim">还没跑过</span>
     </div>
-    <pre id="pirate-view">派空闲舰队**真出战**打世界地图上的海盗部队（ChallengePirateRequest）：一艘船打一个海盗，打完击杀记录 +1。
-**跟「免战扫荡」不是一回事**：扫荡是每日任务「累计击败野怪」那条（PirateSweepRequest，一天 10 次，不动舰队也不烧汽油，
-在「日常」页里自动做）；这里是真的把船开出去打。
-**跟「联盟情报」也不是一回事**：情报事件是雷达里刷出来的，有 6 小时时效；这里打的是地图上常驻的海盗部队。
+    <pre id="pirate-view">两种打法，一段里都做，**先扫荡再出战**：
+
+**① 免战扫荡**（PirateSweepRequest）：不动舰队、不烧汽油，只吃「每日野怪扫荡次数」（PirateParamCfg = 10 次/天）。
+只能打**已经通关过的等级**（客户端 PiratePop 的扫荡分支条件就是「level <= 已击杀最高等级」），
+拿的是该等级的固定掉落（GOLD 250 + 材料，首杀奖励早就拿过了）。所以挂机每天会把 10 次扫完 ——
+先由「日常」页的任务 1010（累计击败野怪）扫够任务进度，剩下的由这一段补完（等级高的先扫，奖励好）。
+
+**② 真出战**（ChallengePirateRequest）：派空闲舰队一艘打一个海盗，打完击杀记录 +1。
 成本 300 汽油/次（WorldParamCfg「打野怪消耗汽油」），**不掉耐久**（「打野怪消耗耐久」= 0）。
 但耐久 <80% 会「降低输出、增加受到的伤害」（LoadingTipsCfg）—— 打起来更容易输、白烧 300 汽油，
 所以**耐久低于「挂机」页设的阈值（默认 80%）的船不出战**，留在港里由「自动情报」那一段修满再派（阈值 0 = 不拦）。
-收益 = 首杀奖励（firstKillReward + 首件装备）+ 每次固定掉落（GOLD 250 + 材料），所以**默认只打没打过的下一个等级**，
+收益 = 首杀奖励（firstKillReward + 首件装备）+ 每次固定掉落，所以**默认只打没打过的下一个等级**，
 照客户端自动讨伐的口径：每种类型从「已击杀最高等级 + 1」往上找，地图上没有这一级就等刷新。
-勾上「刷已通关等级」才会去打打过的那几级 —— 那种只剩固定掉落，值不值自己判断。
+勾上「刷已通关等级」才会去打打过的那几级 —— 那种只剩固定掉落。**想刷已通关等级又不想烧汽油，用上面的扫荡更划算。**
 战力余量沿用「自动情报」那栏那个数（默认 1.2），敌方战力按 **赛季 + 类型 + 等级** 查 WorldPirateCfg
 （同等级不同赛季战力能差 40 倍）。赛季从角色所在的 worldId 算，算不出来时会取各赛季最高战力，宁可不派也不打输。
 **排在货轮和情报后面**：三段抢的是同一批空闲船 —— 货轮错过就没了、情报挂 6 小时还在、海盗没人抢，
-所以它经常看到「0 艘空闲船，这轮不派」，那是正常的。</pre>
+所以它经常看到「0 艘空闲船，这轮不派」，那是正常的（扫荡不受影响，照扫）。</pre>
 
     <h2>拾荒</h2>
     <div class="bar">
@@ -414,6 +418,62 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - **两条硬限制**：船长不能给自己那条船补货；每人最多同时登 2 艘，而且一旦上船就被锁到船到港（2.5~9 小时）才释放名额。
 - 所以策略是「**船员优先 + 挑空舱少的船**（快启航、名额释放快）」，剩余名额才去当船长。
 - **缺料一律不补、绝不花钻石买料**（客户端那条路会弹「购买」，这里不接），等工厂产出来再说。</pre>
+
+    <h2>国战（联盟攻城）</h2>
+    <div class="bar">
+      <label class="dim" title="每天 20:00–21:00 一场。只做「把闲置舰队派到联盟宣战城」+「耐久低自动修」，不宣战、不取消宣战（取消要 200 钻石）">
+        <input type="checkbox" id="city-war-on" checked> 自动跑国战
+      </label>
+      <label class="dim">间隔 <input id="city-war-every" value="180" style="width:60px"> 秒</label>
+      <label class="dim" title="开战前多少秒开始布署：要留够修船（满耐久约 5 分钟）和行军的时间">战前 <input id="city-war-lead" value="600" style="width:60px"> 秒布署</label>
+      <label class="dim" title="同一座城最多派几艘（越多人打越快占领，但汽油也越多）">每城最多 <input id="city-war-max" value="3" style="width:48px"> 艘</label>
+      <label class="dim" title="派兵后至少留下这么多汽油，别把回程/修理的余量烧光">留 <input id="city-war-reserve" value="20000" style="width:72px"> 汽油</label>
+      <label class="dim" title="耐久低于 80%（1600/2000）就修。修船吃汽油：cost = (上限−当前) × 服务端下发的单价">
+        <input type="checkbox" id="city-war-repair" checked> 耐久低自动修
+      </label>
+      <label class="dim" title="舰队战力 ≥ 守军总战力 × 这个系数才派。0 = 不拦（进城就能拿战斗点，打不过也有功勋）；1.2 = 只打有把握的城">
+        战力余量 <input id="city-war-ratio" value="0" style="width:48px">
+      </label>
+      <button id="city-war-look">看局势</button>
+      <button id="city-war-run">立刻派兵</button>
+      <span id="city-war-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="city-war-view">国战是**联盟每天 20:00–21:00 的攻城战**：联盟最多同时宣 3 座相邻城，成员把舰队派过去打。
+- **不需要自己写战斗逻辑**：舰队进城就自动驻守，战期内由服务端排进战斗点。
+  实测（2026-10-28）19:52 派 1 艘船到城 73，20:00 到达后什么都不用做，21:48 复查船仍驻在城里，
+  联盟 3 个宣战城（68/73/74）全部占领。
+- 所以这一段只做两件事：**战前把闲置舰队派到宣战城**、**耐久低于 80% 自动修**。
+- **宣战是盟主/副盟主权限**（普通成员不能宣），而且取消宣战要 200 钻石 —— 这里只跟随，绝不代宣。
+- 汽油按「**出生城 → 目标城**」算，不是按舰队当前所在城：单价 0.4~0.9（越远越贵），花费 = 单价 × 像素距离。
+- 平时整段静默：不在「战前 10 分钟 ~ 战期结束」之间就直接睡到下一场布署点，不会多打请求。
+- 点击「立刻派兵」= 非布署窗也硬派一次（只改时间判断，汽油/名额/委任的闸照旧），用于试跑。</pre>
+
+    <h2>酆都诡事（捞尸人联动）</h2>
+    <div class="bar">
+      <label class="dim" title="只做 4 个免费板块：灭邪祟 + 领累计奖、转龙王罗盘 + 领积分奖、酆都法旨、签到 + 活跃奖。付费板块（累充/每日特惠/战令/满减商店）一个请求都不发">
+        <input type="checkbox" id="youdu-on" checked> 自动跑酆都诡事
+      </label>
+      <label class="dim">间隔 <input id="youdu-every" value="300" style="width:64px"> 秒</label>
+      <label class="dim" title="有抽奖券就转龙王罗盘，抽完领累计积分档位奖（券只能靠签到和日常给，不花钻石买）">
+        <input type="checkbox" id="youdu-spin" checked> 转罗盘
+      </label>
+      <label class="dim" title="有入场券就开一局酆都法旨。服务端把答案放在 session.rune 里，所以 0 显化直接提交 → 耐心留满 100 → 拿最高档奖励">
+        <input type="checkbox" id="youdu-edict" checked> 领法旨
+      </label>
+      <button id="youdu-look">看状态</button>
+      <button id="youdu-run">立刻跑一段</button>
+      <span id="youdu-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="youdu-view">酆都诡事是《疯狂水世界》×《捞尸人》联动活动（2026-10-29 ~ 11-11），本工具只碰**免费**的 4 块：
+- **驱邪除祟**：基地里游荡的邪祟，点一只杀一只（每只给随机奖励），累计 5/10/…/75 只另有里程碑奖（抽奖券 + 100 钻，每 15 只给 10 个藏品碎片）。
+  每 3 分钟刷 1 个、同时最多 6 个，当天没杀完的会累积。
+- **龙王罗盘**：花「抽奖券」转盘，内圈 8 格、抽到龙纹（70 抽保底）再额外拿一个外圈奖励；每抽 30~50 积分，积分档位另给奖。
+- **酆都法旨**：花「入场券」开一局，猜 4 个符文。**服务端把答案直接下发在 session.rune 里**（客户端只是用它渲染符纸、再用遮罩挡住），
+  所以这里是 0 显化直接提交 → 耐心留满 100 → 拿最高档（功德×20）。显化一次扣 5 耐心、猜错扣 10，一次都不该显化。
+- **签到 + 每日活跃**：14 天签到（每天入场券×1 + 体力×20 + 100 钻）与活跃度里程碑。签到靠服务端回包推进
+  （already checked in 跳过、not time yet 当天收工），所以每天实际只发 1~2 条请求。
+- ⛔ **不碰付费**：每日累充、每日特惠、酆都礼遇战令、满减商店结账 —— 都需要充值/花钻石，这里一个请求都不发。
+- 活动实例 id 是 **20261001**（大版本活动容器），不是活动上线日 20261029 —— 后者一律回 prompt 74（活动状态不符）。</pre>
 
     <h2>联盟订单</h2>
     <div class="bar">
@@ -1032,6 +1092,38 @@ function renderGate(nodeId, lastAt, everyMs, enabled, running = true) {
     : base + ' · ' + (left > 0 ? '还差 ' + dur(left) : '已到间隔');
 }
 
+// 国战的状态行跟别的段不一样：它平时是**静默**的（没到布署窗就睡到下一场），
+// 用通用 renderGate 会一直显示「还差 20 小时」，看着像卡死。这里显式写出静默原因与唤醒时刻。
+function renderCityWarGate(data, enabled) {
+  const node = $('city-war-state');
+  if (!node) return;
+  node.title = '';
+  if (!enabled) {
+    node.textContent = '未勾选，不会执行';
+    return;
+  }
+  if (!data.running) {
+    node.textContent = data.lastCityWarAt
+      ? '上次 ' + ago(Math.max(0, Date.now() / 1000 - data.lastCityWarAt)) + ' · 未在挂机，不会执行'
+      : '还没执行过（未在挂机）';
+    return;
+  }
+  const until = Number(data.cityWarSkipUntil) || 0;
+  if (until > 0) {
+    const left = until - Math.floor(Date.now() / 1000);
+    node.title = '唤醒时刻 ' + clock(until);
+    node.textContent = left > 0
+      ? '静默中：' + (data.cityWarSkipReason || '未到布署时间') + '（' + dur(left) + '后唤醒）'
+      : '静默结束，下一轮就探测';
+    return;
+  }
+  if (!data.lastCityWarAt) {
+    node.textContent = '上次：还没执行（首次跑就做一次）';
+    return;
+  }
+  node.textContent = '上次 ' + ago(Math.max(0, Date.now() / 1000 - data.lastCityWarAt)) + ' · 战期窗口内，按间隔轮询';
+}
+
 // 每日宝藏奖励次数：数值来自服务端最近一次探测（挂机每轮更新，手动「立刻抢一次」也更新），
 // 所以页面只显示缓存值，绝不为了「看个数字」在轮询里多发请求。
 // 暂停探测（奖满 / 活动结束 / 没有可抢的）也标在这一行 —— 否则「已领 3/3」配着「上次 30 秒前」
@@ -1101,6 +1193,9 @@ const LOOP_FIELDS = [
   'cargo-on', 'cargo-every',
   'trade-on', 'trade-every', 'trade-speed', 'guild-ship-on', 'guild-ship-every', 'guild-ship-seek',
   'guild-order-on', 'guild-order-every',
+  'city-war-on', 'city-war-every', 'city-war-lead', 'city-war-max', 'city-war-reserve', 'city-war-repair',
+  'city-war-ratio',
+  'youdu-on', 'youdu-every', 'youdu-spin', 'youdu-edict',
 ];
 for (const id of LOOP_FIELDS) {
   const node = $(id);
@@ -1170,6 +1265,43 @@ function renderLoop(data) {
     $('guild-ship-seek').checked = data.guildShipSeek;
   }
   renderGate('guild-order-state', data.lastGuildOrderAt, data.guildOrderEveryMs, gateOn('guild-order-on', data.guildOrderEnabled), data.running);
+  // 国战：静默窗可能长达一整天（白天 → 次日 19:50），必须写清「不是坏了，是还没到点」，
+  // 否则状态行会一直显示「还差 20 小时」，看起来像卡死。
+  syncInterval('city-war-every', data.cityWarEveryMs);
+  if (data.running && typeof data.cityWarPrepLeadSec === 'number' && !loopDirty.has('city-war-lead')
+    && document.activeElement !== $('city-war-lead')) {
+    $('city-war-lead').value = String(Math.round(data.cityWarPrepLeadSec));
+  }
+  if (data.running && typeof data.cityWarMaxFleetsPerCity === 'number' && !loopDirty.has('city-war-max')
+    && document.activeElement !== $('city-war-max')) {
+    $('city-war-max').value = String(data.cityWarMaxFleetsPerCity);
+  }
+  if (data.running && typeof data.cityWarPetrolReserve === 'number' && !loopDirty.has('city-war-reserve')
+    && document.activeElement !== $('city-war-reserve')) {
+    $('city-war-reserve').value = String(data.cityWarPetrolReserve);
+  }
+  if (data.running && typeof data.cityWarRepair === 'boolean' && !loopDirty.has('city-war-repair')) {
+    $('city-war-repair').checked = data.cityWarRepair;
+  }
+  if (data.running && typeof data.cityWarMinPowerRatio === 'number' && !loopDirty.has('city-war-ratio')
+    && document.activeElement !== $('city-war-ratio')) {
+    $('city-war-ratio').value = String(data.cityWarMinPowerRatio);
+  }
+  if (data.running && typeof data.cityWarEnabled === 'boolean' && !loopDirty.has('city-war-on')) {
+    $('city-war-on').checked = data.cityWarEnabled;
+  }
+  renderCityWarGate(data, gateOn('city-war-on', data.cityWarEnabled));
+  syncInterval('youdu-every', data.youduEveryMs);
+  renderGate('youdu-state', data.lastYouduAt, data.youduEveryMs, gateOn('youdu-on', data.youduEnabled), data.running);
+  if (data.running && typeof data.youduSpin === 'boolean' && !loopDirty.has('youdu-spin')) {
+    $('youdu-spin').checked = data.youduSpin;
+  }
+  if (data.running && typeof data.youduEdict === 'boolean' && !loopDirty.has('youdu-edict')) {
+    $('youdu-edict').checked = data.youduEdict;
+  }
+  if (data.running && typeof data.youduEnabled === 'boolean' && !loopDirty.has('youdu-on')) {
+    $('youdu-on').checked = data.youduEnabled;
+  }
   // 运行中把「用商会指针」回填（默认开），标脏的不动。
   if (data.running && typeof data.tradeAllowSpeed === 'boolean' && !loopDirty.has('trade-speed')) {
     $('trade-speed').checked = data.tradeAllowSpeed;
@@ -1260,6 +1392,19 @@ $('loop-start').onclick = async () => {
         // 联盟订单：默认开、600 秒看一眼（料是加工品，工厂一炉 30~300 分钟）。
         guildOrder: $('guild-order-on').checked,
         guildOrderEverySeconds: Number($('guild-order-every').value || 0),
+        // 国战：默认开。平时整段静默，只在「战前 N 秒 ~ 战期结束」之间动。
+        cityWar: $('city-war-on').checked,
+        cityWarEverySeconds: Number($('city-war-every').value || 0),
+        cityWarPrepLeadSeconds: Number($('city-war-lead').value || 600),
+        cityWarMaxFleets: Number($('city-war-max').value || 3),
+        cityWarPetrolReserve: Number($('city-war-reserve').value || 0),
+        cityWarRepair: $('city-war-repair').checked,
+        cityWarPowerRatio: Number($('city-war-ratio').value || 0),
+        // 酆都诡事：只做免费 4 块，默认开、300 秒一段、罗盘与法旨都开。
+        youdu: $('youdu-on').checked,
+        youduEverySeconds: Number($('youdu-every').value || 0),
+        youduSpin: $('youdu-spin').checked,
+        youduEdict: $('youdu-edict').checked,
         powerRatio: Number($('radar-ratio').value || 1.2),
       }),
     });
@@ -1317,13 +1462,18 @@ $('pirate-run').onclick = async () => {
     });
     const results = data.results || [];
     const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
-    const done = results.filter((entry) => entry.ok).length;
+    // 扫荡（免战，不动舰队）和真出战要分开报：混在一起说「派出 N 艘」会把扫荡算成船。
+    const sweeps = results.filter((entry) => entry.kind === 'pirateSweep' && entry.ok).length;
+    const done = results.filter((entry) => entry.ok && entry.kind !== 'pirateSweep').length;
     // 注意：这一段在外层模板字符串里，不能写美元大括号或反引号（会被 Node 先求值），
     // 换行要写成两个反斜杠加 n（输出到浏览器才是换行符）。
     $('pirate-view').textContent = (data.text || '') + (results.length
-      ? '\\n\\n本次派出 ' + done + ' 艘' + (failed ? '，失败 ' + failed + ' 条（明细见下方日志）' : '')
+      ? '\\n\\n本次：扫荡 ' + sweeps + ' 次，派出 ' + done + ' 艘'
+        + (failed ? '，失败 ' + failed + ' 条（明细见下方日志）' : '')
       : '\\n\\n这轮没有可派的目标');
-    $('pirate-state').textContent = results.length ? '派出 ' + done + ' 艘' : '没有可打的';
+    $('pirate-state').textContent = results.length
+      ? (sweeps ? '扫荡 ' + sweeps + ' 次' : '') + (done ? '派出 ' + done + ' 艘' : '') || '扫荡/派兵都被拒'
+      : '没有可打的';
   } catch (error) {
     $('pirate-state').textContent = error.message;
   }
@@ -1453,8 +1603,85 @@ $('guild-ship-run').onclick = async () => {
   }
 };
 
-$('tasks-plan').onclick = async () => {
-  $('tasks-hint').textContent = '检查中 ...';
+$('city-war-look').onclick = async () => {
+  $('city-war-state').textContent = '读取局势 ...';
+  try {
+    const data = await call('/api/citywar');
+    $('city-war-view').textContent = data.text || '';
+    $('city-war-state').textContent = data.summary || '已读取';
+  } catch (error) {
+    $('city-war-state').textContent = error.message;
+  }
+};
+
+$('city-war-run').onclick = () => {
+  openConfirm('立刻跑一次国战布署', [
+    el('div', null, '会把**空闲**舰队派往联盟今天宣战的城市（汽油按「出生城 → 目标城」距离扣），'),
+    el('div', null, '耐久低于 80% 且闲着的船会先修（也吃汽油）。'),
+    el('div', null, '⚠ 这个按钮**不判断战期**：白天点也会照派（用于试跑），平时请让挂机自己跑。'),
+    el('div', null, '⛔ 不发宣战、不取消宣战（200 钻石）、不募兵。'),
+  ], async () => {
+    const data = await call('/api/citywar/run', {
+      method: 'POST',
+      body: JSON.stringify({
+        confirm: true,
+        force: true,
+        repair: $('city-war-repair').checked,
+        prepLeadSeconds: Number($('city-war-lead').value || 600),
+        maxFleets: Number($('city-war-max').value || 3),
+        petrolReserve: Number($('city-war-reserve').value || 0),
+      }),
+    });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '')
+      : String.fromCharCode(10, 10) + '没有要派的（舰队都已就位 / 汽油不够 / 没有宣战城）';
+    $('city-war-view').textContent = (data.text || '') + tail;
+    $('city-war-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  });
+};
+
+// 酆都诡事：看状态（只读） / 立刻跑一段（灭邪祟 → 领累计奖 → 转罗盘 → 领积分奖 → 法旨 → 签到 → 活跃奖）。
+$('youdu-look').onclick = async () => {
+  $('youdu-state').textContent = '读取状态 ...';
+  try {
+    const data = await call('/api/youdu');
+    $('youdu-view').textContent = data.text || '';
+    $('youdu-state').textContent = data.open ? (data.summary || '已读取') : (data.reason || '活动未开启');
+  } catch (error) {
+    $('youdu-state').textContent = error.message;
+  }
+};
+
+$('youdu-run').onclick = () => {
+  openConfirm('立刻跑一次酆都诡事', [
+    el('div', null, '会做：灭掉基地里现存的邪祟 → 领累计奖励 → 转龙王罗盘 → 领积分档位奖 → 领法旨（0 显化直接交答案）→ 签到 → 领活跃奖。'),
+    el('div', null, '消耗的只有活动内道具：**抽奖券**（转盘）和**入场券**（法旨），都是签到/日常白给的。'),
+    el('div', null, '⛔ 不花钻石、不买礼包、不碰每日累充/每日特惠/礼遇战令/满减商店。'),
+  ], async () => {
+    const data = await call('/api/youdu/run', {
+      method: 'POST',
+      body: JSON.stringify({
+        confirm: true,
+        spin: $('youdu-spin').checked,
+        edict: $('youdu-edict').checked,
+      }),
+    });
+    const results = data.results || [];
+    const failed = results.filter((entry) => entry.ok === false && !entry.skipped).length;
+    const notes = (data.notes || []).length ? String.fromCharCode(10) + data.notes.join(String.fromCharCode(10)) : '';
+    const tail = results.length
+      ? String.fromCharCode(10, 10) + '执行 ' + results.length + ' 个动作' + (failed ? '，失败 ' + failed : '') + notes
+      : String.fromCharCode(10, 10) + '这一段没有要做的事（没有邪祟 / 没券 / 今天已签到 / 活跃奖已领完）' + notes;
+    $('youdu-view').textContent = (data.text || '') + tail;
+    $('youdu-state').textContent = results.length ? '执行完成' : '没有要做的事';
+    refreshLoop();
+  });
+};
+
+$('tasks-plan').onclick = async () => {  $('tasks-hint').textContent = '检查中 ...';
   try {
     const data = await call('/api/tasks');
     $('tasks-hint').textContent = '可领 ' + data.plan.length + ' 条';

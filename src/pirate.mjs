@@ -10,8 +10,19 @@
 // - 地图海盗 `AllPirateResponse.pirates[]` = `Pirate{uid,type,level,gridIdx,cityId}`，type 1/2/3 = 先锋/精锐/头目。
 //   注意 `Pirate` **没有 state 字段**（不像雷达事件），所以「这个海盗是不是已经在被我打」只能靠舰队状态判断：
 //   船派出去后 state 变 MOVING，下一轮就不在空闲列表里了。
-//   `sweepTimes` 是**免战扫荡**的余量（`PirateParamCfg.每日野怪扫荡次数` = 10），跟真出战无关，
-//   别拿它当「今天还能打几次」—— 那是 `dailies.mjs` 1010 那条任务的事。
+//
+// - ⚠️ `AllPirateResponse.sweepTimes` 是**今天已经用掉的扫荡次数**，不是剩余次数！
+//   实证两条：① 客户端 `WarPirateModel.initDate(e)` 直接 `this.pirateSweepTimes = e.sweepTimes`，
+//   而它判断剩余用的是 `maxSweepTimes() - pirateSweepTimes`；每日重置时 `pirateSweepTimes = 0`
+//   （新一天 = 已用 0 次）。② 2026-10-28 全天 3930 条回包该字段**恒为 0**，而这天我们一次扫荡都没发过
+//   —— 若它是「剩余」，应该是满额 10。旧注释把它当剩余，导致 dailies 1010 一直误判「次数已用完」。
+//
+// - 免战扫荡 `PirateSweepRequest{uid, cityId}`：**不动舰队、不烧汽油**，打「已通关等级」拿 fixedReward。
+//   次数上限 `PirateParamCfg.每日野怪扫荡次数` = 10（客户端还会加月卡/VIP 的「野怪扫荡次数」效果，
+//   我们拿不到那些加成 → 用 10 当天花板，宁可少扫也不错算）。
+//   客户端 `PiratePop` 的 `case 2` 就是扫荡分支：`level <= maxKilledLevel` 才允许，
+//   次数用完会回 `PromptResponse`（`cannot sweep`）—— 所以「排满 10 条直到被拒」也是安全的，
+//   失败由 `group` 隔离掉其余几条，不会刷屏。
 //
 // - 击杀进度 `PirateKillRecordResponse.records[{type,maxKilledLevel}]`：每种 type 已击杀的最高等级。
 //   客户端的自动讨伐就是「从 maxKilledLevel+1 往上找」，我们照抄这个口径：**默认只打没打过的等级**
@@ -28,8 +39,10 @@
 //   赛季从 `player.worldId` 算：`Math.floor(worldId / 1e6 % 1000)`（客户端 `WorldIdRule.getSeason`）。
 //
 // 边界：只在战力够的时候派（输赢虽然都不掉耐久，但白烧 300 汽油）；
-// 不碰免战扫荡（`PirateSweepRequest`，那是 dailies 1010 的活）；不做「合服世界禁讨伐时段」判断
-// （客户端 `isUniteWorldsForbidTime()` 依赖合服计划数据，我们拿不到 —— 服务端会拒，被拒的动作记 rejected 即可）。
+// 免战扫荡（`PirateSweepRequest`）也在这里做 —— 它不动舰队、不烧汽油、只吃「每日野怪扫荡次数」，
+// 打的是**已通关等级**（`level <= maxKilledLevel`），拿的是该等级 fixedReward；
+// 不做「合服世界禁讨伐时段」判断（客户端 `isUniteWorldsForbidTime()` 依赖合服计划数据，我们拿不到
+// —— 服务端会拒，被拒的动作记 rejected 即可）。
 
 import { normalize } from './worlds.mjs';
 import { rowsOf, assetCount, fleetDuraOk, fleetDuraPct } from './world.mjs';
@@ -40,6 +53,9 @@ const PIRATE_TYPE_TEXT = { 1: '海盗先锋', 2: '海盗精锐', 3: '海盗头�
 
 // 汽油单价的兜底值（配置里「打野怪消耗汽油」读不到时用，实测 300）。
 export const FALLBACK_PETROL_COST = 300;
+
+// 免战扫荡次数的兜底值（`PirateParamCfg.每日野怪扫荡次数` 读不到时用，实测 10）。
+export const FALLBACK_SWEEP_MAX = 10;
 
 const FLEET_STATE_TEXT = { 1: '空闲', 2: '航行中', 3: '战斗中', 4: '修理中', 5: '排队中' };
 
@@ -52,6 +68,23 @@ function paramValue(rows, name) {
 // 单次讨伐的汽油消耗（WorldParamCfg「打野怪消耗汽油」）。
 export function petrolCostOf(config) {
   return paramValue(rowsOf(config, 'WorldParamCfg'), '打野怪消耗汽油') || FALLBACK_PETROL_COST;
+}
+
+// 每日免战扫荡的次数上限 = `PirateParamCfg.每日野怪扫荡次数`（本服 10）
+// + VIP 等级的「野怪扫荡次数」效果（VipLevelCfg.effects：VIP1/2 +2、VIP3/4 +5 ……）。
+// 客户端是 `param(10) + 月卡效果 + 其它效果`，月卡那一项我们读不到（要查月卡开通状态），
+// 所以可能低估 1~5 次 —— 低估只是少扫几次，不会撞 `cannot sweep`。
+// 实测 2026-10-28 23:16：这个账号 `sweepTimes`（已用）已经从 0 涨到 **12**，
+// 说明上限确实不是 10，VIP 加成必须算进去。
+export function sweepMaxOf(config, player = null) {
+  const base = paramValue(rowsOf(config, 'PirateParamCfg'), '每日野怪扫荡次数') || FALLBACK_SWEEP_MAX;
+  const vipLevel = Number(player?.vip?.vipLevel ?? player?.vipLevel ?? 0) || 0;
+  if (vipLevel <= 0) return base;
+  const row = rowsOf(config, 'VipLevelCfg').find((entry) => Number(entry?.level) === vipLevel);
+  const bonus = (row?.effects ?? [])
+    .filter((effect) => Array.isArray(effect) && effect[0] === '野怪扫荡次数')
+    .reduce((sum, effect) => sum + (Number(effect[1]) || 0), 0);
+  return base + bonus;
 }
 
 // 当前赛季：worldId 的编码规则 `Math.floor(worldId / 1e6 % 1000)`。
@@ -166,13 +199,20 @@ export async function surveyPirates(client, protocol, {
     // 缺 uid / type / level 的条目直接丢掉：发出去只会白烧汽油。
     .filter((pirate) => pirate.uid > 0 && pirate.type > 0 && pirate.level > 0);
 
+  // 免战扫荡次数：`all.sweepTimes` 是**今天已用**的次数（见文件头实证），剩余 = 上限 − 已用。
+  const sweepUsed = Math.max(0, Math.floor(Number(all.sweepTimes) || 0));
+  const sweepMax = sweepMaxOf(config, player);
+
   return {
     now: Math.floor(Date.now() / 1000),
     season: seasonOf(player),
     petrol: bag.get('汽油') ?? 0,
     stock: bag,
-    // 免战扫荡余量：**只用于显示**，真出战不看它（见文件头）。
-    sweepTimes: Math.max(0, Math.floor(Number(all.sweepTimes) || 0)),
+    sweepUsed,
+    sweepMax,
+    sweepLeft: Math.max(0, sweepMax - sweepUsed),
+    // 原始值保留（网页统计/其它模块可能直接读），但语义是「已用」，别再当剩余。
+    sweepTimes: sweepUsed,
     pirates,
     killed: new Map((record?.records ?? [])
       .map((row) => [Number(row?.type) || 0, Number(row?.maxKilledLevel) || 0])
@@ -296,13 +336,25 @@ export function viewPirates(survey, {
   targets.sort((a, b) => (Number(b.firstKill) - Number(a.firstKill))
     || (b.level - a.level) || (a.type - b.type));
 
+  // 免战扫荡候选：**只能打已通关的等级**（客户端 PiratePop 的扫荡分支条件就是
+  // `level <= maxPirateKilledLevel(type)`），奖励是该等级的 `fixedReward`
+  // （首杀奖励在真打时已经拿过，扫荡不会再给）。等级越高 fixedReward 越好 → level 降序。
+  const sweepTargets = (survey.pirates ?? [])
+    .filter((pirate) => pirate.level <= (Number(survey.killed?.get(pirate.type)) || 0))
+    .sort((a, b) => (b.level - a.level) || (a.type - b.type) || (a.uid - b.uid));
+
   return {
     now: survey.now,
     season,
     seasonExact,
     petrol,
     petrolCost,
+    // 扫荡次数：sweepTimes 是「已用」，sweepLeft 才是还能扫几次。
+    sweepUsed: Number(survey.sweepUsed) || 0,
+    sweepMax: Number(survey.sweepMax) || FALLBACK_SWEEP_MAX,
+    sweepLeft: Math.max(0, Number(survey.sweepLeft) || 0),
     sweepTimes: survey.sweepTimes,
+    sweepTargets,
     minPowerRatio: ratio,
     repeat,
     fleets: fleets.map((fleet) => ({
@@ -324,14 +376,56 @@ export function viewPirates(survey, {
   };
 }
 
-// 计划：一船一海盗，最强的那艘先挑。
-// 三个上限都要守：船数、汽油、maxPerRound（页面「一次最多派几艘」，默认不限）。
+// 计划：先免战扫荡（免费），再一船一海盗真出战，最强的那艘先挑。
+// 真出战的三个上限都要守：船数、汽油、maxPerRound（页面「一次最多派几艘」，默认不限）。
 // 汽油按「这次要烧的量」累计判断 —— 只判一次会让 2 艘船派出去后才发现只够 1 次的油。
-export function planPirates(view, { maxPerRound = Infinity } = {}) {
+export function planPirates(view, {
+  maxPerRound = Infinity,
+  // 免战扫荡开关与「一轮最多扫几次」。扫荡不动舰队、不烧汽油，只吃每日次数，
+  // 所以它**排在所有前置判断之前**（没空闲船/汽油不够时照样扫）。
+  sweep = true,
+  sweepMaxPerRound = Infinity,
+} = {}) {
   const actions = [];
   const notes = [];
   const cap = Number.isFinite(Number(maxPerRound)) ? Math.max(0, Number(maxPerRound)) : Infinity;
   const cost = Math.max(1, Number(view.petrolCost) || FALLBACK_PETROL_COST);
+
+  // ---- 免战扫荡（PirateSweepRequest）----
+  // 次数语义见文件头：view.sweepUsed 是今天已用，sweepLeft = 上限 − 已用。
+  // 同一批动作共用一个 group：一条被拒（次数真用完 / 该 uid 不可扫）就停掉剩下的，
+  // 不会连发十条刷屏；key 带序号，避免「重复扫同一个海盗」撞 key 被 rejected 永久跳过。
+  if (sweep === true && (view.sweepLeft ?? 0) > 0) {
+    const targets = view.sweepTargets ?? [];
+    if (targets.length === 0) {
+      notes.push(`还有 ${view.sweepLeft} 次免战扫荡，但地图上没有「已通关等级」的海盗可扫`
+        + '（扫荡只能打已击杀过的等级）');
+    } else {
+      const capSweep = Math.min(
+        Math.floor(Number(view.sweepLeft) || 0),
+        Number.isFinite(Number(sweepMaxPerRound)) ? Math.max(0, Number(sweepMaxPerRound)) : Infinity,
+      );
+      for (let index = 0; index < capSweep; index += 1) {
+        // 目标少于次数时轮着扫（扫荡不消灭目标，客户端也是同一个海盗反复点）。
+        // 万一服务端只允许扫一次同一个 uid，第 2 条就会失败 → group 停掉后面的，不会打满十次。
+        const target = targets[index % targets.length];
+        actions.push({
+          kind: 'pirateSweep',
+          request: 'PirateSweepRequest',
+          response: null,
+          body: { uid: target.uid, cityId: target.cityId },
+          key: `pirateSweep:${index + 1}`,
+          group: 'pirateSweep',
+          transient: true,
+          label: `扫荡 ${PIRATE_TYPE_TEXT[target.type] ?? `海盗 ${target.type}`} Lv${target.level}`
+            + `（免战，第 ${(Number(view.sweepUsed) || 0) + index + 1}/${view.sweepMax} 次）`,
+        });
+      }
+      if (capSweep < (Number(view.sweepLeft) || 0)) {
+        notes.push(`免战扫荡还剩 ${view.sweepLeft - capSweep} 次，本轮上限 ${capSweep} 次，下一轮继续`);
+      }
+    }
+  }
 
   if (view.targets.length === 0) {
     for (const type of view.types) {
@@ -421,6 +515,8 @@ export function formatPirateSummary(view) {
   const head = `S${view.season || '?'}${view.seasonExact ? '' : '（赛季未知，战力取各赛季最高，偏保守）'}`
     + ` · 汽油 ${view.petrol}（每次 ${view.petrolCost}）`
     + ` · 空闲船 ${view.idleFleets.length}/${view.fleets.length}（最强 ${powerText(view.bestIdlePower)}）`
+    // 免战扫荡：`sweepUsed` 是今天已用次数，所以这里报「剩 x/上限」，别把已用当剩余。
+    + ` · 免战扫荡剩 ${view.sweepLeft ?? 0}/${view.sweepMax ?? FALLBACK_SWEEP_MAX}`
     // 被耐久闸留下的船单独标出来：否则「空闲船 0/2」看着像船都在航行。
     + ((view.groundedFleets ?? []).length > 0 ? ` · 耐久<${Math.round((Number(view.duraFloor) || 0) * 100)}% ${view.groundedFleets.length} 艘待修` : '');
   const progress = view.types.map((type) => `${type.name.replace('海盗', '')} ${type.killedLevel}`).join(' / ');

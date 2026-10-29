@@ -239,7 +239,8 @@ export function formatState(view) {
     ].filter(Boolean);
     lines.push(`  ${building.buildingId} ${bits.join(' ')}`);
   }
-  lines.push(`世界: 资源田 ${view.resFields?.count ?? 0}/${view.resFields?.max ?? 0} 舰队 ${view.fleets} 货船 ${view.cargo} 海盗 ${view.pirates?.count ?? 0}(扫荡${view.pirates?.sweepTimes ?? 0})`);
+  // sweepTimes 是「今天已用掉的免战扫荡次数」（不是剩余，见 pirate.mjs 文件头）。
+  lines.push(`世界: 资源田 ${view.resFields?.count ?? 0}/${view.resFields?.max ?? 0} 舰队 ${view.fleets} 货船 ${view.cargo} 海盗 ${view.pirates?.count ?? 0}(今日已扫 ${view.pirates?.sweepTimes ?? 0})`);
   lines.push(`  自动生产至 ${clock(view.water.autoProduceEndTime)} 永久=${view.water.autoProduceForever} 自动种植=${view.water.autoFarming}`);
   lines.push(`  钓鱼lv${view.water.fishingLevel ?? '-'} 打捞lv${view.water.salvageLevel ?? '-'} 潜水lv${view.water.divingLevel ?? '-'}`);
   if (view.worldBoss) lines.push(`  世界Boss bossId=${view.worldBoss.bossId} 最高伤害=${view.worldBoss.bestDamage} 已领档位=${view.worldBoss.gotRewardLevel}`);

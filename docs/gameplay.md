@@ -980,8 +980,37 @@ fixedEvent = { eventId, gridIdx, startTime, createTime, state }   ← 第 6 个�
 | 玩法 | 请求 | 动舰队 | 代价 | 我们怎么用 |
 |---|---|---|---|---|
 | 联盟情报事件（雷达） | `RadarSendFleetsRequest` | 要 | 汽油 500 × 船数 | `radar.mjs`，已全自动 |
-| 免战扫荡 | `PirateSweepRequest{uid,cityId}` | **不动** | 每天 10 次（`PirateParamCfg.每日野怪扫荡次数`） | `dailies.mjs` 1010 里顺手做 |
+| 免战扫荡 | `PirateSweepRequest{uid,cityId}` | **不动** | 每天 10 次 + VIP 加成（`PirateParamCfg.每日野怪扫荡次数` + `VipLevelCfg.effects` 的「野怪扫荡次数」） | `pirate.mjs` 每轮先扫完，`dailies.mjs` 1010 用它凑任务进度 |
 | 真出战 | `ChallengePirateRequest{uid,fleetBuildingIds,cityId}` | 要 | 汽油 300（`WorldParamCfg.打野怪消耗汽油`），**耐久 0** | `pirate.mjs` |
+
+**免战扫荡的 `sweepTimes` 是「已用」不是「剩余」（2026-10-28 修）**
+
+这是本项目里最贵的一次语义误读：**每天 10 次免费扫荡，一次都没扫过**，日志还天天说「次数已用完」。
+
+证据链（三条独立互相印证，别再凭猜）：
+
+1. 客户端 `WarPirateModel.initDate(e)`：`this.pirateSweepTimes = e.sweepTimes`，
+   而它判剩余用的是 `maxSweepTimes() - this.pirateSweepTimes`；每日重置（`daily reset`）里
+   `n.model.warPirate.pirateSweepTimes = 0` —— 新的一天 = 已用 0 次。
+2. 2026-10-28 全天 3930 条 `AllPirateResponse` 该字段**恒为 0**，而那天一次扫荡都没发过。
+   若它是「剩余」，应该是满额 10。
+3. 同一天 23:01→23:16，地图上海盗从 67 个变 57 个（少了 10 个），`sweepTimes` 同时从 0 变 **12**
+   —— 扫了 12 次，数字**增加**，只可能是「已用」。
+
+配套事实：
+
+- **只能扫已通关等级**：客户端 `PiratePop` 的 `_ctl_state.selectedIndex = 2`（扫荡分支）
+  条件是 `level <= maxPirateKilledLevel(type)`；`level == maxKilled + 1` 才是真出战。
+  拿的是该等级 `fixedReward`（首杀奖励真打时已拿过）。
+- **上限不是 10**：`maxSweepTimes() = param(10) + 月卡效果 + 其它效果`，
+  `VipLevelCfg.effects` 里 VIP1/2 = +2、VIP3/4 = +5。本账号 VIP2 → 上限 **12**，与实测吻合。
+  月卡加成读不到（要查月卡开通状态），所以可能低估几次 —— 低估只是少扫，不会撞拒绝。
+- **被拒的文案**：次数用完回 `PromptResponse.prompt = "sweep times not enough"`（实测 23:20），
+  `sendWatch` 会抛错 → `runWorld` 记失败 + `group` 隔离，**一条被拒就停掉剩下的**。
+  `loop` 还据此记 `sweepBlockedUntil = 明天 0 点`，当天不再试（否则每 60 秒撞一次同一句）。
+- **不依赖舰队也不烧汽油**，所以计划里它排在真出战**前面**，且「没空闲船 / 汽油不够」时照扫。
+- 同一批扫荡动作 `group: 'pirateSweep'`、`key` 带序号（重复扫同一个 uid 不撞 key）、`transient: true`。
+  地图上「已通关等级」的海盗有几十个（实测 39 个），目标不够时才轮着扫。
 
 **请求名踩过的坑**：早先的记录把真出战写成 `PirateFightRequest` —— 协议表和客户端里**都没有这个名字**，
 正确的是 `ChallengePirateRequest`（客户端 `SelectTroopPop` 的 `case _.Pirate:`）。
@@ -1721,3 +1750,89 @@ preparedEndTime / pos / mvToCityId / mvStartTime / mvEndTime`。
    船位满了 → 睡到自己那几条船**最早释放**的一刻（在航的到港时间 / 补货截止时间）+5 秒，别白打请求。
 5. **绝不花钱**：缺料就报「缺什么、差多少」，等工厂产，不做钻石购买、不买 VIP 卡。
 
+
+## 17. 国战（联盟攻城，每天 20:00–21:00）
+
+代码：`src/cityWar.mjs`（探测 / 视图 / 计划 / 文案）、`tools/probe-citywar.mjs`（只读探针）、
+CLI `node src/app.mjs citywar [--dry] [--force]`、循环第 13 段、网页「国战（联盟攻城）」。
+
+### 17.1 玩法与结论
+
+联盟每天可以宣战最多 **3 座相邻城**（`MAX_DECLARE_CITIES=3`，按联盟算，不是按人），
+战期 **20:00–21:00**（服务端 `SCCityWarTime` 每天 0 点推一次）。
+
+**关键结论：不需要自己写战斗逻辑，也不需要战期内反复派兵。**
+客户端 `TipsDescCfg.舰队委任` 原文是「开启舰队委任后，城战期间会自动派出队伍进攻宣战城市」，
+而舰队只要在城里，就已经算进这一城的战斗点。2026-10-28 实盘：
+
+- 19:52 `MoveFleetsToCityRequest{buildingId:['2远征船'], cityId:73}` → state 立刻 `MOVING(2)`；
+- 20:00 到达，之后**没有做任何操作**；
+- 21:48 复查：`state=IDLE / cityId=73 / 耐久 1800/2000（没掉）`，且出现在 `CityDefenceResponse(73).fleets`
+  的守军名单里（`isNpc=false`，名字=自己昵称）；
+- 联盟 3 个宣战城（68 / 73 / 74）全部占领，宣战列表从 5 条降到 1 条（只剩别的联盟的）。
+
+所以自动化只有两件事：**战前把闲置舰队派到宣战城**、**耐久低于 80% 自动修**。
+
+### 17.2 协议（字段已用实盘回包核对）
+
+| 消息 | 字段 | 说明 |
+|---|---|---|
+| `GuildInfoRequest {}` → `GuildInfoResponse` | `guild.guildId/name/level/memberCount`、`myTitle` | 职位 4 副盟主 / 5 盟主 才有宣战权 |
+| `WarDeclarationRequest {}` → `WarDeclarationResponse` | `declarations[WarDeclaration]`、`startTime`、`endTime`、`assembleCityId` | 只读；`WarDeclaration{attackGuildIdx,defenceGuildIdx,cityId}` |
+| `MyFleetsRequest {}` → `MyFleetsResponse` | `fleets[WorldFleet]` | `state/cityId/targetCityId/durability/maxDura/power/repairing/autoFight` |
+| `CityDefenceRequest {cityId}` → `CityDefenceResponse` | `fleets[DefenceFleetInfo]` | `{name,guildIdx,power,multiple,isNpc}` |
+| `GuildCityInfoRequest {}` → `GuildCityInfoResponse` | `cities[DispGuildCity{cityId,recommended,defenceNum,fort}]` | 可打城市 + 防御值 |
+| `MoveFleetsToCityRequest {buildingId:[…], cityId}` | — | **无 Response** → `sendWatch` |
+| `RepairFleetRequest {buildingId}` | — | **无 Response**；只有 IDLE 能修，修是「修满」 |
+| `FleetRepairParamRequest {buildingId}` → `FleetRepairParamResponse` | `unitRepairTime`、`unitRepairCost` | 服务端下发，不能硬编码 |
+| `SetFleetAutoFightRequest {buildingIds:[…], isOn}` | `MyFleet.autoFight{isOn,todayTimes}` | 原生「舰队委任」，**需 VIP3+** |
+
+`FleetState`：`1 IDLE / 2 MOVING / 3 BATTLING / 4 REPAIRING / 5 QUEUING`。
+
+### 17.3 三个坑（每个都踩过）
+
+1. **联盟身份是 idx 不是 guildId**：客户端 `guildIndex(e) = e % 1000`。我们 `guildId 2001014410003` → **idx 3**，
+   只有 `attackGuildIdx === 3` 的宣战才是我们的战场。而且 guildId 在回包里是 **int64**（low 有符号），
+   必须走 `bigNum()`，直接 `Number()` 会算出负数。
+2. **守军总战力不能乘 `multiple`**：客户端 `DefenseTroopPop` 里 `multiple` 是
+   `cityDefenseName(cityId) + " x" + multiple` 的**单位数**（「城防兵 x1000」），战力单独显示 `power`。
+   按 `power × multiple` 算会把守军放大 1000 倍（实测城 86：power 370000、multiple 1000 → 3.7 亿），
+   于是一个兵都派不出去。
+3. **战期回包会「停在上一场」**：服务端只在 0 点推 `SCCityWarTime`，`WarDeclarationResponse.startTime/endTime`
+   实测在跨天后仍返回**昨天**那一场（10/28 22:40：窗口还是 10/28 20:00–21:00，宣战列表已经是新一场的城 86）。
+   直接拿它跟当前时间比，第二天 19:50 会被判成「今日已结束」→ 睡一整天 → **整场国战错过**。
+   口径：按 86400 秒整日往前滚，滚到「end > now」为止（`rollWarWindow`）。
+
+### 17.4 派兵汽油
+
+客户端 `getAttackCityPetrolCost(bornCityId(), targetCityId)`：
+
+- **距离从出生城算，不是从舰队当前所在城**。出生城 = `CityCfg` 里 `guildIndex === 我的 idx` 那一行
+  （我们 idx=3 → 水之都 91）。
+- 距离 = 两座城格子中心的像素欧氏距离：`x = row%2===0 ? col*tileWidth + tileWidth/2 : (col+1)*tileWidth`，
+  `y = -(row+1)*tileHeight/2 - tileHeight/2`（客户端还减了 `mapSize.height`，常数项不影响距离）。
+  格子尺寸/坐标来自 `work/cdn/world_map.world_map<scenarioId>.json`（`scenarioId=1` → `world_map1.json`）。
+- 单价按距离分档（`AttackCityConsumeCfg`）：`<6000` 像素 0.4，之后每 2400 像素 +0.1（6000/8400/10800/13200/15600）。
+- 花费 = `ceil(单价 × 距离)`。实测 91 → 73 约 1200 汽油，91 → 86 约 5938。
+
+### 17.5 自动化决策（`planCityWar`）
+
+1. **只在布署窗动**：`phase` = `waiting / prep / live / done / unknown`；
+   只有 `prep`（战前 10 分钟）与 `live`（战中）才发请求，其余时间整段静默，睡到下一场布署点。
+2. **先修再派**：`state=IDLE && 耐久 < 80% && 没在修` → `RepairFleetRequest`；
+   同一艘船**同一轮不会再派**（修完会变 `REPAIRING`，派了必被拒）。
+   汽油不够修满就只写 note，不发必败请求。
+3. **派兵**：只派 `IDLE + 耐久>0 + 没开委任` 的船（委任中的由服务端托管，不抢）；
+   目标按「我方进攻城（守军最弱优先）→ 我方防守城」排序，每城最多 3 艘；
+   已经在目标城 / 正在去目标城 / 每城名额满了的都不重复派。
+4. **汽油闸**：派兵后至少留 2 万汽油（`--no-…` 不可调时用默认）；不够就跳过并说明。
+5. **战力闸默认 0（不拦）**：进城就能拿战斗点，打不过也有功勋；战力低于守军时只多写一条提示。
+   想只打有把握的城，把「战力余量」设成 1.2。
+6. **不越过边界**：不宣战、不取消宣战（**200 钻石**）、不 `CityRecruitDefenceRequest`（募兵令，防守方道具）。
+
+### 17.6 静默窗与日志
+
+- 不在窗内 → `cityWarSkipUntil` = 下一场开战前 10 分钟；页面状态行写「静默中：…（x 小时后唤醒）」，
+  **只在设窗/换窗那一轮报一次**（一整天不刷屏）。
+- 战期未知（没宣战 / 还没到 0 点推送）→ 每小时探一次。
+- 派兵/修船被拒 → 退避 5 分钟（别拿同一条必败请求每 3 分钟撞墙）。

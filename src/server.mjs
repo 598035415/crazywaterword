@@ -31,6 +31,29 @@ import {
   formatGuildShipGain,
   bigNum,
 } from './guildShip.mjs';
+import {
+  surveyCityWar,
+  viewCityWar,
+  planCityWar,
+  formatCityWarSummary,
+  formatCityWarGain,
+  cityWarBlockedReason,
+  CW_STATE_TEXT,
+  DEFAULT_CW_PREP_LEAD_SEC,
+  DEFAULT_CW_REPAIR_BELOW,
+  DEFAULT_CW_PETROL_RESERVE,
+  DEFAULT_CW_MAX_FLEETS_PER_CITY,
+} from './cityWar.mjs';
+import {
+  surveyYoudu,
+  viewYoudu,
+  planYoudu,
+  runYouduSigns,
+  settleYouduEdict,
+  formatYouduSummary,
+  summarizeYoudu,
+  formatYouduGain,
+} from './youdu.mjs';
 import { surveyCargo, fetchStock, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, safeCargoDemand, CARGO_SLOTS } from './tradePort.mjs';
 import {
   surveyTradeKing,
@@ -191,6 +214,26 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         guildShipEveryMs: 120_000,
         lastGuildShipAt: null,
         guildShipSeek: true,
+        // 国战（联盟攻城，每天 20:00–21:00）：只做「派兵 + 修船」，不宣战、不取消宣战（200 钻石）。
+        // 平时整段静默 —— 不在「战前 10 分钟 ~ 战期结束」就直接睡到下一场布署点。
+        cityWarEnabled: true,
+        cityWarEveryMs: 180_000,
+        lastCityWarAt: null,
+        cityWarRepair: true,
+        cityWarPrepLeadSec: 600,
+        cityWarMinPowerRatio: 0,
+        cityWarPetrolReserve: 20_000,
+        cityWarMaxFleetsPerCity: 3,
+        // 静默窗（不在布署窗/战中就睡到下一场）：页面要能看出「不是坏了，是还没到点」。
+        cityWarSkipUntil: null,
+        cityWarSkipReason: '',
+        // 酆都诡事（捞尸人联动）：灭邪祟 + 领累计奖、转龙王罗盘 + 领积分奖、酆都法旨、签到 + 活跃奖。
+        // 全是免费板块，付费（累充/每日特惠/战令/满减商店）一个请求都不发。
+        youduEnabled: true,
+        youduEveryMs: 300_000,
+        lastYouduAt: null,
+        youduSpin: true,
+        youduEdict: true,
         // 海商王（活动「Trade」，每天 10~22 点）：在港就卖 + 买本港特产 + 开去紧缺港口。
         // 只花活动内的商会币（不花钻石），商会指针是免费道具 —— 默认全用。
         // 海商王活动 2026-10-28 已下线，loop 里那一段整段注释，这里也跟着默认关。
@@ -512,7 +555,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       seasonExact: view.seasonExact,
       petrol: view.petrol,
       petrolCost: view.petrolCost,
+      // 扫荡次数：sweepTimes 是今天「已用」，sweepLeft 才是还能扫几次（语义见 pirate.mjs 文件头）。
       sweepTimes: view.sweepTimes,
+      sweepUsed: view.sweepUsed,
+      sweepMax: view.sweepMax,
+      sweepLeft: view.sweepLeft,
+      sweepTargets: view.sweepTargets,
       bestIdlePower: view.bestIdlePower,
       minPowerRatio: ratio,
       repeat: view.repeat,
@@ -804,6 +852,134 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         text: formatGuildShipSummary(view) + (plan.actions.length > 0
           ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
           : `\n没有可做的（${plan.notes[0] ?? '等下一条船刷新'}）`),
+      },
+    };
+  }
+
+  // 国战（联盟攻城）：只读视图 + 派兵/修船计划，真正的写走 /api/citywar/run。
+  // 「联盟宣了哪几座城」只有服务端知道（宣战是盟主/副盟主的权限），所以这里只跟随，不代宣。
+  async function cityWar(session, account, options = {}) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const stock = options.stock ?? await fetchStock(instance, protocol);
+    const survey = await surveyCityWar(instance, protocol, {
+      config,
+      stock,
+      player: session.player,
+      prepLead: options.prepLead ?? DEFAULT_CW_PREP_LEAD_SEC,
+      repairBelow: options.repairBelow ?? DEFAULT_CW_REPAIR_BELOW,
+      // force：非布署窗也把守军查出来（否则白天点「看局势」看到的全是「守军未知」）。
+      force: options.force === true,
+    });
+    const view = viewCityWar(survey, { config, player: session.player });
+    // 手动跑时允许「非布署窗也硬派」：只改 phase，其余判据（汽油/名额/委任）照旧。
+    const planView = options.force ? { ...view, phase: 'prep' } : view;
+    const plan = planCityWar(planView, {
+      repair: options.repair !== false,
+      petrolReserve: options.petrolReserve ?? DEFAULT_CW_PETROL_RESERVE,
+      maxFleetsPerCity: options.maxFleets ?? DEFAULT_CW_MAX_FLEETS_PER_CITY,
+    });
+    return {
+      survey,
+      view,
+      plan,
+      payload: {
+        phase: view.phase,
+        startAt: view.startAt,
+        endAt: view.endAt,
+        secondsToStart: view.secondsToStart,
+        secondsToEnd: view.secondsToEnd,
+        myIdx: view.myIdx,
+        myTitle: view.myTitle,
+        canDeclare: view.canDeclare,
+        bornCity: view.bornCity,
+        petrol: view.petrol,
+        summary: formatCityWarSummary(view),
+        targets: view.targets,
+        fleets: view.fleets.map((fleet) => ({
+          buildingId: fleet.buildingId,
+          state: fleet.state,
+          stateText: CW_STATE_TEXT[fleet.state] ?? `状态${fleet.state}`,
+          cityId: fleet.cityId,
+          power: fleet.power,
+          durability: fleet.durability,
+          maxDurability: fleet.maxDurability,
+          duraPct: fleet.duraPct,
+          autoFight: fleet.autoFight,
+          needsRepair: fleet.needsRepair,
+          atTargetCity: fleet.atTargetCity,
+        })),
+        actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+        notes: plan.notes,
+        text: formatCityWarSummary(view)
+          + (plan.actions.length > 0
+            ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
+            : `\n没有可做的（${plan.notes[0] ?? cityWarBlockedReason(view) ?? '舰队都已就位'}）`),
+      },
+    };
+  }
+
+  // 酆都诡事（捞尸人联动）：4 个免费板块的只读视图 + 计划，写操作走 /api/youdu/run。
+  // 付费板块（累充 / 每日特惠 / 礼遇战令 / 满减商店）一个请求都不发。
+  async function youdu(session, account, options = {}) {
+    const instance = await ensureConnected(session, account);
+    const config = loadConfigSafe();
+    const survey = await surveyYoudu(instance, { config });
+    const view = viewYoudu(survey, { config });
+    const plan = planYoudu(view, { config, spin: options.spin !== false, edict: options.edict !== false });
+    return {
+      survey,
+      view,
+      plan,
+      payload: {
+        open: view.open,
+        activityId: view.activityId,
+        reason: view.reason ?? null,
+        summary: formatYouduSummary(view),
+        evil: view.open ? {
+          alive: view.evil.alive,
+          maxAlive: view.evil.maxAlive,
+          todayKill: view.evil.todayKill,
+          killTotal: view.evil.killTotal,
+          claimed: view.evil.claimed,
+          claimable: view.evil.claimable.map((row) => ({ id: row.id, totalCount: row.totalCount })),
+          next: view.evil.next ? { id: view.evil.next.id, totalCount: view.evil.next.totalCount } : null,
+        } : null,
+        wheel: view.open ? {
+          score: view.wheel.score,
+          claimedId: view.wheel.claimedId,
+          times: view.wheel.times,
+          pity: view.wheel.pity,
+          dragonIn: view.wheel.dragonIn,
+          coinHeld: view.wheel.coinHeld,
+          costId: view.wheel.costId,
+          costNum: view.wheel.costNum,
+          spins: view.wheel.spins,
+          outerGot: view.wheel.outerGot,
+          claimable: view.wheel.claimable.map((row) => ({ id: row.id, score: row.score })),
+        } : null,
+        edict: view.open ? {
+          ticketHeld: view.edict.ticketHeld,
+          ticketNum: view.edict.ticketNum,
+          canStart: view.edict.canStart,
+          hasSession: !!view.edict.session,
+          session: view.edict.session,
+          patienceTotal: view.edict.patienceTotal,
+          askCost: view.edict.askCost,
+          receiveCost: view.edict.receiveCost,
+        } : null,
+        stock: view.open ? {
+          ticket: view.stock.get('活动26捞尸人_入场券') ?? 0,
+          coin: view.stock.get('活动26捞尸人_抽奖券') ?? 0,
+          merit: view.stock.get('活动26捞尸人_货币') ?? 0,
+          energy: view.stock.get('打雪仗体力') ?? 0,
+        } : null,
+        actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+        notes: plan.notes,
+        text: formatYouduSummary(view)
+          + (plan.actions.length > 0
+            ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
+            : `\n没有可做的（${plan.notes[0] ?? '当前没有可领/可打'}）`),
       },
     };
   }
@@ -1266,7 +1442,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         await new Promise((resolve) => setTimeout(resolve, 1200));
         json({
-          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          // kind 一起回：扫荡（pirateSweep）和真出战（pirateChallenge）要分开数，
+          // 页面上「扫荡 N 次 / 派出 M 艘」靠它区分。
+          results: results.map((r) => ({ kind: r.step.kind, label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
           ...(await pirates(session, account)),
         });
         return;
@@ -1338,6 +1516,108 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       if (route === 'GET /api/guildship') {
         const { account, session } = scoped_(parsed);
         json((await guildShip(session, account)).payload);
+        return;
+      }
+      // 国战（联盟攻城）：只读看局势（联盟宣了哪几座城、守军多强、我每艘船在哪、派过去多少汽油）。
+      if (route === 'GET /api/citywar') {
+        const { account, session } = scoped_(parsed);
+        json((await cityWar(session, account)).payload);
+        return;
+      }
+      // 立刻跑一次国战布署（派兵 + 修船）。`force:true` 可以在非布署窗硬派，便于白天试跑。
+      if (route === 'POST /api/citywar/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const options = {
+          force: payload.force === true,
+          repair: payload.repair !== false,
+          prepLead: payload.prepLeadSeconds ? Number(payload.prepLeadSeconds) : undefined,
+          petrolReserve: payload.petrolReserve != null ? Number(payload.petrolReserve) : undefined,
+          maxFleets: payload.maxFleets != null ? Number(payload.maxFleets) : undefined,
+        };
+        const before = await cityWar(session, account, options);
+        const instance = await ensureConnected(session, account);
+        let results = [];
+        if (before.plan.actions.length > 0) {
+          ({ results } = await runWorld(instance, protocol, before.plan, {
+            allowMutate: true,
+            window: 1500,
+            onStep: (entry) => {
+              if (entry.skipped) emit(session, 'warn', `国战「${entry.step.label}」跳过：${entry.error}`);
+              else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `国战 ${entry.step.label}` : `国战 ${entry.step.label} 失败：${entry.error}`);
+            },
+          }));
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          const gain = formatCityWarGain(results);
+          if (gain) emit(session, 'warn', gain);
+        }
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await cityWar(session, account, options)).payload,
+        });
+        return;
+      }
+      // 酆都诡事（捞尸人联动）：只读看 4 个免费板块的状态与待办。
+      if (route === 'GET /api/youdu') {
+        const { account, session } = scoped_(parsed);
+        json((await youdu(session, account)).payload);
+        return;
+      }
+      // 立刻跑一段酆都诡事（灭邪祟 → 领累计奖 → 转罗盘 → 领积分奖 → 法旨 → 签到 → 活跃奖）。
+      if (route === 'POST /api/youdu/run') {
+        const payload = jsonBody();
+        needConfirm(payload);
+        const { account, session } = scoped_(parsed);
+        const options = { spin: payload.spin !== false, edict: payload.edict !== false };
+        const before = await youdu(session, account, options);
+        const instance = await ensureConnected(session, account);
+        let results = [];
+        let signResults = [];
+        let signNotes = [];
+        if (before.plan.actions.length > 0) {
+          ({ results } = await runWorld(instance, protocol, before.plan, {
+            allowMutate: true,
+            window: 1200,
+            onStep: (entry) => {
+              if (entry.skipped) emit(session, 'warn', `酆都诡事「${entry.step.label}」跳过：${entry.error}`);
+              else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `酆都诡事 ${entry.step.label}` : `酆都诡事 ${entry.step.label} 失败：${entry.error}`);
+            },
+          }));
+        }
+        // 法旨：开局回包里就带答案，当轮直接交，不用白等下一轮。
+        let edictFixResults = [];
+        let edictFixNotes = [];
+        if (before.view.open) {
+          const fix = await settleYouduEdict(instance, results, {
+            allowMutate: true,
+            onStep: (entry) => {
+              emit(session, entry.ok ? 'info' : 'error', entry.ok ? `酆都诡事 ${entry.step.label}` : `酆都诡事 ${entry.step.label} 失败：${entry.error}`);
+            },
+          });
+          edictFixResults = fix.results;
+          edictFixNotes = fix.notes;
+        }
+        results = [...results, ...edictFixResults];
+        // 签到按回包推进（already checked in / not time yet），不能塞进静态计划。
+        if (before.view.open) {
+          const signs = await runYouduSigns(instance, {
+            config: loadConfigSafe(),
+            onStep: (entry) => {
+              if (entry.ok) emit(session, 'info', `酆都诡事 ${entry.step.label}`);
+              else emit(session, 'error', `酆都诡事 ${entry.step.label} 失败：${entry.error}`);
+            },
+          });
+          signResults = signs.results;
+          signNotes = signs.notes;
+        }
+        const gain = formatYouduGain(summarizeYoudu([...results, ...signResults]));
+        if (gain) emit(session, 'warn', gain);
+        json({
+          results: [...results, ...signResults].map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          notes: [...edictFixNotes, ...signNotes],
+          ...(await youdu(session, account, options)).payload,
+        });
         return;
       }
       // 立刻跑一段联盟商船（补货 → 应聘船长），判据与循环里那套完全一样。
@@ -1902,6 +2182,24 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.guildShipEnabled = payload.guildShip !== false;
         loop.guildShipEveryMs = secondsArg(payload.guildShipEverySeconds, 120) * 1000;
         loop.guildShipSeek = payload.guildShipSeek !== false;
+        // 国战默认开：动作只有「把闲置舰队派到联盟宣战城」+「耐久低了修一下」，全程只烧汽油，
+        // 而且平时整段静默，不会为了它多打请求。间隔 180 秒（布署窗 10 分钟够算好几轮）。
+        loop.cityWarEnabled = payload.cityWar !== false;
+        loop.cityWarEveryMs = secondsArg(payload.cityWarEverySeconds, 180) * 1000;
+        loop.cityWarRepair = payload.cityWarRepair !== false;
+        loop.cityWarPrepLeadSec = secondsArg(payload.cityWarPrepLeadSeconds, 600);
+        loop.cityWarMinPowerRatio = Number(payload.cityWarPowerRatio) > 0 ? Number(payload.cityWarPowerRatio) : 0;
+        loop.cityWarPetrolReserve = Number(payload.cityWarPetrolReserve) >= 0
+          ? Number(payload.cityWarPetrolReserve) : 20_000;
+        loop.cityWarMaxFleetsPerCity = Number(payload.cityWarMaxFleets) > 0
+          ? Number(payload.cityWarMaxFleets) : 3;
+        // 酆都诡事默认开，间隔默认 300 秒：邪祟 3 分钟刷 1 个、上限 6；
+        // 抽奖券/入场券都是签到与日常给的，半天才凑够一张，看太勤只是白打 4 个请求。
+        loop.youduEnabled = payload.youdu !== false;
+        loop.youduEveryMs = secondsArg(payload.youduEverySeconds, 300) * 1000;
+        // 关掉就只灭邪祟 + 签到，不动罗盘和法旨（保守模式）。
+        loop.youduSpin = payload.youduSpin !== false;
+        loop.youduEdict = payload.youduEdict !== false;
         // 联盟订单默认开，间隔默认 600 秒：料是工厂产的加工品（30~300 分钟一炉），
         // 看太勤只是白打 3 个请求（GuildOrder + GuildCityInfo + CounterInfo）。
         loop.guildOrderEnabled = payload.guildOrder !== false;
@@ -1931,6 +2229,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           loop.lastTradeAt = null;
           loop.lastGuildShipAt = null;
           loop.lastGuildOrderAt = null;
+          // 国战：静默窗也一起清掉，否则「昨晚睡到明天 19:50」会跟着新开的循环一起带过来。
+          loop.lastCityWarAt = null;
+          loop.cityWarSkipUntil = null;
+          loop.cityWarSkipReason = '';
         }
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
         const farmText = loop.farmEnabled
@@ -1966,12 +2268,17 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const guildOrderText = loop.guildOrderEnabled
           ? (loop.guildOrderEveryMs > 0 ? `联盟订单每 ${Math.round(loop.guildOrderEveryMs / 1000)} 秒看一眼` : '联盟订单每轮都看')
           : '联盟订单关';
+        const cityWarText = loop.cityWarEnabled
+          ? `国战开战前 ${Math.round(loop.cityWarPrepLeadSec / 60)} 分钟布署舰队`
+            + `（每城最多 ${loop.cityWarMaxFleetsPerCity} 艘${loop.cityWarRepair ? ' + 耐久低自动修' : ''}，`
+            + `留 ${loop.cityWarPetrolReserve} 汽油备用；只在 20:00–21:00 前后干活）`
+          : '国战关';
         const pirateText = loop.pirateEnabled
           ? `海盗${loop.pirateEveryMs > 0 ? `每 ${Math.round(loop.pirateEveryMs / 1000)} 秒` : '每轮'}讨伐一次`
             + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×）`
           : '海盗关';
         const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
-        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${guildShipText}；${guildOrderText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
+        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${guildShipText}；${guildOrderText}；${cityWarText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
         // 热更新到此为止：正在跑的那个 runLoop 会从 live() 读到新值，下一轮自动生效。
         if (hot) {
           json({ ok: true, running: true, hot: true, note: '设置已应用，下一轮生效' });
@@ -2018,6 +2325,17 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           guildShipEnabled: loop.guildShipEnabled,
           guildShipEveryMs: loop.guildShipEveryMs,
           guildShipSeek: loop.guildShipSeek,
+          cityWarEnabled: loop.cityWarEnabled,
+          cityWarEveryMs: loop.cityWarEveryMs,
+          cityWarRepair: loop.cityWarRepair,
+          cityWarPrepLeadSec: loop.cityWarPrepLeadSec,
+          cityWarMinPowerRatio: loop.cityWarMinPowerRatio,
+          cityWarPetrolReserve: loop.cityWarPetrolReserve,
+          cityWarMaxFleetsPerCity: loop.cityWarMaxFleetsPerCity,
+          youduEnabled: loop.youduEnabled,
+          youduEveryMs: loop.youduEveryMs,
+          youduSpin: loop.youduSpin,
+          youduEdict: loop.youduEdict,
           guildOrderEnabled: loop.guildOrderEnabled,
           guildOrderEveryMs: loop.guildOrderEveryMs,
           minPowerRatio: loop.minPowerRatio,
@@ -2048,6 +2366,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastCargoAt = summary.gates?.cargo?.lastAt ?? loop.lastCargoAt;
             loop.lastTradeAt = summary.gates?.trade?.lastAt ?? loop.lastTradeAt;
             loop.lastGuildShipAt = summary.gates?.guildShip?.lastAt ?? loop.lastGuildShipAt;
+            loop.lastCityWarAt = summary.gates?.cityWar?.lastAt ?? loop.lastCityWarAt;
+            loop.lastYouduAt = summary.gates?.youdu?.lastAt ?? loop.lastYouduAt;
+            loop.cityWarSkipUntil = summary.gates?.cityWar?.skipUntil ?? loop.cityWarSkipUntil;
+            loop.cityWarSkipReason = summary.gates?.cityWar?.skipReason ?? loop.cityWarSkipReason;
             loop.lastGuildOrderAt = summary.gates?.guildOrder?.lastAt ?? loop.lastGuildOrderAt;
             // 奖励次数只有真的探测过才有新值（静默窗里是上一轮的旧值，保留着给页面显示）。
             loop.treasureStats = summary.gates?.treasure?.stats ?? loop.treasureStats;
@@ -2161,6 +2483,16 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       guildShipEveryMs: loop.guildShipEveryMs,
       lastGuildShipAt: loop.lastGuildShipAt,
       guildShipSeek: loop.guildShipSeek,
+      cityWarEnabled: loop.cityWarEnabled,
+      cityWarEveryMs: loop.cityWarEveryMs,
+      lastCityWarAt: loop.lastCityWarAt,
+      cityWarRepair: loop.cityWarRepair,
+      cityWarPrepLeadSec: loop.cityWarPrepLeadSec,
+      cityWarMinPowerRatio: loop.cityWarMinPowerRatio,
+      cityWarPetrolReserve: loop.cityWarPetrolReserve,
+      cityWarMaxFleetsPerCity: loop.cityWarMaxFleetsPerCity,
+      cityWarSkipUntil: loop.cityWarSkipUntil,
+      cityWarSkipReason: loop.cityWarSkipReason,
       guildOrderEnabled: loop.guildOrderEnabled,
       guildOrderEveryMs: loop.guildOrderEveryMs,
       lastGuildOrderAt: loop.lastGuildOrderAt,
