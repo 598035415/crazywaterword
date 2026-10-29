@@ -38,7 +38,7 @@ console.log(formatYouduSummary(view));
 
 if (view.open) {
   console.log('\n=== 驱邪除祟 ===');
-  console.log(`  基地 ${view.evil.alive} 只 / 今日 ${view.evil.todayKill} / 累计 ${view.evil.killTotal} / 已领到第 ${view.evil.claimed} 档`);
+  console.log(`  基地 ${view.evil.alive} 只 / 今日 ${view.evil.todayKill} / 累计 ${view.evil.killTotal} / 已领到「累计 ${view.evil.claimed} 只」那一档（claimed 是累计杀数，不是档位号）`);
   console.log(`  可领档位: ${view.evil.claimable.map((r) => `#${r.id}(${r.totalCount}只)`).join(' ') || '无'}`);
   console.log(`  下一档: ${view.evil.next ? `#${view.evil.next.id} 需累计 ${view.evil.next.totalCount} 只（还差 ${Math.max(0, view.evil.next.totalCount - view.evil.killTotal)}）` : '已领满'}`);
 

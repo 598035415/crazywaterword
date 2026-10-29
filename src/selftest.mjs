@@ -38,7 +38,7 @@ import {
   formatCityWarSummary,
   CW_STATE_IDLE,
 } from './cityWar.mjs';
-import { viewYoudu, planYoudu, formatYouduSummary, settleYouduEdict, YOUDU_ACTIVITY_ID } from './youdu.mjs';
+import { viewYoudu, planYoudu, formatYouduSummary, settleYouduEdict, runYouduActive, summarizeYoudu, YOUDU_ACTIVITY_ID } from './youdu.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -5677,7 +5677,7 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
         { id: 2, patience: 30, battlePassScore: 20, rewards: [] },
         { id: 3, patience: 1, battlePassScore: 30, rewards: [] },
       ] },
-      LinkageLSRActiveRewardCfg: { data: [{ rewardId: 1, score: 80 }] },
+      LinkageLSRActiveRewardCfg: { data: Array.from({ length: 6 }, (_, i) => ({ rewardId: i + 1, score: 80 * (i + 1) })) },
       LinkageLSRCompassWheelCfg: { data: [
         { rewardId: 1, ring: 1, isDragon: '', minDraw: 0, mustDraw: 0 },
         { rewardId: 8, ring: 1, isDragon: '是', minDraw: 20, mustDraw: 70 },
@@ -5795,6 +5795,52 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const notStarted = await settleYouduEdict(fake, [{ step: { kind: 'youduKill' }, ok: true, body: {} }], { allowMutate: true });
   assert.equal(calls.length, 0, '本轮没开局就不发 guess');
   assert.equal(notStarted.results.length, 0, '没开局也不产生结果');
+
+  // 11. 活跃度不进静态计划（改成按回包推进的 runYouduActive）：
+  //     没分可领时一轮只发 1 条，有积压时一轮连领到被拒为止。
+  assert.equal(p1.actions.filter((a) => a.kind === 'youduActive').length, 0, '活跃度由 runYouduActive 单独处理');
+  const claimCalls = [];
+  const activeClient = (refuseAt) => ({
+    request: async (name) => {
+      claimCalls.push(name);
+      if (claimCalls.length >= refuseAt) throw new Error('server prompt: no claimable reward');
+      return { claimedId: claimCalls.length, reward: { asset: [{ id: '打雪仗体力', num: 20 }] } };
+    },
+  });
+  claimCalls.length = 0;
+  const drained = await runYouduActive(activeClient(4), { max: 8 });
+  assert.equal(claimCalls.length, 4, '连领到被拒为止：3 档成功 + 第 4 次确认到头');
+  assert.equal(drained.results.length, 3, '3 次成功进 results，被拒那次不算结果');
+  assert.equal(drained.notes.length, 0, '领到头是正常结束，不用报说明');
+  claimCalls.length = 0;
+  const nothing = await runYouduActive(activeClient(1));
+  assert.equal(claimCalls.length, 1, '没分可领时只发 1 条（不像静态排 5 条那样刷「跳过」）');
+  assert.equal(nothing.notes.length, 1, '第一发就被拒要留一句说明');
+  claimCalls.length = 0;
+  await runYouduActive(activeClient(99), { max: 3 });
+  assert.equal(claimCalls.length, 3, 'max 是硬上限（防止配置异常时无限连领）');
+  const sum = summarizeYoudu([
+    { step: { kind: 'youduActive' }, ok: false, error: 'server prompt: no claimable reward' },
+    { step: { kind: 'youduActive' }, ok: false, skipped: true, error: '同类动作已失败，本轮不再尝试' },
+    { step: { kind: 'youduKill' }, ok: true, body: { reward: { asset: [{ id: '活动26捞尸人_货币', num: 15 }] } } },
+  ]);
+  assert.equal(sum.fail, 0, '「领到头」与「同类已失败」都不算失败');
+  assert.equal(sum.kill, 1, '成功的 kill 计数');
+  assert.deepEqual(sum.rewards, [['活动26捞尸人_货币', 15]], '奖励明细要能解析出 id+数量');
+
+  // 12. 法旨答案的边界：席位全 0 / 位数不对 → 不交（扣耐心不值）；但含 0 的合法 4 位要照交
+  //     （别用 filter(v>0) 洗，洗了就把 4 位洗成 3 位、这一局永远交不出去）。
+  const withRunes = (rune) => viewYoudu({
+    ...base(),
+    edict: { cost: { id: '活动26捞尸人_入场券', num: 1 }, session: { rune, shown: [0, 0, 0, 0], patience: 100 } },
+  }, { config: cfg });
+  const guessOf = (rune) => planYoudu(withRunes(rune), { config: cfg }).actions.filter((a) => a.kind === 'youduEdictGuess');
+  assert.equal(guessOf([0, 0, 0, 0]).length, 0, '全 0 的 rune 不算答案');
+  assert.equal(guessOf([1, 2, 3]).length, 0, '只有 3 位的 rune 不交');
+  assert.deepEqual(guessOf([0, 3, 1, 6])[0]?.body.guess, [0, 3, 1, 6], '含 0 的合法答案要原样提交');
+  // 开局这条也必须 transient（入场券是签到给的，今天没有明天可能有）。
+  const startAction = p3.actions.find((a) => a.kind === 'youduEdictStart');
+  assert.ok(startAction?.transient === true, 'youduEdictStart 必须 transient，否则没券那天会把它拉黑到进程结束');
   checked += 1;
 }
 

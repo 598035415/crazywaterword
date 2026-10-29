@@ -46,6 +46,15 @@ function assetOf(display) {
   return { id: String(display.id ?? ''), num: num(display.num) };
 }
 
+// 法旨答案：`session.rune` 的 4 个符文 id 就是答案（客户端只拿它渲染符纸、再用遮罩挡住）。
+// 位数不对或全 0 都当「没有答案」，宁可这局不交（扣耐心不值），也不要瞎猜。
+function runeOf(session) {
+  const raw = (session?.rune ?? []).map(num);
+  if (raw.length !== 4) return null;
+  if (!raw.some((v) => v > 0)) return null;
+  return raw;
+}
+
 function rewardText(pkg) {
   const list = pkg?.assets ?? pkg?.asset ?? pkg?.rewards ?? [];
   const pairs = [];
@@ -209,9 +218,6 @@ export function planYoudu(view, {
   edict = true,
   kill = true,
   claim = true,
-  checkIn = true,
-  dailyActive = true,
-  activeTries = 1, // 活跃度一次连领几档（服务端按进度给下一档，领到被拒为止）
 } = {}) {
   const actions = [];
   const notes = [];
@@ -311,8 +317,10 @@ export function planYoudu(view, {
   // ---- 5. 酆都法旨：有贡品就开一局，然后直接提交 session 里下发的答案 ----
   if (edict) {
     if (view.edict.session) {
-      const rune = (view.edict.session.rune ?? []).map(num).filter((v) => v > 0);
-      if (rune.length === 4) {
+      // 符文 id 是 1~6（`shown` 是 6 位掩码），但**别用 filter(v>0) 洗** ——
+      // 万一服务端哪天用 0 当合法符文，洗一下就把 4 位洗成 3 位、这局永远交不出去。
+      const rune = runeOf(view.edict.session);
+      if (rune) {
         actions.push({
           kind: 'youduEdictGuess',
           request: 'EdictGuessRequest',
@@ -333,6 +341,8 @@ export function planYoudu(view, {
         response: 'EdictStartResponse',
         body: act,
         key: 'youduEdictStart',
+        // 入场券是签到/日常给的，今天没有明天可能有 —— 一次失败不能拉黑到进程结束。
+        transient: true,
         group: 'youduEdict',
         label: `开一局法旨（消耗 ${view.edict.ticketId}×${view.edict.ticketNum}，持 ${view.edict.ticketHeld}）`,
       });
@@ -345,29 +355,57 @@ export function planYoudu(view, {
   //      用静态计划会白打 14 条请求（2026-10-29 实测：第 1 天 `already checked in`，
   //      第 2~14 天全是 `not time yet`）。
 
-  // ---- 7. 每日活跃度里程碑：body 只有 activityId，服务端按「已领到第几档」给下一档。
-  //      回包带 claimedId，所以「领到被拒为止」是安全的：第一条就把真实进度告诉我们了。
-  //      没分可领时服务端回 `no claimable reward`（实测），1 条请求的代价，不用额外前置探测。
-  if (dailyActive) {
-    const activeCfg = rowsOf(config, 'LinkageLSRActiveRewardCfg')
-      .map((row) => ({ id: num(row.rewardId), score: num(row.score) }))
-      .sort((a, b) => a.id - b.id);
-    const maxTries = Math.max(1, Number(activeTries) || 1);
-    for (let i = 0; i < Math.min(maxTries, Math.max(1, activeCfg.length)); i += 1) {
-      actions.push({
-        kind: 'youduActive',
-        request: 'ClaimActivityDailyActiveRewardRequest',
-        response: 'ClaimActivityDailyActiveRewardResponse',
-        body: act,
-        key: `youduActive:${i}`,
-        transient: true,
-        group: 'youduActive',
-        label: i === 0 ? '领活跃度奖励（服务端按进度给下一档）' : `继续领活跃度奖励 #${i + 1}`,
-      });
-    }
-  }
+  // ---- 7. 每日活跃度里程碑也单独走 runYouduActive，理由同上：
+  //      body 只有 activityId（服务端按「已领到第几档」顺序给下一档），
+  //      没分可领时回 `no claimable reward`。静态计划只能猜要排几条 ——
+  //      排 1 条会在积压时白等好几个间隔，排 5 条又会在没分时刷 4 行「跳过」。
 
   return { actions, notes };
+}
+
+// ───────────────────────────── 每日活跃度里程碑 ─────────────────────────────
+//
+// 和签到一样是「试了才知道」：没有 info 接口能查「已领到第几档」，
+// 服务端只会按顺序给下一档，没得给时回 `no claimable reward`。
+// 所以按回包推进 —— 成功就继续要下一档，被拒就停：
+//   · 没分可领：一轮恰好 1 条请求（不会像排 5 条那样刷 4 行「跳过」）
+//   · 有积压（一天没挂机回来涨了好几档）：一轮连领，最多 `max` 档
+export async function runYouduActive(client, {
+  activityId = YOUDU_ACTIVITY_ID,
+  max = 8,
+  timeout = 8000,
+  onStep = null,
+} = {}) {
+  const results = [];
+  const notes = [];
+  const limit = Math.max(1, Number(max) || 1);
+  for (let i = 0; i < limit; i += 1) {
+    const step = { kind: 'youduActive', label: i === 0 ? '领活跃度奖励' : `领活跃度奖励 #${i + 1}` };
+    try {
+      const body = await client.request(
+        'ClaimActivityDailyActiveRewardRequest',
+        { activityId },
+        'ClaimActivityDailyActiveRewardResponse',
+        timeout,
+      );
+      const entry = { step, ok: true, body };
+      results.push(entry);
+      onStep?.(entry);
+    } catch (error) {
+      const msg = String(error?.message ?? '');
+      if (/no claimable reward/i.test(msg)) {
+        // 进度到头了 —— 正常结束，只在第一条就撞上时留一句说明。
+        if (i === 0) notes.push('活跃度没有可领的档位（分数还没到下一档）');
+        break;
+      }
+      const entry = { step, ok: false, error: msg };
+      results.push(entry);
+      onStep?.(entry);
+      notes.push(`领活跃度奖励失败：${msg}`);
+      break;
+    }
+  }
+  return { results, notes };
 }
 
 // ───────────────────────────── 法旨：开局后当轮直交 ─────────────────────────────
@@ -386,9 +424,9 @@ export async function settleYouduEdict(client, results, {
   if (!allowMutate) return empty;
   const started = (results ?? []).find((entry) => entry.ok === true && entry.step?.kind === 'youduEdictStart');
   if (!started) return empty;
-  const rune = (started.body?.session?.rune ?? []).map(num).filter((v) => v > 0);
-  if (rune.length !== 4) {
-    return { results: [], notes: ['法旨开局回包里没有 4 位 rune，这局留到下一轮探测再交（不乱猜，猜错扣 10 耐心）'] };
+  const rune = runeOf(started.body?.session);
+  if (!rune) {
+    return { results: [], notes: ['法旨开局回包里没有可用的 4 位 rune，这局留到下一轮探测再交（不乱猜，猜错扣 10 耐心）'] };
   }
   const step = { kind: 'youduEdictGuess', label: `提交法旨答案 [${rune.join(',')}]（开局直交，0 显化）` };
   try {
@@ -490,7 +528,8 @@ export function formatYouduSummary(view) {
   if (!view?.open) return `酆都诡事：未开启（${view?.reason ?? '探测失败'}）`;
   const parts = [];
   parts.push(`邪祟 ${view.evil.alive}/${view.evil.maxAlive} 只待灭`
-    + `（今日 ${view.evil.todayKill}，累计 ${view.evil.killTotal}，已领到累计 ${view.evil.claimed} 只的档`
+    + `（今日 ${view.evil.todayKill}，累计 ${view.evil.killTotal}`
+    + `${view.evil.claimed > 0 ? `，已领到累计 ${view.evil.claimed} 只的档` : '，还没领过档位'}`
     + `${view.evil.claimable.length ? `，可领 ${view.evil.claimable.length} 档` : ''}）`);
   parts.push(`罗盘 ${view.wheel.coinHeld} 券${view.wheel.spins ? `（可转 ${view.wheel.spins} 次）` : '（没券）'}`
     + ` 积分 ${view.wheel.score}${view.wheel.claimable.length ? ` 可领 ${view.wheel.claimable.length} 档` : ''}`
@@ -503,7 +542,12 @@ export function formatYouduSummary(view) {
 export function summarizeYoudu(results) {
   const summary = { ok: 0, fail: 0, kill: 0, spin: 0, edict: null, rewards: [] };
   for (const entry of results ?? []) {
+    // 「同类动作已失败，本轮不再尝试」是 runWorld 的隔离，不是这条自己失败 ——
+    // 算进 fail 会让「失败 N 条」虚高（活跃度排 5 条时就是 4 条假失败）。
+    if (entry.skipped) continue;
     if (entry.ok !== true) {
+      // `no claimable reward` = 活跃度已经领到头，是进度而不是错误，不计失败。
+      if (entry.step?.kind === 'youduActive' && /no claimable reward/i.test(String(entry.error ?? ''))) continue;
       summary.fail += 1;
       continue;
     }

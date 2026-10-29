@@ -49,6 +49,7 @@ import {
   viewYoudu,
   planYoudu,
   runYouduSigns,
+  runYouduActive,
   settleYouduEdict,
   formatYouduSummary,
   summarizeYoudu,
@@ -1610,13 +1611,26 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           });
           signResults = signs.results;
           signNotes = signs.notes;
+          // 每日活跃度：同样按回包推进（成功继续下一档 / `no claimable reward` 就停）。
+          const active = await runYouduActive(instance, {
+            onStep: (entry) => {
+              if (entry.ok) emit(session, 'info', `酆都诡事 ${entry.step.label}`);
+              else emit(session, 'error', `酆都诡事 ${entry.step.label} 失败：${entry.error}`);
+            },
+          });
+          signResults = [...signResults, ...active.results];
+          signNotes = [...signNotes, ...active.notes];
         }
         const gain = formatYouduGain(summarizeYoudu([...results, ...signResults]));
         if (gain) emit(session, 'warn', gain);
+        const fresh = await youdu(session, account, options);
+        // ⚠ payload 里本来就有 notes（静态计划的「为什么没动作」），先展开再合并本轮的运行期说明，
+        //   否则会被 payload 的 notes 覆盖掉（签到/活跃度的进度说明就看不见了）。
+        const runtimeNotes = [...edictFixNotes, ...signNotes];
         json({
+          ...fresh.payload,
           results: [...results, ...signResults].map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
-          notes: [...edictFixNotes, ...signNotes],
-          ...(await youdu(session, account, options)).payload,
+          notes: [...new Set([...(fresh.payload.notes ?? []), ...runtimeNotes])],
         });
         return;
       }

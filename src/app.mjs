@@ -63,6 +63,8 @@ import {
   viewYoudu,
   planYoudu,
   runYouduSigns,
+  runYouduActive,
+  settleYouduEdict,
   formatYouduSummary,
   summarizeYoudu,
   formatYouduGain,
@@ -1133,24 +1135,38 @@ async function youduCli({ allowMutate, dryRun, spin = true, edict = true }) {
       console.log('\n--dry：只列计划，未执行');
       return;
     }
-    if (plan.actions.length === 0) return;
-
+    // 计划为空不代表没事可做（签到 / 活跃度 / 法旨直交都不在静态计划里），所以不提前 return。
     console.log('\n执行:');
-    const { results } = await runWorld(client, protocol, plan, {
-      allowMutate,
-      window: 1200,
-      onStep: (entry) => {
-        if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
-        else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
-      },
-    });
-    // 签到按回包决定进度，不能进静态计划（见 runYouduSigns 注释）。
+    const results = [];
+    if (plan.actions.length > 0) {
+      const world = await runWorld(client, protocol, plan, {
+        allowMutate,
+        window: 1200,
+        onStep: (entry) => {
+          if (entry.skipped) console.log(`  - ${entry.step.label} 跳过: ${entry.error}`);
+          else console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`);
+        },
+      });
+      results.push(...world.results);
+      // 法旨：开局回包里就带答案，当轮直接交。
+      const edictFix = await settleYouduEdict(client, world.results, {
+        allowMutate,
+        onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
+      });
+      results.push(...edictFix.results);
+      for (const note of edictFix.notes) console.log(`  · ${note}`);
+    }
+    // 签到与活跃度都按回包决定进度，不能进静态计划（见 runYouduSigns / runYouduActive 注释）。
     const signs = await runYouduSigns(client, {
       config,
       onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
     });
     for (const note of signs.notes) console.log(`  · ${note}`);
-    const gain = formatYouduGain(summarizeYoudu([...results, ...signs.results]));
+    const active = await runYouduActive(client, {
+      onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
+    });
+    for (const note of active.notes) console.log(`  · ${note}`);
+    const gain = formatYouduGain(summarizeYoudu([...results, ...signs.results, ...active.results]));
     if (gain) console.log(`\n${gain}`);
   } finally {
     client.stop();

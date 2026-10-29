@@ -458,7 +458,7 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
         <input type="checkbox" id="youdu-spin" checked> 转罗盘
       </label>
       <label class="dim" title="有入场券就开一局酆都法旨。服务端把答案放在 session.rune 里，所以 0 显化直接提交 → 耐心留满 100 → 拿最高档奖励">
-        <input type="checkbox" id="youdu-edict" checked> 领法旨
+        <input type="checkbox" id="youdu-edict" checked> 做法旨
       </label>
       <button id="youdu-look">看状态</button>
       <button id="youdu-run">立刻跑一段</button>
@@ -470,8 +470,9 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - **龙王罗盘**：花「抽奖券」转盘，内圈 8 格、抽到龙纹（70 抽保底）再额外拿一个外圈奖励；每抽 30~50 积分，积分档位另给奖。
 - **酆都法旨**：花「入场券」开一局，猜 4 个符文。**服务端把答案直接下发在 session.rune 里**（客户端只是用它渲染符纸、再用遮罩挡住），
   所以这里是 0 显化直接提交 → 耐心留满 100 → 拿最高档（功德×20）。显化一次扣 5 耐心、猜错扣 10，一次都不该显化。
-- **签到 + 每日活跃**：14 天签到（每天入场券×1 + 体力×20 + 100 钻）与活跃度里程碑。签到靠服务端回包推进
-  （already checked in 跳过、not time yet 当天收工），所以每天实际只发 1~2 条请求。
+- **签到 + 每日活跃**：14 天签到（每天入场券×1 + 体力×20 + 100 钻）与活跃度里程碑。两件都没有 info 接口能查进度，
+  只能按服务端回包推进（already checked in 跳过、not time yet 当天收工、no claimable reward 表示领到头）；
+  被拒后冷却 1 小时再探，不会每轮都去撞一次。
 - ⛔ **不碰付费**：每日累充、每日特惠、酆都礼遇战令、满减商店结账 —— 都需要充值/花钻石，这里一个请求都不发。
 - 活动实例 id 是 **20261001**（大版本活动容器），不是活动上线日 20261029 —— 后者一律回 prompt 74（活动状态不符）。</pre>
 

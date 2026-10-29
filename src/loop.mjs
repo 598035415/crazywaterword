@@ -51,6 +51,7 @@ import {
   viewYoudu,
   planYoudu,
   runYouduSigns,
+  runYouduActive,
   settleYouduEdict,
   formatYouduSummary,
   summarizeYoudu,
@@ -1344,17 +1345,27 @@ export async function runLoop(initialClient, protocol, {
             onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
           });
           if (edictFix.results.length > 0) summary.youdu.results = [...results, ...edictFix.results];
+          summary.youdu.planned = (summary.youdu.planned ?? 0) + edictFix.results.length;
           if (edictFix.notes.length > 0) summary.youdu.notes = [...(summary.youdu.notes ?? []), ...edictFix.notes];
           summary.youdu.gain = formatYouduGain(summarizeYoudu(summary.youdu.results));
         }
-        // 签到单独走：它得看回包决定「继续下一天 / 今天到此为止」。
+        // 签到与每日活跃都「试了才知道」，得按回包推进（already checked in / not time yet /
+        // no claimable reward），塞进静态计划只会白打一堆必被拒的请求。
         if (ydView.open) {
           const signs = await runYouduSigns(client, {
             config,
             onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
           });
           summary.youdu.results = [...(summary.youdu.results ?? []), ...signs.results];
+          // 「计划 N」= 静态计划 + 按回包推进里真正发起的动作（否则签到/活跃度领到了却显示「计划 0」）。
+          summary.youdu.planned = (summary.youdu.planned ?? 0) + signs.results.length;
           if (signs.notes.length > 0) summary.youdu.notes = [...(summary.youdu.notes ?? []), ...signs.notes];
+          const active = await runYouduActive(client, {
+            onStep: (entry) => onStep?.({ round, phase: 'youdu', ...entry }),
+          });
+          summary.youdu.results = [...(summary.youdu.results ?? []), ...active.results];
+          summary.youdu.planned = (summary.youdu.planned ?? 0) + active.results.length;
+          if (active.notes.length > 0) summary.youdu.notes = [...(summary.youdu.notes ?? []), ...active.notes];
           summary.youdu.gain = formatYouduGain(summarizeYoudu(summary.youdu.results));
         }
         // 探测成功（含「活动没开」）都算用掉这一格时间；网络异常不记时，下一轮立刻重试。
