@@ -38,7 +38,7 @@ import {
   formatCityWarSummary,
   CW_STATE_IDLE,
 } from './cityWar.mjs';
-import { viewYoudu, planYoudu, formatYouduSummary, YOUDU_ACTIVITY_ID } from './youdu.mjs';
+import { viewYoudu, planYoudu, formatYouduSummary, settleYouduEdict, YOUDU_ACTIVITY_ID } from './youdu.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -5678,6 +5678,10 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
         { id: 3, patience: 1, battlePassScore: 30, rewards: [] },
       ] },
       LinkageLSRActiveRewardCfg: { data: [{ rewardId: 1, score: 80 }] },
+      LinkageLSRCompassWheelCfg: { data: [
+        { rewardId: 1, ring: 1, isDragon: '', minDraw: 0, mustDraw: 0 },
+        { rewardId: 8, ring: 1, isDragon: '是', minDraw: 20, mustDraw: 70 },
+      ] },
     },
   };
   const stock = () => new Map([
@@ -5715,7 +5719,12 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 
   // 4. 罗盘：券 3 张、单抽 1 张 → 一次请求抽 3 发；积分 113 只够第 1 档（30 分），已领过 → 不重复领。
   assert.equal(v1.wheel.spins, 3, '3 张券 / 单抽 1 → 能转 3 次');
-  assert.equal(v1.wheel.dragonIn, 2, 'pity 68 → 距龙纹还差 2 抽');
+  assert.equal(v1.wheel.dragonIn, 68, 'pity 68 → 保底还剩 68 抽（不是 70-68=2，pity 本身就是剩余数）');
+  assert.equal(v1.wheel.dragonMustDraw, 70, '保底抽数从 LinkageLSRCompassWheelCfg 的 isDragon 行读 mustDraw');
+  assert.equal(v1.wheel.dragonMinDraw, 20, '龙纹最早第 20 抽才可能出（minDraw）');
+  // 服务端没下发 pity 时退回 70 - times，不至于显示成 0。
+  const noPity = viewYoudu({ ...base(), wheel: { ...base().wheel, pity: 0, times: 5 } }, { config: cfg });
+  assert.equal(noPity.wheel.dragonIn, 65, 'pity 缺失 → 按 70-5 兜底');
   const spins = p1.actions.filter((a) => a.kind === 'youduSpin');
   assert.equal(spins.length, 1, '一次请求抽 3 发（不拆成 3 条）');
   assert.equal(spins[0].body.num, 3, 'body.num = 发数');
@@ -5754,6 +5763,38 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   // 8. 签到不放进静态计划：它得按回包推进（already checked in / not time yet），
   //    否则每天白打 13 条必被拒的请求。
   assert.equal(p1.actions.filter((a) => a.kind === 'youduSign').length, 0, '签到由 runYouduSigns 单独处理');
+
+  // 9. 两个 claim 必须 transient：可领档位是「按杀完之后 / 按当前积分」投影算的，
+  //    上一轮的 kill / spin 万一失败，这条 claim 一定被拒；不标 transient 就会被写进
+  //    跨轮 rejected 集合，那一档之后永远不再尝试（要重启进程才发现漏领）。
+  for (const kind of ['youduEvilClaim', 'youduWheelClaim']) {
+    const rows = [...p1.actions, ...planYoudu(viewYoudu({
+      ...base(),
+      wheel: { ...base().wheel, score: 800, claimedId: 1 },
+    }, { config: cfg }), { config: cfg }).actions].filter((a) => a.kind === kind);
+    assert.ok(rows.length > 0, `${kind} 应当被排出来（夹具要能覆盖到）`);
+    assert.ok(rows.every((a) => a.transient === true), `${kind} 必须标 transient，否则一次失败就永久拉黑该档`);
+  }
+
+  // 10. 法旨开局当轮直交：`EdictStartResponse.session.rune` 就是答案，不用等下一轮探测。
+  const calls = [];
+  const fake = { request: async (name, body) => { calls.push({ name, body }); return { success: true, reward: { asset: [] } }; } };
+  const starts = [{ step: { kind: 'youduEdictStart' }, ok: true, body: { session: { rune: [2, 1, 6, 4], shown: [0, 0, 0, 0], patience: 100 } } }];
+  const settled = await settleYouduEdict(fake, starts, { allowMutate: true });
+  assert.equal(calls.length, 1, '开局成功后立刻补一条 EdictGuessRequest');
+  assert.equal(calls[0].name, 'EdictGuessRequest', '补的是猜答案请求');
+  assert.deepEqual(calls[0].body.guess, [2, 1, 6, 4], 'guess 取自 EdictStartResponse 的 session.rune');
+  assert.equal(settled.results[0].ok, true, '直交结果记进 results');
+  calls.length = 0;
+  await settleYouduEdict(fake, starts, { allowMutate: false });
+  assert.equal(calls.length, 0, '没有 allowMutate 时一条都不发');
+  const noRune = await settleYouduEdict(fake, [{ step: { kind: 'youduEdictStart' }, ok: true, body: { session: { rune: [] } } }], { allowMutate: true });
+  assert.equal(calls.length, 0, '开局回包没 rune 就不猜（猜错扣 10 耐心）');
+  assert.ok(noRune.notes.length > 0, '要说明为什么没交');
+  calls.length = 0;
+  const notStarted = await settleYouduEdict(fake, [{ step: { kind: 'youduKill' }, ok: true, body: {} }], { allowMutate: true });
+  assert.equal(calls.length, 0, '本轮没开局就不发 guess');
+  assert.equal(notStarted.results.length, 0, '没开局也不产生结果');
   checked += 1;
 }
 

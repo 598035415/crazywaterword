@@ -411,11 +411,21 @@ export async function settleYouduEdict(client, results, {
 //   `not time yet`       → 还没到那一天，**今天到此为止**，直接停
 // 2026-10-29 实盘：活动第 1 天，checkId=1 回 already、checkId=2 回 not time yet → 2 条请求收工。
 // 按静态计划发 14 条的话，后面 13 条纯粹是噪音（还会把 rejected 集合塞满）。
+//
+// 另外「今天到此为止」这个结论要记住：挂机一轮 5 分钟、一天 288 轮，不记住的话每轮都会
+// 重打一遍 already + not time（实测 2 小时就攒了 50 条 `ClaimActivityDailyCheckInRewardRequest`）。
+// 但**不能按本地日期一刀切「今天不试了」**——服务端的「一天」不一定在本地 0 点翻（实测
+// 00:34 还能签到、签到档位按活动第 N 天算），所以这里用「被拒后冷却 1 小时」：
+// 一天最多 24 次探测，既不刷屏也不会因为时区/刷新点差异漏掉一整天。
+const SIGN_RETRY_MS = 60 * 60 * 1000;
+const signMemo = { retryAfterAt: 0 };
+
 export async function runYouduSigns(client, {
   config = null,
   activityId = YOUDU_ACTIVITY_ID,
   timeout = 8000,
   onStep = null,
+  now = Date.now(),
 } = {}) {
   const results = [];
   const notes = [];
@@ -426,6 +436,8 @@ export async function runYouduSigns(client, {
     notes.push('配置表里没有 LinkageLSRSignCfg，跳过签到');
     return { results, notes };
   }
+  // 冷却中就不发了（静默：日志里那段本来就没东西可看）。
+  if (now < signMemo.retryAfterAt) return { results, notes };
 
   let done = 0;
   for (const row of signCfg) {
@@ -449,16 +461,21 @@ export async function runYouduSigns(client, {
       }
       if (/not time yet/i.test(msg)) {
         notes.push(`签到停在「第 ${row.signDay} 天」（服务端回 not time yet，说明今天只能签到这里）`);
+        signMemo.retryAfterAt = now + SIGN_RETRY_MS;
         break;
       }
       const entry = { step, ok: false, error: msg };
       results.push(entry);
       onStep?.(entry);
       notes.push(`签到第 ${row.signDay} 天失败：${msg}`);
+      signMemo.retryAfterAt = now + SIGN_RETRY_MS;
       break;
     }
   }
-  if (done === 0 && notes.length === 0) notes.push('今天已经签过了，没有新的签到可领');
+  if (done === 0 && notes.length === 0) {
+    signMemo.retryAfterAt = now + SIGN_RETRY_MS;
+    notes.push('今天已经签过了，没有新的签到可领');
+  }
   return { results, notes };
 }
 

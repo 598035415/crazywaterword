@@ -45,7 +45,7 @@ if (view.open) {
   console.log('\n=== 龙王罗盘 ===');
   console.log(`  积分 ${view.wheel.score}（累计抽 ${view.wheel.times} 次）已领到第 ${view.wheel.claimedId} 档`);
   console.log(`  单抽 ${view.wheel.costId}×${view.wheel.costNum}，持有 ${view.wheel.coinHeld} → 可转 ${view.wheel.spins} 次`);
-  console.log(`  距必出龙纹还差 ${view.wheel.dragonIn} 抽（${YOUDU_ACTIVITY_ID ? '' : ''} pity=${view.wheel.pity}/70）`);
+  console.log(`  保底还剩 ${view.wheel.dragonIn} 抽（pity=${view.wheel.pity}，mustDraw=${view.wheel.dragonMustDraw}，最早第 ${view.wheel.dragonMinDraw} 抽才可能出）`);
   console.log(`  外圈已得: ${view.wheel.outerGot.join(',') || '无'}`);
   console.log(`  可领积分档位: ${view.wheel.claimable.map((r) => `#${r.id}(${r.score}分)`).join(' ') || '无'}`);
 

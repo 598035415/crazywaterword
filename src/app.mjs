@@ -1120,7 +1120,7 @@ async function youduCli({ allowMutate, dryRun, spin = true, edict = true }) {
     console.log(`\n${formatYouduSummary(view)}`);
     if (view.open) {
       console.log(`  邪祟 ${view.evil.alive}/${view.evil.maxAlive}（今日 ${view.evil.todayKill}，累计 ${view.evil.killTotal}，已领到累计 ${view.evil.claimed} 只的档）`);
-      console.log(`  罗盘 ${view.wheel.coinHeld} 券 → 可转 ${view.wheel.spins} 次，积分 ${view.wheel.score}，距龙纹 ${view.wheel.dragonIn} 抽`);
+      console.log(`  罗盘 ${view.wheel.coinHeld} 券 → 可转 ${view.wheel.spins} 次，积分 ${view.wheel.score}，保底还剩 ${view.wheel.dragonIn} 抽（已抽 ${view.wheel.times}）`);
       console.log(`  法旨 ${view.edict.session ? '有一局未交' : '空闲'}，${view.edict.ticketId} 持 ${view.edict.ticketHeld}（开一局 ${view.edict.ticketNum}）`);
     }
     // --no-spin / --no-edict 只做驱邪与签到的保守模式。
