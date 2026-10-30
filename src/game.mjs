@@ -66,7 +66,11 @@ function responseNameOf(name) {
 // Fires the whole entry set in one burst, exactly as the client does, then waits for the
 // responses. Nothing is sent sequentially: the server tolerates the burst and answering
 // one at a time would take a minute of wall clock.
-export async function collectState(client, protocol, { timeout = 15000, onResult = null } = {}) {
+// `skip` 可以剔掉几条：总览页每 60 秒拉一次完整快照，里面的 `RadarInfoRequest` 是纯浪费
+// （`summarize` 一个字段都不用），而且会把挂机那边「事件打光 → 睡到刷新」的静默窗变成
+// 每分钟一条空探测（2026-10-30 实测：页面开着时情报仍每 60 秒探一次）。
+export async function collectState(client, protocol, { timeout = 15000, onResult = null, skip = [] } = {}) {
+  const skipped = new Set(skip);
   const ok = {};
   const failed = {};
   const waiting = [];
@@ -76,6 +80,7 @@ export async function collectState(client, protocol, { timeout = 15000, onResult
   }
 
   for (const query of ENTRY_QUERIES) {
+    if (skipped.has(query.name)) continue;
     const response = responseNameOf(query.name);
     if (!protocol[query.name] || !protocol[response]) {
       failed[query.name] = `no protocol type for ${protocol[query.name] ? response : query.name}`;
