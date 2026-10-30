@@ -17,7 +17,7 @@ import { surveyTasks, runTasks, formatTaskPlan } from './tasks.mjs';
 import { surveyWorld, planWorld, runWorld, formatWorldPlan, formatFieldReport, loadMapAsset, summarizeFloaters, formatFloaters, materialGroups } from './world.mjs';
 import { runLoop, formatLoopRound } from './loop.mjs';
 import { surveyRadar, viewRadar, planRadar, formatRadarPlan, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
-import { surveyPirates, viewPirates, planPirates, formatPiratePlan } from './pirate.mjs';
+import { surveyPirates, viewPirates, planPirates, formatPiratePlan, sweepCountText } from './pirate.mjs';
 import { surveyEquip, planEquip, formatEquipPlan } from './equip.mjs';
 import { surveyPet, planPet, formatPetPlan, PET_QUALITIES } from './pet.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
@@ -212,6 +212,15 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         lastPirateAt: null,
         // false = 只打「没打过的下一个等级」（首杀）；true = 连已通关等级也刷，只拿 fixedReward。
         pirateRepeat: false,
+        // true = 战力不够就先不打（暂停探测，30 分钟复查一次战力，够了当轮恢复）。
+        // 判据见 pirate.mjs 的 giveUpUntilOf：只有「全账号最强的船都打不过」才暂停。
+        pirateGiveUp: true,
+        // 「战力不够，先不打」的暂停窗（秒）+ 原因：页面靠它显示「暂停到几点、为什么」。
+        pirateSkipUntil: null,
+        pirateSkipReason: '',
+        // 最近一次探测到的免战扫荡次数（{ at, used, max, left, text }）：页面上
+        // 「每日野怪扫荡 · 已用 x/N，还剩 y 次」直接用它，不为看个数字再打探测请求。
+        pirateStats: null,
         // 装备厂（锻造）：造好了收取 + 按部位均衡排下一件。一件蓝装 25 分钟上下，
         // 所以默认 3 分钟看一眼；造好不收 = 整座工厂停产，比农田更值得勤看。
         forgeEnabled: true,
@@ -1514,6 +1523,18 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         if (payload.repeat !== undefined) session.loop.pirateRepeat = payload.repeat === true;
         const survey = await surveyPirates(instance, protocol, { config, player: session.player });
         const view = viewPirates(survey, { config, minPowerRatio: ratio, repeat: session.loop.pirateRepeat === true, duraFloor: duraFloorOf(session.loop) });
+        // 页面上「每日野怪扫荡 · 已用 x/N，还剩 y 次」跟着这次探测一起刷新（不额外发请求）。
+        session.loop.pirateStats = {
+          at: Math.floor(Date.now() / 1000),
+          used: Number(view.sweepUsed) || 0,
+          max: Number(view.sweepMax) || 0,
+          left: Math.max(0, Number(view.sweepLeft) || 0),
+          text: sweepCountText(view),
+        };
+        // 手动跑一次 = 用户明确要求「现在就试」，所以把「战力不够先不打」的暂停窗清掉：
+        // 下一轮由挂机自己重新判一次（还不够就再设回去，多一个探测请求而已）。
+        session.loop.pirateSkipUntil = null;
+        session.loop.pirateSkipReason = '';
         const plan = planPirates(view, {
           maxPerRound: Number(payload.max) > 0 ? Number(payload.max) : session.loop.pirateMaxPerRound,
         });
@@ -2290,6 +2311,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         loop.pirateEnabled = payload.pirate !== false;
         loop.pirateEveryMs = secondsArg(payload.pirateEverySeconds, 60) * 1000;
         loop.pirateRepeat = payload.pirateRepeat === true;
+        // 「战力不够就先不打」默认开：不够的时候 60 秒探一次没有任何收益，暂停 + 30 分钟复查。
+        loop.pirateGiveUp = payload.pirateGiveUp !== false;
         loop.pirateMaxPerRound = Number(payload.pirateMax) > 0 ? Math.floor(Number(payload.pirateMax)) : Infinity;
         // 锻造默认开，间隔默认 180 秒（一件蓝装约 25 分钟，没必要每轮去问）。
         loop.forgeEnabled = payload.forge !== false;
@@ -2378,6 +2401,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           // 情报的静默窗同理：新开循环就该重新看一眼，别沿用上次「睡到 6 小时后」。
           loop.radarSkipUntil = null;
           loop.lastPirateAt = null;
+          // 海盗的「战力不够先不打」同理：新开循环要重新判一次战力（可能刚造了新船）。
+          loop.pirateSkipUntil = null;
+          loop.pirateSkipReason = '';
           loop.lastForgeAt = null;
           loop.lastPetAt = null;
           loop.lastIdleAt = null;
@@ -2439,7 +2465,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           : '国战关';
         const pirateText = loop.pirateEnabled
           ? `海盗${loop.pirateEveryMs > 0 ? `每 ${Math.round(loop.pirateEveryMs / 1000)} 秒` : '每轮'}讨伐一次`
-            + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×）`
+            + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×`
+            + `${loop.pirateGiveUp !== false ? '，战力不够就先不打（30 分钟复查）' : ''}）`
           : '海盗关';
         const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
         emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${guildPackText}；${guildOrderText}；${cityWarText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
@@ -2472,6 +2499,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           pirateEnabled: loop.pirateEnabled,
           pirateEveryMs: loop.pirateEveryMs,
           pirateRepeat: loop.pirateRepeat,
+          pirateGiveUp: loop.pirateGiveUp !== false,
           pirateMaxPerRound: loop.pirateMaxPerRound,
           forgeEnabled: loop.forgeEnabled,
           forgeEveryMs: loop.forgeEveryMs,
@@ -2535,6 +2563,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.radarSkipUntil = summary.gates?.radar?.skipUntil ?? null;
             loop.radarNextRefreshAt = summary.gates?.radar?.nextRefreshAt ?? loop.radarNextRefreshAt;
             loop.lastPirateAt = summary.gates?.pirate?.lastAt ?? loop.lastPirateAt;
+            // 「战力不够，先不打」的暂停窗 + 最近一次探测到的扫荡次数（页面直接用，不再发请求）。
+            loop.pirateSkipUntil = summary.gates?.pirate?.skipUntil ?? null;
+            loop.pirateSkipReason = summary.gates?.pirate?.skipUntil ? (summary.gates?.pirate?.skipReason ?? '') : '';
+            loop.pirateStats = summary.gates?.pirate?.stats ?? loop.pirateStats;
             loop.lastForgeAt = summary.gates?.forge?.lastAt ?? loop.lastForgeAt;
             loop.lastPetAt = summary.gates?.pet?.lastAt ?? loop.lastPetAt;
             loop.lastIdleAt = summary.gates?.idle?.lastAt ?? loop.lastIdleAt;
@@ -2634,6 +2666,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       pirateEveryMs: loop.pirateEveryMs,
       lastPirateAt: loop.lastPirateAt,
       pirateRepeat: loop.pirateRepeat === true,
+      // 战力不够就先不打（默认开）+ 暂停窗（秒）+ 原因：页面要能显示「暂停到几点、为什么」。
+      pirateGiveUp: loop.pirateGiveUp !== false,
+      pirateSkipUntil: loop.pirateSkipUntil,
+      pirateSkipReason: loop.pirateSkipReason,
+      // 每日野怪扫荡次数：{ at, used, max, left, text }，null = 还没探测过。
+      pirateStats: loop.pirateStats,
       forgeEnabled: loop.forgeEnabled,
       forgeEveryMs: loop.forgeEveryMs,
       lastForgeAt: loop.lastForgeAt,

@@ -19,7 +19,7 @@ import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
 import { surveyRadar, viewRadar, planRadar, radarIdleUntil, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
-import { surveyPirates, viewPirates, planPirates, formatPirateSummary } from './pirate.mjs';
+import { surveyPirates, viewPirates, planPirates, formatPirateSummary, giveUpUntilOf, sweepCountText } from './pirate.mjs';
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
 import { surveyCargo, viewCargo, planCargo, formatCargoSummary, summarizeCargo, formatCargoGain, cargoDemandOf } from './tradePort.mjs';
@@ -224,6 +224,10 @@ export async function runLoop(initialClient, protocol, {
   pirateRepeat = false,
   // 一次最多派几艘船去打海盗（默认不限 = 有多少空闲船派多少）。
   pirateMaxPerRound = Infinity,
+  // 「战力不够就先不打」（默认开）：战力不够的时候 60 秒探一次毫无收益，暂停探测，
+  // 改成 30 分钟复查一次战力，够打了当轮立刻恢复（判据见 pirate.mjs 的 giveUpUntilOf ——
+  // 只有「连全账号最强的船都打不过」才暂停；船出海/在修/汽油不够这些几分钟就会变的状态照旧重试）。
+  pirateGiveUp = true,
   // 装备厂（锻造）：造好了收取 + 按部位均衡排下一件。一件蓝装原时长 1800 秒、
   // 减完「锻造时间」委任也要 25 分钟左右，所以默认 3 分钟看一眼就够。
   // 它比农田更值得勤看：同一时间只能造一件，造好不收等于整座工厂停产。
@@ -386,6 +390,15 @@ export async function runLoop(initialClient, protocol, {
   let radarNextRefreshAt = 0;
   // 海盗讨伐同理：探测（海盗列表 + 舰队 + 击杀记录）成功就计时。
   let lastPirateAt = 0;
+  // 「战力不够就先不打」的暂停窗（见 pirate.mjs 的 giveUpUntilOf）：命中期间这一段的
+  // 3 个只读探测请求一次都不发，到点复查一次战力，够打了当轮立刻恢复。用户原话：
+  // 「打不过的话，今天就可以先不打了」→ 后来收紧成「战力不够之前就不打」。
+  let pirateSkipUntil = 0;
+  let pirateSkipReason = '';
+  let pirateSkipNoticedAt = 0;
+  // 最近一次探测到的免战扫荡次数（网页上「每日野怪扫荡 · 已用 x/N，还剩 y 次」直接用，
+  // 跟货轮的 treasureStats 一个套路：不为看个数字再打一遍探测请求）。
+  let pirateStats = null;
   // 免战扫荡被服务端拒过（`PromptResponse = sweep times not enough`，已实测）就到今天结束为止不再扫：
   // 次数是服务端管的，我们的「上限 = 配置 10 + VIP」可能比真实上限低，被拒一次说明已经到顶，
   // 每 60 秒再试一次只会把日志刷成同一句失败。
@@ -918,7 +931,11 @@ export async function runLoop(initialClient, protocol, {
     const pirateEvery = pickAt(conf, 'pirateEveryMs', pirateEveryMs);
     const pirateRepeatNow = pickAt(conf, 'pirateRepeat', pirateRepeat) === true;
     const pirateCapNow = pickAt(conf, 'pirateMaxPerRound', pirateMaxPerRound);
-    const pirateDue = pirateOn && gateDue(lastPirateAt, pirateEvery, tickAt);
+    const pirateGiveUpNow = pickAt(conf, 'pirateGiveUp', pirateGiveUp) !== false;
+    // 「战力不够」的暂停窗：命中后连探测请求都不发（判据见 pirate.mjs 的 giveUpUntilOf）。
+    // 关闭开关时窗口直接失效 —— 否则取消勾选还要等窗口走完（最多 30 分钟）才恢复，像没生效。
+    const pirateSkipping = pirateOn && pirateGiveUpNow && pirateSkipUntil > tickAt;
+    const pirateDue = pirateOn && !pirateSkipping && gateDue(lastPirateAt, pirateEvery, tickAt);
     if (halted()) break;
     if (pirateDue) {
       try {
@@ -945,6 +962,33 @@ export async function runLoop(initialClient, protocol, {
         summary.pirate.planned = piratePlan.actions.length;
         summary.pirate.notes = piratePlan.notes;
         summary.pirate.summary = formatPirateSummary(pirateView);
+        // 每日野怪扫荡次数快照：网页那行「已用 x/N，还剩 y 次」直接用，不为看个数字再探一次
+        // （跟货轮的 treasureStats 同一个套路）。
+        pirateStats = {
+          at: Math.floor(tickAt / 1000),
+          used: Number(pirateView.sweepUsed) || 0,
+          max: Number(pirateView.sweepMax) || 0,
+          left: Math.max(0, Number(pirateView.sweepLeft) || 0),
+          text: sweepCountText(pirateView),
+        };
+        // 「战力不够就先不打」：暂停探测到下次复查（默认 30 分钟后），够打了当轮立刻恢复。
+        // 只在「连全账号最强的船都打不过」时成立（见 giveUpUntilOf 的注释）——
+        // 船出海 / 在修 / 汽油不够这些几分钟就会变的状态照旧按间隔重试。
+        // ⚠️ 扫荡被服务端拒过之后，`sweepLeft` 还挂在那儿但其实已经扫不动了（次数真用完 / 一天的上限到了），
+        // 判「能不能暂停」时要按 0 算 —— 否则永远因为「还有扫荡次数没用完」而不暂停，60 秒一轮白探一整天。
+        const giveUp = giveUpUntilOf(
+          sweepBlockedUntil > tickAt ? { ...pirateView, sweepLeft: 0 } : pirateView,
+          { now: tickAt, enabled: pirateGiveUpNow },
+        );
+        if (giveUp.until > tickAt) {
+          pirateSkipUntil = giveUp.until;
+          pirateSkipReason = giveUp.reason;
+          // 归零 = 下一轮立刻把「暂停探测」印一次（abort 那种「设窗那轮不印」的情况也不会漏）。
+          pirateSkipNoticedAt = 0;
+        } else {
+          pirateSkipUntil = 0;
+          pirateSkipReason = '';
+        }
         if (sweepBlockedUntil > tickAt) {
           summary.pirate.notes = [...(summary.pirate.notes ?? []), '免战扫荡今天已被服务端拒绝过，不再尝试（明天 0 点重置）'];
         }
@@ -1628,6 +1672,12 @@ export async function runLoop(initialClient, protocol, {
     // 海商王的静默窗有两种原因（在航 / 不在市），同样只在设窗那一轮 + 每 30 分钟报一次。
     const tradeSkipNotice = tradeSkipping && tickAt - tradeSkipNoticedAt >= SKIP_NOTICE_MS;
     if (tradeSkipNotice) tradeSkipNoticedAt = tickAt;
+    // 海盗的暂停窗是「战力不够，先不打」—— 到点复查（默认 30 分钟），同样每 30 分钟才提一句。
+    // 这里**重新算一次**而不是复用段首那个 pirateSkipping：静默窗可能就是这一轮刚设的，
+    // 用段首的旧值会让「设窗那一轮」显示成「间隔未到」，看着像没生效。
+    const pirateSkippingNow = pirateOn && pirateGiveUpNow && pirateSkipUntil > tickAt;
+    const pirateSkipNotice = pirateSkippingNow && tickAt - pirateSkipNoticedAt >= SKIP_NOTICE_MS;
+    if (pirateSkipNotice) pirateSkipNoticedAt = tickAt;
     // gates 里必须是**这一轮真正生效**的值（conf），否则网页上改了设置，
     // 状态行还按启动时的旧值算「还差多久」，看起来像改了没用。
     summary.gates = {
@@ -1662,7 +1712,19 @@ export async function runLoop(initialClient, protocol, {
         // 服务端给的下次刷新时刻（秒）。页面拿它显示「还有多久刷新」，不额外发请求。
         nextRefreshAt: radarNextRefreshAt > 0 ? radarNextRefreshAt : null,
       },
-      pirate: { ...gateSummary(pirateOn, pirateEvery, lastPirateAt, tickAt), throttled: pirateOn && !pirateDue },
+      pirate: {
+        ...gateSummary(pirateOn, pirateEvery, lastPirateAt, tickAt),
+        // 静默中不算「间隔未到」：一个是「打不过，今天先不打」，一个是「60 秒还没到」。
+        throttled: pirateOn && !pirateDue && !pirateSkippingNow,
+        skipped: pirateSkippingNow,
+        skipReason: pirateSkippingNow ? pirateSkipReason : '',
+        skipForever: false,
+        skipLeftSeconds: pirateSkippingNow ? Math.max(0, Math.ceil((pirateSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: pirateSkippingNow ? Math.floor(pirateSkipUntil / 1000) : null,
+        skipNotice: pirateSkipNotice,
+        // 最近一次探测到的每日野怪扫荡次数（网页直接显示，不用额外请求）。
+        stats: pirateStats,
+      },
       forge: { ...gateSummary(forgeOn, forgeEvery, lastForgeAt, tickAt), throttled: forgeOn && !forgeDue },
       pet: { ...gateSummary(petOn, petEvery, lastPetAt, tickAt), throttled: petOn && !petDue },
       cargo: {

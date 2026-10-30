@@ -265,6 +265,11 @@ export const PAGE = `<!doctype html>
       <label class="dim" title="默认只打「下一个没打过的等级」（有首杀奖励）。勾上才会重复刷已通关等级，那种只有固定掉落">
         <input type="checkbox" id="pirate-repeat"> 刷已通关等级
       </label>
+      <label class="dim" title="战力不够（连全账号最强的船都不够）就先不打：暂停探测，每 30 分钟复查一次战力，够打了当轮立刻恢复。船出海/在修/汽油不够这些几分钟就会变的状态不算，照旧按间隔重试">
+        <input type="checkbox" id="pirate-giveup" checked> 战力不够就先不打
+      </label>
+      <span class="k" title="每日免战扫荡次数：上限来自 PirateParamCfg「每日野怪扫荡次数」+ VIP 加成，已用次数来自 AllPirateResponse.sweepTimes。数字来自最近一次探测，挂机不会为了「看个数字」多发请求">每日野怪扫荡</span>
+      <span id="pirate-count" class="dim">还没探测过</span>
       <button id="pirate-run">立刻讨伐一次</button>
       <span id="pirate-state" class="dim">还没跑过</span>
     </div>
@@ -285,7 +290,19 @@ export const PAGE = `<!doctype html>
 战力余量沿用「自动情报」那栏那个数（默认 1.2），敌方战力按 **赛季 + 类型 + 等级** 查 WorldPirateCfg
 （同等级不同赛季战力能差 40 倍）。赛季从角色所在的 worldId 算，算不出来时会取各赛季最高战力，宁可不派也不打输。
 **排在货轮和情报后面**：三段抢的是同一批空闲船 —— 货轮错过就没了、情报挂 6 小时还在、海盗没人抢，
-所以它经常看到「0 艘空闲船，这轮不派」，那是正常的（扫荡不受影响，照扫）。</pre>
+所以它经常看到「0 艘空闲船，这轮不派」，那是正常的（扫荡不受影响，照扫）。
+
+**战力不够就先不打**（默认勾选）：如果**连全账号最强的那艘船**（含在航、在修的）都够不上「最便宜的那个目标」，
+就说明现在打不动 —— 60 秒探一次也是白打 3 个只读请求，于是暂停探测，改成**每 30 分钟复查一次战力**：
+战力一够，当轮立刻恢复成 60 秒节奏去打（所以不是「锁到今天结束」，随时可能恢复）。
+日志与状态行会写「暂停探测：战力不够：最强船 55.0万，打最弱的 海盗先锋 Lv8 要 66.1万（敌方 55.1万 × 1.2 余量），28 分后再试」。
+只认这一种情况：船出海 / 在修 / 汽油不够 / 地图上暂时没有下一级，这些都是几十分钟内自己会变的，
+照旧按间隔重试，不会被暂停掉。想立刻再试一次就点「立刻讨伐一次」（不受暂停影响，并且会把暂停清掉让挂机重新判一次），
+或者取消勾选这个开关（下一轮生效）。
+
+**每日野怪扫荡次数**：上方「已用 x/N，还剩 y 次」来自最近一次探测（N = 配置 10 + VIP 加成，
+已用来自 AllPirateResponse.sweepTimes），挂机不会为了显示这个数字额外发请求；
+进程重启后、还没探测过时显示「还没探测过」，跑一轮就回来。</pre>
 
     <h2>拾荒</h2>
     <div class="bar">
@@ -1214,6 +1231,20 @@ function renderYouduGate(data, enabled) {
   renderGate('youdu-state', data.lastYouduAt, data.youduEveryMs, enabled, data.running);
 }
 
+// 海盗的状态行要能回答两件事：下一格时间到没到、**今天是不是已经不打了**。
+// 只说「上次 5 分钟前 · 已到间隔」会让人以为它每 60 秒还在探测（其实一次请求都没发）。
+function renderPirateGate(data, enabled) {
+  const node = $('pirate-state');
+  const until = enabled ? Number(data && data.pirateSkipUntil) || 0 : 0;
+  if (until > 0 && until * 1000 > Date.now()) {
+    const why = (data && data.pirateSkipReason) || '战力不够';
+    node.title = '暂停到 ' + clock(until) + '（' + why + '）；到点自动复查战力，够打了立刻恢复 60 秒节奏。点「立刻讨伐一次」不受影响，取消勾选「战力不够就先不打」下一轮生效';
+    node.textContent = '暂停探测：' + why + '，' + dur(Math.round(until - Date.now() / 1000)) + '后再试';
+    return;
+  }
+  renderGate('pirate-state', data.lastPirateAt, data.pirateEveryMs, enabled, data.running);
+}
+
 // 每日宝藏奖励次数：数值来自服务端最近一次探测（挂机每轮更新，手动「立刻抢一次」也更新），
 // 所以页面只显示缓存值，绝不为了「看个数字」在轮询里多发请求。
 // 暂停探测（奖满 / 活动结束 / 没有可抢的）也标在这一行 —— 否则「已领 3/3」配着「上次 30 秒前」
@@ -1235,6 +1266,38 @@ function treasureCountOf(stats, gate) {
 function renderTreasureCount(data, lastRound) {
   const node = $('treasure-count');
   const view = treasureCountOf(data && data.treasureStats, lastRound && lastRound.gates && lastRound.gates.treasure);
+  node.textContent = view.text;
+  node.title = view.title;
+}
+
+// 每日野怪扫荡次数（免战扫荡）：跟「每日宝藏奖励」一个套路 —— 只显示服务端最近一次探测到的数，
+// 轮询里一句探测都不发。暂停探测（战力不够先不打）也标在这一行，否则「已用 3/12」配着
+// 「上次 5 分钟前」会让人以为挂机还在傻跑。
+// 注意跟宝藏的区别：宝藏那次是页面自己补一次 /api/treasure，这里**不补** ——
+// 挂机一启动就会探到，没挂机时点「立刻讨伐一次」也会探到，不需要额外请求。
+function pirateSweepOf(stats, data) {
+  if (!stats) {
+    return {
+      text: '还没探测过',
+      title: '还没探测过：开始挂机或点「立刻讨伐一次」就会读到次数（不为看个数字单独发请求）',
+    };
+  }
+  const tail = data && data.running && data.pirateSkipUntil
+    ? ' · 暂停探测'
+    : '';
+  return {
+    text: (stats.text || '—') + (stats.at ? '（' + clock(stats.at) + ' 探测）' : '') + tail,
+    title: '每日上限 ' + stats.max + ' 次（PirateParamCfg「每日野怪扫荡次数」+ VIP 加成），已用 '
+      + (stats.used == null ? '?' : stats.used) + ' 次，还剩 ' + (stats.left == null ? '?' : stats.left) + ' 次'
+      + '；扫荡只能打已通关等级、不动舰队也不烧汽油'
+      + (data && data.pirateSkipUntil ? '；真出战暂停中：' + (data.pirateSkipReason || '战力不够') : ''),
+  };
+}
+
+function renderPirateCount(data) {
+  const node = $('pirate-count');
+  if (!node) return;
+  const view = pirateSweepOf(data && data.pirateStats, data);
   node.textContent = view.text;
   node.title = view.title;
 }
@@ -1294,7 +1357,7 @@ const LOOP_FIELDS = [
   'loop-rounds', 'loop-every', 'world-speedup', 'world-reroll',
   'world-pick', 'pick-every', 'world-farm', 'farm-every', 'world-instant-topup',
   'loop-radar', 'radar-every', 'radar-ratio', 'radar-repair',
-  'pirate-on', 'pirate-every', 'pirate-repeat',
+  'pirate-on', 'pirate-every', 'pirate-repeat', 'pirate-giveup',
   'forge-on', 'forge-every', 'pet-on', 'pet-every', 'pet-quality', 'pet-feed',
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
   'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
@@ -1356,10 +1419,14 @@ function renderLoop(data) {
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, gateOn('world-pick', data.pickEnabled), data.running);
   renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, gateOn('world-farm', data.farmEnabled), data.running);
   renderRadarGate(data, gateOn('loop-radar', data.radarEnabled));
-  renderGate('pirate-state', data.lastPirateAt, data.pirateEveryMs, gateOn('pirate-on', data.pirateEnabled), data.running);
-  // 运行中把「刷已通关等级」回填（默认关），标脏的不动。
+  renderPirateGate(data, gateOn('pirate-on', data.pirateEnabled));
+  renderPirateCount(data);
+  // 运行中把「刷已通关等级 / 战力不够就先不打」回填（标脏的不动）。
   if (data.running && typeof data.pirateRepeat === 'boolean' && !loopDirty.has('pirate-repeat')) {
     $('pirate-repeat').checked = data.pirateRepeat;
+  }
+  if (data.running && typeof data.pirateGiveUp === 'boolean' && !loopDirty.has('pirate-giveup')) {
+    $('pirate-giveup').checked = data.pirateGiveUp;
   }
   renderGate('forge-state', data.lastForgeAt, data.forgeEveryMs, gateOn('forge-on', data.forgeEnabled), data.running);
   renderGate('pet-state', data.lastPetAt, data.petEveryMs, gateOn('pet-on', data.petEnabled), data.running);
@@ -1481,6 +1548,8 @@ $('loop-start').onclick = async () => {
         pirate: $('pirate-on').checked,
         pirateEverySeconds: Number($('pirate-every').value || 0),
         pirateRepeat: $('pirate-repeat').checked,
+        // 战力不够就先不打（默认开）：只有「全账号最强的船都不够」才暂停，30 分钟复查一次。
+        pirateGiveUp: $('pirate-giveup').checked,
         // 锻造默认开，默认 3 分钟看一眼（一件蓝装约 25 分钟；造好不收等于停产）。
         forge: $('forge-on').checked,
         forgeEverySeconds: Number($('forge-every').value || 0),
@@ -1595,6 +1664,8 @@ $('pirate-run').onclick = async () => {
     $('pirate-state').textContent = results.length
       ? (sweeps ? '扫荡 ' + sweeps + ' 次' : '') + (done ? '派出 ' + done + ' 艘' : '') || '扫荡/派兵都被拒'
       : '没有可打的';
+    // 扫荡次数跟着这次探测一起刷新（服务端已经把 stats 存下了，不额外发请求）。
+    refreshLoop();
   } catch (error) {
     $('pirate-state').textContent = error.message;
   }

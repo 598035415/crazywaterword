@@ -39,6 +39,8 @@
 //   赛季从 `player.worldId` 算：`Math.floor(worldId / 1e6 % 1000)`（客户端 `WorldIdRule.getSeason`）。
 //
 // 边界：只在战力够的时候派（输赢虽然都不掉耐久，但白烧 300 汽油）；
+// 「战力不够就先不打」（`giveUpUntilOf`，2026-10-30 加）：连全账号最强的船都够不上最便宜的目标时，
+// 这一段暂停探测、改成 30 分钟复查一次战力，够打了当轮立刻恢复 —— 不是锁到当天结束（战力随时可能涨）。
 // 免战扫荡（`PirateSweepRequest`）也在这里做 —— 它不动舰队、不烧汽油、只吃「每日野怪扫荡次数」，
 // 打的是**已通关等级**（`level <= maxKilledLevel`），拿的是该等级 fixedReward；
 // 不做「合服世界禁讨伐时段」判断（客户端 `isUniteWorldsForbidTime()` 依赖合服计划数据，我们拿不到
@@ -254,6 +256,9 @@ export function viewPirates(survey, {
     .sort((a, b) => b.power - a.power);
   // 舰队战力取「最强的那艘空闲船」：派兵是一艘一艘派的，`powerNeeded` 的判定同理。
   const bestPower = idle.reduce((max, fleet) => Math.max(max, fleet.power), 0);
+  // 「整个账号最强的那艘」（不管在不在港）：只给 giveUpUntilOf 判「是真打不过，还是强的船正好出海了」。
+  // 两者差别很大 —— 船出海几十分钟就回来，用空闲船战力去判「今天都别打了」会误伤一整天。
+  const bestPowerAll = fleets.reduce((max, fleet) => Math.max(max, fleet.power), 0);
   const petrol = Number(survey.petrol) || 0;
   const petrolCost = petrolCostOf(cfg);
   const targets = [];
@@ -371,9 +376,72 @@ export function viewPirates(survey, {
     groundedFleets,
     duraFloor: Number(duraFloor) > 0 ? Math.min(1, Number(duraFloor)) : 0,
     bestIdlePower: bestPower,
+    bestPowerAll,
     types,
     targets,
   };
+}
+
+// 「战力不够就先不打」的暂停窗口 —— 返回 { until, reason }。
+//
+// 语义是「战力够之前一直不打」，而不是「锁到今天结束」：战力是账号级的东西，不会按整点变，
+// 造新船 / 升舰队 / 换更好的装备随时可能让它跨过门槛。所以命中之后不做真出战，
+// 只是**按一个更慢的节奏复查**（默认 30 分钟一次），复查到「够打了」当轮立刻恢复 60 秒节奏。
+// 为什么不能干脆一直 60 秒试：这一段的探测一轮就是 3 个只读请求
+// （AllPirate + MyFleets + PirateKillRecord），打不过的时候 60 秒一轮刷一整天毫无收益，
+// 也正是「被服务端看出规律性请求」的典型特征。
+//
+// 反过来，下面这些都**不许暂停**（都是几分钟内自己会变的状态，暂停了就会漏）：
+//   · 还有免战扫荡次数没用完（扫荡不动舰队、不烧油，跟战力无关，暂停就白丢次数）；
+//   · 一艘空闲船都没有（船出海/战斗/修理，回来就能打）；
+//   · 汽油不够（产出会补上来）；
+//   · 地图上没有「下一级」（海盗会刷，刷出来就打）；
+//   · **整个账号最强的那艘船**打得过、只是现在出海了/被耐久闸留在港里（等它回来/修好）。
+// 最后一条是这里最容易写错的地方：用「最强空闲船」判会误伤很久（强的船正在打货轮/情报，
+// 几十分钟就回来）。所以判据用 view.bestPowerAll（含在航/在修的船），只有连它都不够才暂停。
+export const POWER_RECHECK_MS = 30 * 60 * 1000;
+
+export function giveUpUntilOf(view, { now = Date.now(), enabled = true, recheckMs = POWER_RECHECK_MS } = {}) {
+  if (!enabled) return { until: 0, reason: '' };
+  // 免战扫荡还没扫完：这一段还得继续跑（扫荡排在真出战前面、不依赖舰队）。
+  if ((Number(view?.sweepLeft) || 0) > 0) return { until: 0, reason: '' };
+  const wait = Math.max(60_000, Number(recheckMs) || POWER_RECHECK_MS);
+  const pause = (reason) => ({ until: now + wait, reason });
+  const types = view?.types ?? [];
+  // 只算「战力查得到」的目标：配置缺行的目标 powerUnknown，无法判断打不打得过。
+  const targets = (view?.targets ?? []).filter((one) => Number(one?.power) > 0);
+  if (targets.length === 0) {
+    // 三种都打到赛季上限 = 本赛季不会再有新等级。这不是「战力」问题，但同样没必要 60 秒问一次，
+    // 用同一个复查节奏（新赛季一开，下一次复查就能看到新等级）。
+    if (types.length > 0 && types.every((type) => type.maxed)) {
+      return pause('三种海盗都打到赛季上限，本赛季没有新等级了');
+    }
+    return { until: 0, reason: '' };
+  }
+  if ((view?.idleFleets ?? []).length === 0) return { until: 0, reason: '' };
+  const cost = Math.max(1, Number(view?.petrolCost) || FALLBACK_PETROL_COST);
+  if ((Number(view?.petrol) || 0) < cost) return { until: 0, reason: '' };
+  // 「最便宜的那个目标」需要多少战力：连它都打不过才是真的不够。
+  const cheapest = targets.reduce((min, one) => (Number(one.powerNeeded) < Number(min.powerNeeded) ? one : min), targets[0]);
+  const need = Number(cheapest.powerNeeded) || 0;
+  const strongest = Math.max(Number(view?.bestPowerAll) || 0, Number(view?.bestIdlePower) || 0);
+  if (strongest >= need) return { until: 0, reason: '' };
+  return pause(`战力不够：最强船 ${powerText(strongest)}，打最弱的 ${cheapest.name ?? '海盗'} Lv${cheapest.level}`
+    + ` 要 ${powerText(need)}（敌方 ${powerText(cheapest.power)} × ${view?.minPowerRatio ?? 1.2} 余量）`);
+}
+
+// 每日野怪扫荡次数的统一说法（日志 / 页面同一句）：
+//   已用 4/12，还剩 8 次 / 已用 12/12，今天的次数用完了（明天 0 点重置）
+// ⚠️ sweepTimes 是「已用」不是「剩余」（见文件头实证），别把两个数反过来写。
+export function sweepCountText(view) {
+  const max = Number(view?.sweepMax) || FALLBACK_SWEEP_MAX;
+  const used = Math.max(0, Math.floor(Number(view?.sweepUsed) || 0));
+  const left = Number.isFinite(Number(view?.sweepLeft))
+    ? Math.max(0, Math.floor(Number(view.sweepLeft)))
+    : Math.max(0, max - used);
+  return left > 0
+    ? `已用 ${used}/${max}，还剩 ${left} 次`
+    : `已用 ${used}/${max}，今天的次数用完了（明天 0 点重置）`;
 }
 
 // 计划：先免战扫荡（免费），再一船一海盗真出战，最强的那艘先挑。

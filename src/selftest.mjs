@@ -4763,7 +4763,8 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
 // 海盗讨伐（世界地图真出战）：战力必须按赛季查、默认只打首杀等级、一船一海盗。
 // 这里钉死的都是「错了不会报错、只会白烧汽油」的地方，所以每条都要有断言。
 {
-  const { pirateOf, petrolCostOf, seasonOf, viewPirates, planPirates, formatPirateSummary, sweepMaxOf } = await import('./pirate.mjs');
+  const { pirateOf, petrolCostOf, seasonOf, viewPirates, planPirates, formatPirateSummary, sweepMaxOf,
+    giveUpUntilOf, sweepCountText, POWER_RECHECK_MS } = await import('./pirate.mjs');
   const config = { tables: {
     // 「打野怪消耗汽油」在 WorldParamCfg，不在 PirateParamCfg（后者只有「每日野怪扫荡次数」）。
     WorldParamCfg: { data: [{ paramName: '打野怪消耗汽油', paramValue: 300 }] },
@@ -4991,8 +4992,59 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(pirateRound.includes('海盗 计划 1'), `要有海盗概览行，实际：\n${pirateRound}`);
   assert.ok(pirateRound.includes('成功 讨伐海盗'), `成功行要标出讨伐海盗，实际：\n${pirateRound}`);
   assert.ok(pirateRound.includes('海盗 间隔未到，还差 40 秒'), `要有节流提示，实际：\n${pirateRound}`);
+
+  // ---- 战力不够就先不打（2026-10-30 加）----
+  // 用户要求：不是「锁到今天结束」，而是「战力不够之前一直不打」——
+  // 暂停到一个复查点（默认 30 分钟），到点看战力，够打了当轮立刻恢复 60 秒节奏。
+  const nowMs = 1_700_000_000_000;
+  const weakView = viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ power: 500000 })],
+  }), { config });
+  const paused = giveUpUntilOf(weakView, { now: nowMs });
+  assert.equal(paused.until, nowMs + POWER_RECHECK_MS, '战力不够 → 暂停到下次复查（30 分钟），不是锁到明天 0 点');
+  assert.ok(paused.reason.includes('战力不够'), `原因要说人话（战力不够 + 差多少），实际：${paused.reason}`);
+
+  // 战力够 / 关掉开关 → 一秒都不停（旧的 60 秒节奏）。
+  assert.equal(giveUpUntilOf(noRepeat, { now: nowMs }).until, 0, '战力够就不暂停');
+  assert.equal(giveUpUntilOf(weakView, { now: nowMs, enabled: false }).until, 0, '开关关掉就照旧按间隔重试');
+
+  // 最强的船只是出海了（在航）= 临时状态，等它回来 —— 不能因为「空闲船不够」暂停。
+  const busyStrong = viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ power: 500000 }), fleet({ buildingId: '2远征船', state: 2, power: 3000000 })],
+  }), { config });
+  assert.equal(busyStrong.bestPowerAll, 3000000, 'bestPowerAll 要算上在航的船');
+  assert.equal(giveUpUntilOf(busyStrong, { now: nowMs }).until, 0, '强的船在航不能暂停（几十分钟就回来）');
+
+  // 一艘空闲船都没有（全在海上/在修）也不暂停。
+  const noIdle = viewPirates(survey({
+    pirates: [pirate({ uid: 1 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ state: 2, power: 500000 })],
+  }), { config });
+  assert.equal(giveUpUntilOf(noIdle, { now: nowMs }).until, 0, '没有空闲船不暂停');
+
+  // 还有免战扫荡次数没用完 → 不暂停（扫荡不动舰队、不烧汽油，跟战力无关，暂停就白丢次数）。
+  const withSweep = viewPirates(survey({
+    pirates: [pirate({ uid: 1 }), pirate({ uid: 2, level: 7 })],
+    killed: new Map([[1, 7]]),
+    fleets: [fleet({ power: 500000 })],
+    sweepLeft: 4,
+  }), { config: sweepConfig });
+  assert.equal(withSweep.targets.length, 1, '前提：确实有打不过的目标');
+  assert.equal(giveUpUntilOf(withSweep, { now: nowMs }).until, 0, '还有扫荡次数时不能暂停');
+
+  // 扫荡次数的页面文案：已用 / 剩余 两个数都要有（sweepTimes 是「已用」，别写反）。
+  assert.equal(sweepCountText(sweepView), '已用 7/10，还剩 3 次', '扫荡文案 = 已用 + 剩余');
+  assert.ok(sweepCountText(viewPirates(survey({
+    fleets: [fleet()], sweepUsed: 12, sweepMax: 12, sweepLeft: 0,
+  }), { config: sweepConfig })).includes('用完了'), '次数用完要说清今天没了');
   checked += 1;
 }
+
 
 // --- 海商王（活动 Trade） --------------------------------------------------
 // 判据全部来自实盘：city91 特产布匹 44（基准 50）、紧缺海鲜披萨 316（基准 280）；
