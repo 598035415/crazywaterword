@@ -619,6 +619,38 @@ export function planRadar(view, {
   return { actions, notes };
 }
 
+// 情报池刷新的余量：nextRefreshTime 是秒级时间戳，我们到点前后几秒难免有误差，
+// 早探一次只会白拿一份空列表（而且又要再等一个间隔）。宁可晚 5 秒。
+export const RADAR_REFRESH_SLACK_MS = 5_000;
+
+// 这次探测之后，到什么时候才值得再探一次。返回 0 = 按常规间隔（radarEveryMs）再来。
+//
+// 背景：情报事件是「打掉就没了，等服务端按 nextRefreshTime 刷一批新的」的池子，
+// 刷新间隔是小时级（实测 6 小时量级）。以前不管有没有事件可打都每 60 秒探一次 ——
+// 一晚上几百次 RadarInfo + MyFleets 全打在空气上。
+//
+// 只有下面这些条件**全部**成立才敢睡到刷新点，任何一条不成立都按常规节奏回来：
+//  1. 服务端给了 nextRefreshTime 且还没到（没给 = 不知道什么时候刷，只能照常轮询）；
+//  2. 没有待领奖的事件（state=4 不领不会自己进包里）；
+//  3. 没有任何 state=1 的事件 —— 包括我们战力/材料不够打不了的，因为材料是工厂现产、
+//     战力会随英雄养成变，几分钟后就可能打得过了；
+//  4. 所有舰队都空闲且不在修（派出去的船回来就能接着打，不能睡）；
+//  5. 没有该修还没修的船（可能只是汽油暂时不够，下轮就够）。
+//
+// state=2（被别人占了）不算「有事可做」：抢不回来，只能等刷新。
+// state=3（我方在打）必然对应一艘非空闲的船，第 4 条已经拦住了。
+export function radarIdleUntil(view, { nowMs = Date.now(), slackMs = RADAR_REFRESH_SLACK_MS } = {}) {
+  const now = Math.floor(Number(nowMs) / 1000);
+  const refreshAt = Number(view?.nextRefreshTime) || 0;
+  if (!(refreshAt > now)) return 0;
+  if ((view.rewards ?? []).length > 0) return 0;
+  if ((view.events ?? []).some((event) => Number(event?.state) === 1)) return 0;
+  const fleets = view.fleets ?? [];
+  if (fleets.some((fleet) => Number(fleet?.state) !== FLEET_STATE_IDLE || fleet?.repairing)) return 0;
+  if ((view.repairQueue ?? []).length > 0) return 0;
+  return refreshAt * 1000 + Math.max(0, Number(slackMs) || 0);
+}
+
 export function formatRadarPlan(view, plan) {
   const lines = [];
   lines.push(`情报 Lv${view.level}（经验 ${view.exp}）· 存 ${view.storedNum} 个 · 汽油 ${view.petrol}`

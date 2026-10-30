@@ -524,6 +524,16 @@ export function youduBlockedReason(view) {
   return null;
 }
 
+// 三个 info 请求全挂时 `open=false`，「活动下线」和「网络断了」长得一模一样，
+// 但处理必须不同：前者退避 1 小时，后者下一轮立刻重试。
+// 判据：服务端明确的 prompt（74 = ACTIVE_END / 活动状态不符）才算「活动关闭」；
+// `not connected` / `timeout` / `拿不到 xxx` 都只是这一轮没通，不能停一小时。
+export function isYouduClosed(reason) {
+  const text = String(reason ?? '');
+  if (/prompt/i.test(text) || /ACTIVE_END/i.test(text)) return true;
+  return false;
+}
+
 export function formatYouduSummary(view) {
   if (!view?.open) return `酆都诡事：未开启（${view?.reason ?? '探测失败'}）`;
   const parts = [];
@@ -556,7 +566,8 @@ export function summarizeYoudu(results) {
     const body = entry.body ?? {};
     if (kind === 'youduKill') summary.kill += 1;
     else if (kind === 'youduSpin') {
-      summary.spin += (body.spin ?? []).length || num(entry.step?.body?.num);
+      // 回包里 `spin` 是本批次的每一格结果（num=10 就是 10 项），数它最准。
+      summary.spin += Array.isArray(body.spin) ? body.spin.length : 0;
     } else if (kind === 'youduEdictGuess' || kind === 'youduEdictStart') {
       summary.edict = body;
     }

@@ -18,7 +18,7 @@
 import { surveyTasks, runTasks } from './tasks.mjs';
 import { surveyDailies, runDailies } from './dailies.mjs';
 import { surveyWorld, planWorld, runWorld, summarizeFloaters, formatFloaters } from './world.mjs';
-import { surveyRadar, viewRadar, planRadar, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
+import { surveyRadar, viewRadar, planRadar, radarIdleUntil, DEFAULT_MIN_POWER_RATIO } from './radar.mjs';
 import { surveyPirates, viewPirates, planPirates, formatPirateSummary } from './pirate.mjs';
 import { surveyEquip, planEquip, formatEquipSummary } from './equip.mjs';
 import { surveyPet, planPet, formatPetSummary } from './pet.mjs';
@@ -30,6 +30,9 @@ import {
   planCityWar,
   formatCityWarSummary,
   formatCityWarGain,
+  claimWarOnlineReward,
+  formatOnlineReward,
+  warPollInterval,
   nextWarStartAt,
   DEFAULT_CW_PREP_LEAD_SEC,
   DEFAULT_CW_REPAIR_BELOW,
@@ -56,6 +59,7 @@ import {
   formatYouduSummary,
   summarizeYoudu,
   formatYouduGain,
+  isYouduClosed,
 } from './youdu.mjs';
 // ⚠ 海商王（活动 Trade）2026-10-28 已下线：第 10 段整段注释，下面这几个导入暂时用不到，
 // 但**故意保留** —— 活动重开时解注释那一段就能直接跑，不用回来补 import（ESM 允许未使用的导入）。
@@ -69,6 +73,7 @@ import {
   mergeLearned,
 } from './tradeKing.mjs';
 import { surveyIdle, planIdle, runIdle, formatIdleSummary } from './idle.mjs';
+import { surveyGuildPack, planGuildPack, runGuildPack, formatGuildPackSummary } from './guildPack.mjs';
 import {
   surveyTreasure,
   viewTreasure,
@@ -84,6 +89,12 @@ import {
 // 「暂停探测」这条日志的重复间隔：货轮静默窗可能长达 10 小时（22:00 收摊 → 次日 8:00），
 // 每轮都印一句会把有用的记录挤没，所以只每 30 分钟报一次。
 const SKIP_NOTICE_MS = 30 * 60 * 1000;
+// 瞬成补产的节奏：排满 → 等 6 秒（服务端跑完 tick）→ 收 → 再排。
+// 上限 4 趟 + 30 秒总预算：主循环间隔是 60 秒，这一段再长就会把整轮拖过间隔、
+// 影响情报/货轮/海盗这些同样按 60 秒跑的段（用户明确要求「最多 4 次，避免异常」）。
+const INSTANT_TOPUP_WAIT_MS = 6_000;
+const INSTANT_TOPUP_MAX_PASSES = 4;
+const INSTANT_TOPUP_BUDGET_MS = 30_000;
 // 某一种作物的播种被服务端拒（典型 `item limit reached` = 该作物库存到上限）后，
 // 这种作物歇多久再试。半小时足够工厂/订单吃掉一批农产品，也不至于白等一整场挂机。
 const FARM_BLOCK_MS = 30 * 60 * 1000;
@@ -182,6 +193,13 @@ export async function runLoop(initialClient, protocol, {
   packGapMax,
   pickUpFloaters = false,
   pickEveryMs = 0,
+  // 瞬成补产（默认开）：瞬成配方排满后不用等下一轮才收 —— 等 6 秒再探一次、收掉、接着排，
+  // 最多 4 趟。理由：瞬成产物排下去就完成，但「收取」要重新探测才看得见，
+  // 一轮只走「排 6 个 → 下一轮收 6 个」这一格，60 秒才 6 个；库存被打空时要等好几轮才能补回来。
+  instantTopUp = true,
+  // 队列里允许堆几个非瞬成配方（见 world.mjs 的 maxLongQueue）：默认 1，多排不提升产能、
+  // 只会把制造位吃光让瞬成排不进去。
+  maxLongQueue = 1,
   // 农田跟拾荒一样有自己的节奏：作物最快也要 30 分钟成熟，每轮都探测纯属浪费请求，
   // 所以默认 2 分钟看一次（0 = 不限制，每轮都看）。开关默认开。
   farmEnabled = true,
@@ -251,6 +269,9 @@ export async function runLoop(initialClient, protocol, {
   // 平时整段静默：不在「战前 10 分钟 ~ 战期结束」之间就直接睡到下一场布署点。
   cityWarEnabled = true,
   cityWarEveryMs = 180_000,
+  // 战期内的节奏：舰队打完就被服务端送回后方城，3 分钟一轮等于白等 —— 战期只有 1 小时，
+  // 每多等一轮就少打一波。默认 60 秒（与拾荒/情报同节奏），战期外仍按 cityWarEveryMs。
+  cityWarLiveEveryMs = 60_000,
   cityWarRepair = true,
   // 战前提前多少秒开始布署（默认 600 = 10 分钟，够修一次満耐久）。
   cityWarPrepLeadSec = DEFAULT_CW_PREP_LEAD_SEC,
@@ -280,6 +301,10 @@ export async function runLoop(initialClient, protocol, {
   // 不必每轮都多打 3 个请求（AfkInfo + EmailBox + 库存复用）。
   idleEnabled = true,
   idleEveryMs = 300_000,
+  // 联盟礼包：队友丢进「联盟礼包库」的免费包，每个都能领一次、24 小时过期。
+  // 一条空请求全领走，所以只需要「多久看一次库」—— 10 分钟足够（不会因为晚几分钟少拿东西）。
+  guildPackEnabled = true,
+  guildPackEveryMs = 600_000,
   // 搁浅的货轮（世界宝藏）：整点刷新、一天只有 3 次奖励，抢的是刷新后那几十秒的窗口，
   // 所以给它最短的间隔 —— 默认 60 秒（与情报同节奏）。它排在情报前面先挑船。
   treasureEnabled = true,
@@ -309,7 +334,7 @@ export async function runLoop(initialClient, protocol, {
   // 下面十几处 `client.request(...)` 自动就跟上新的，不用逐个改。
   let client = initialClient;
   let linkError = '';
-  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set(), guildOrder: new Set(), guildShip: new Set(), cityWar: new Set(), youdu: new Set() };
+  const rejected = { tasks: new Set(), world: new Set(), radar: new Set(), pirate: new Set(), forge: new Set(), pet: new Set(), idle: new Set(), treasure: new Set(), cargo: new Set(), trade: new Set(), guildOrder: new Set(), guildShip: new Set(), guildPack: new Set(), cityWar: new Set(), youdu: new Set() };
   const history = [];
   // 拾荒的「上次执行时间」（毫秒）。0 表示还没执行过，第一次跑就立刻做一次。
   // 只在**真的排进了请求**时才更新 —— 海面没漂浮物时不该白等一个间隔。
@@ -322,6 +347,8 @@ export async function runLoop(initialClient, protocol, {
   // 联盟订单：上次探测时间 + 交成功后的静默窗（睡到次日刷新点）。
   let lastGuildOrderAt = 0;
   let lastGuildShipAt = 0;
+  // 联盟礼包：上次看库的时间。
+  let lastGuildPackAt = 0;
   let guildOrderSkipUntil = 0;
   // 联盟商船的静默窗（船位满了就睡到自己那几条船最早释放的一刻）与英雄星级缓存。
   let guildShipSkipUntil = 0;
@@ -334,12 +361,29 @@ export async function runLoop(initialClient, protocol, {
   let lastCityWarAt = 0;
   let cityWarSkipUntil = 0;
   let cityWarSkipReason = '';
+  // 上一轮 survey 到的战期窗口（秒）。有它才能在「战期内」按 60 秒跑，而不是等到这一轮
+  // 探测完才知道在战期里（那时已经白等了一个 180 秒的间隔）。
+  let cityWarWindow = null;
+  // 本轮战期节奏（60 秒）还是常规节奏（180 秒）。summary 与 gate 都用它，避免两处不一致。
+  let cityWarInterval = 180_000;
   // 酆都诡事：上次探测时间。活动没开（服务端回 ACTIVE_END/74）也照常计时，
   // 否则每轮都要多打 3 个必败请求。
   let lastYouduAt = 0;
+  // 活动下线之后（2026-11-11 结束）这一段还在：每 5 分钟 3 个 info 请求全是 prompt 74。
+  // 所以「探测到没开」就退避 1 小时一次（和联盟商船同一套做法），日志里只报一句「暂停探测」。
+  let youduSkipUntil = 0;
+  let youduSkipReason = '';
+  let youduSkipNotice = false;
   // 情报不一样：探测本身就会刷新事件列表，「读取情报 → 领奖 → 派兵」是一整套动作，
   // 所以只要这轮真的探测成功就计时（不管有没有事件可派），间隔到了才做下一次。
   let lastRadarAt = 0;
+  // 但「间隔到了」不等于「值得再探」：事件打光之后服务端要等 nextRefreshTime 才刷新的，
+  // 那段（实测 6 小时量级）里每 60 秒探一次全是空包。这里记到什么时候才再探，
+  // 算法见 radar.mjs 的 radarIdleUntil（有任何事可做就返回 0，退回常规间隔）。
+  let radarSkipUntil = 0;
+  let radarSkipNoticedAt = 0;
+  // 最近一次探测到的刷新时刻（秒）—— 只用来给页面显示「还有多久刷新」，不参与调度。
+  let radarNextRefreshAt = 0;
   // 海盗讨伐同理：探测（海盗列表 + 舰队 + 击杀记录）成功就计时。
   let lastPirateAt = 0;
   // 免战扫荡被服务端拒过（`PromptResponse = sweep times not enough`，已实测）就到今天结束为止不再扫：
@@ -458,7 +502,7 @@ export async function runLoop(initialClient, protocol, {
       tasks: part(), dailies: part(), world: { ...part(), population: '-', floaterLoot: null },
       idle: part(), treasure: part(), radar: part(), pirate: part(), forge: part(), pet: part(), cargo: part(),
       trade: part(),
-      guildOrder: part(), guildShip: part(), cityWar: part(), youdu: part(),
+      guildOrder: part(), guildShip: part(), guildPack: part(), cityWar: part(), youdu: part(),
     };
 
     // 一轮的统一收尾：补耗时 → 进历史 → 交给页面/日志。
@@ -591,6 +635,9 @@ export async function runLoop(initialClient, protocol, {
         farmBlocked,
         // 工厂排产的额外需求：货船缺的货（空 Map = 只按订单缺口排）。
         cargoDemand: cargoOn ? cargoOrderDemand : null,
+        // 队列里非瞬成配方的上限（默认 1）：多排不提升产能，还会把制造位吃光，
+        // 让 0 秒的瞬成配方（布匹/淡水/生鱼片）连排队资格都没有。
+        maxLongQueue: pickAt(conf, 'maxLongQueue', maxLongQueue),
       });
       summary.world.planned = worldPlan.actions.length;
       summary.world.notes = [...worldSurvey.notes, ...worldPlan.notes];
@@ -622,6 +669,75 @@ export async function runLoop(initialClient, protocol, {
       finish();
       await waitNext(tickAt, everyNow, round < total);
       continue;
+    }
+
+    // 3.5 瞬成补产：排满 → 等 6 秒 → 收 → 再排，最多 4 趟（共 ≤30 秒）。
+    //
+    // 为什么需要：瞬成配方（减免后 0 秒，如布匹 300s − 委任 774s）排下去就完成，但「收取」
+    // 必须重新探测才看得见 —— 一轮只走「排 6 个 → 下一轮收 6 个」这一格，60 秒才 6 个。
+    // 实测 2026-10-30 13:57:40→13:58:40 就是一批 6 个布匹，库存被打空后要好几轮才补回来。
+    //
+    // 只做「队列里没有长物品」的工厂（`action.queueLong === 0`）：有长物品在跑时，瞬成排下去
+    // 只是排队，等 6 秒也收不到，白等还白花请求。
+    // 稳态下每轮只跑 1 趟（上轮已经顶到存量上限，第一次探测就发现没得排）；只有库存被打空时才连跑。
+    // 硬上限 4 趟 + 30 秒预算，保住主循环的 60 秒节奏。
+    // 本轮主段**一条瞬成都没排**（到上限 / 料不够 / 队列被长物品占着）就整段不进 ——
+    // 否则每轮白等 6 秒。
+    const instantPlanned = (worldPlan?.actions ?? []).some((action) => action.kind === 'startProduce'
+      && action.instant === true && action.queueLong === 0);
+    if (instantPlanned && pickAt(conf, 'instantTopUp', instantTopUp) !== false && allowMutate) {
+      const topUpStartAt = Date.now();
+      const collected = new Map();
+      let passes = 0;
+      try {
+        while (passes < INSTANT_TOPUP_MAX_PASSES && !halted()) {
+          if (Date.now() - topUpStartAt > INSTANT_TOPUP_BUDGET_MS) break;
+          await sleep(INSTANT_TOPUP_WAIT_MS);
+          if (halted()) break;
+          const fresh = await linkRetry(() => surveyWorld(client, protocol, { config, player }));
+          const topPlan = planWorld(fresh, {
+            config,
+            useSelectPack: pickAt(conf, 'useSelectPack', useSelectPack),
+            maxPackPerRound: pickAt(conf, 'maxPackPerRound', maxPackPerRound),
+            packGapMax: pickAt(conf, 'packGapMax', packGapMax),
+            cargoDemand: cargoOn ? cargoOrderDemand : null,
+            // 补产只做两件事：收成品 + 排瞬成。建造/农田/拾荒留给主段，别在这一格里重复做。
+            pickUpFloaters: false,
+            farm: false,
+            maxBuilds: 0,
+            maxUpgrades: 0,
+            maxLongQueue: pickAt(conf, 'maxLongQueue', maxLongQueue),
+          });
+          // 只挑两件事：收成品 + 排「队列里没有长物品」的瞬成。
+          // 收取和排产分开判：**收**永远要做（主段排的那 6 个就等这一下），
+          // 没得排只是说明下一趟不用再来了，不能因此把收取也跳过。
+          const collects = topPlan.actions.filter((action) => action.kind === 'gainFactory');
+          const starts = topPlan.actions.filter((action) => action.kind === 'startProduce'
+            && action.instant === true && action.queueLong === 0);
+          if (collects.length === 0 && starts.length === 0) break;
+          const quick = [...collects, ...starts];
+          const { rejected: stillRejected } = await runWorld(client, protocol, { actions: quick, notes: [] }, {
+            allowMutate,
+            rejected: rejected.world,
+            window: 400,
+            onStep: (entry) => onStep?.({ round, phase: 'world', ...entry }),
+          });
+          rejected.world = stillRejected;
+          for (const action of quick) {
+            for (const [id, num] of action.items ?? []) collected.set(id, (collected.get(id) ?? 0) + num);
+          }
+          passes += 1;
+          // 收完了但没有新的瞬成可排（到存量上限 / 料不够 / 队列被长物品占着）→ 不用再等一趟。
+          if (starts.length === 0) break;
+        }
+      } catch (error) {
+        summary.world.notes = [...(summary.world.notes ?? []), `瞬成补产中断：${error.message}`];
+      }
+      if (passes > 0) {
+        // 不打进 notes：概览行（formatLoopRound）有专门一格显示它，notes 只留 4 条，
+        // 挤进去反而会把「为什么这座厂没排产」那类原因挤掉。
+        summary.world.instant = { passes, items: [...collected], ms: Date.now() - topUpStartAt };
+      }
     }
 
     // 4. 挂机领取：邮件附件 + 挂机本段收益 + 等级奖励 + 等级升级。
@@ -730,10 +846,11 @@ export async function runLoop(initialClient, protocol, {
     //    舰队只有 IDLE 能派，派出去后 state 变 MOVING，下一轮自然跳过；
     //    另外整段受自己的间隔约束（默认 60 秒），没到点就一次请求都不发。
     //    货轮那一段已经挑走了它要的船，这里只能拿剩下的。
+    //    事件打光之后还要「睡到刷新」：详情见 radar.mjs 的 radarIdleUntil。
     const radarOn = pickAt(conf, 'radarEnabled', radarEnabled);
     const radarEvery = pickAt(conf, 'radarEveryMs', radarEveryMs);
     const ratioNow = pickAt(conf, 'minPowerRatio', minPowerRatio);
-    const radarDue = radarOn && gateDue(lastRadarAt, radarEvery, tickAt);
+    const radarDue = radarOn && !(radarSkipUntil > tickAt) && gateDue(lastRadarAt, radarEvery, tickAt);
     if (halted()) break;
     if (radarDue) {
       try {
@@ -778,6 +895,15 @@ export async function runLoop(initialClient, protocol, {
         }
         // 探测成功就算这次「读取情报」用掉了这一格时间；失败不记时，下一轮立刻重试。
         lastRadarAt = tickAt;
+        radarNextRefreshAt = Number(radarView.nextRefreshTime) || 0;
+        // 事件打光 + 舰队全在港 + 没有待领奖 → 到服务端刷新前一次请求都不用发。
+        // 只要还有任何一件事能做（有 state=1 的事件、有船在外面/在修、有奖没领），这里就是 0，
+        // 保持原来的 60 秒节奏（见 radarIdleUntil 的注释）。
+        const radarIdleAt = radarIdleUntil(radarView, { nowMs: tickAt });
+        radarSkipUntil = radarIdleAt;
+        if (radarIdleAt > tickAt) {
+          summary.radar.summary += ` · 没事件可打了，${humanDuration((radarIdleAt - tickAt) / 1000)}后才刷新（期间不再请求）`;
+        }
       } catch (error) {
         summary.radar.notes = [`情报探测失败：${error.message}`];
       }
@@ -1124,6 +1250,13 @@ export async function runLoop(initialClient, protocol, {
       }
     }
 
+    // 12. 联盟商船（活动「GuildShip」）
+    // ───────────────────────────────────────────────────────────────────────
+    // ⚠ 2026-10-30：**活动已结束，本段整段停用**。代码原样保留在下面（判据/协议一行没删），
+    //   只是不再探测：不发请求、日志里也不会出现「联盟商船」这一行。
+    //   活动重开时恢复办法：去掉下面那对块注释标记（单独一行的斜杠星号 / 星号斜杠），
+    //   再删掉末尾那 4 行 stub 即可。页面开关 / `/api/guildship` / CLI 也都一起注释了，要一并恢复。
+    /*
     // 12. 联盟商船（活动「GuildShip」）：全联盟一起凑货舱，凑齐立刻启航，船长与登船成员拿**同样**奖励。
     //     能做的只有两件事：
     //       ① 给「已有船长、舱还空着」的船**补一个货舱** —— 但材料必须已经够（缺料时客户端会弹
@@ -1217,6 +1350,57 @@ export async function runLoop(initialClient, protocol, {
         summary.guildShip.notes = [`联盟商船探测失败：${error.message}`];
       }
     }
+    */
+    // 停用期间的 stub：gates 与概览行仍然引用这几个名字。
+    // guildShipOn=false 时 gateLine 直接返回空串，日志里不会多一行「联盟商船」。
+    const guildShipOn = false;
+    const guildShipEvery = 0;
+    const guildShipDue = false;
+    const guildShipSkipping = false;
+
+    // 12.5 联盟礼包（公会福利礼包）：队友买礼包 / 闯关 / 每日订单成单时会往「联盟礼包库」丢一个包，
+    //      联盟所有成员**各能免费领一次**，24 小时后消失。不发请求就永远躺着 —— 纯白丢的收益
+    //      （10/29 实测库里积了 25 个没领，含 RUBY / 抽卡券 / 藏品券 / 原料自选包）。
+    //      请求 `GotGuildWelfarePackRequest` 是**空消息**：一条就把库里所有未领的一次结清，
+    //      回包 `{ reward, lastGotTime }` 直接给出合并奖励，所以没有「先领哪个」的问题。
+    //      判据照抄客户端 `_onBtnGot`：有包的 createTime > guild.gotWelfareTime。
+    //      节奏 10 分钟：礼包是别人随时丢进来的，24 小时才过期，看太勤只是白打 GuildInfo。
+    const guildPackOn = pickAt(conf, 'guildPackEnabled', guildPackEnabled);
+    const guildPackEvery = pickAt(conf, 'guildPackEveryMs', guildPackEveryMs);
+    const guildPackDue = guildPackOn && gateDue(lastGuildPackAt, guildPackEvery, tickAt);
+    if (halted()) break;
+    if (guildPackDue) {
+      try {
+        const packSurvey = await linkRetry(() => surveyGuildPack(client, protocol));
+        const packPlan = planGuildPack(packSurvey);
+        summary.guildPack.planned = packPlan.actions.length;
+        summary.guildPack.notes = packPlan.notes;
+        summary.guildPack.summary = formatGuildPackSummary(packSurvey);
+        if (packPlan.actions.length > 0) {
+          const { results, rejected: stillRejected } = await runGuildPack(client, protocol, packPlan, {
+            allowMutate,
+            rejected: rejected.guildPack,
+            onStep: (entry) => onStep?.({ round, phase: 'guildPack', ...entry }),
+          });
+          rejected.guildPack = stillRejected;
+          summary.guildPack.results = results;
+          // 领到之后库里就空了，把概览改成「已领完」——否则这一轮的日志会写
+          // 「25 个待领」+「成功 领 25 个」两句自相矛盾的话。
+          if (results.some((entry) => entry.ok)) {
+            summary.guildPack.summary = formatGuildPackSummary({
+              ...packSurvey,
+              pending: 0,
+              claimable: [],
+              gotWelfareTime: results.find((entry) => entry.ok)?.step?.lastGotTime ?? packSurvey.gotWelfareTime,
+            });
+          }
+        }
+        // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
+        lastGuildPackAt = tickAt;
+      } catch (error) {
+        summary.guildPack.notes = [`联盟礼包探测失败：${error.message}`];
+      }
+    }
 
     // 13. 国战（联盟攻城）：每天 20:00–21:00 一场，联盟宣战最多 3 座城。
     //     **这一段只做「派兵 + 修船」两件事**，不写任何战斗逻辑：
@@ -1227,6 +1411,7 @@ export async function runLoop(initialClient, protocol, {
     //     所以白天不会每小时多打几条请求。
     const cityWarOn = pickAt(conf, 'cityWarEnabled', cityWarEnabled);
     const cityWarEvery = pickAt(conf, 'cityWarEveryMs', cityWarEveryMs);
+    const cityWarLiveEvery = Math.max(30_000, Number(pickAt(conf, 'cityWarLiveEveryMs', cityWarLiveEveryMs)) || 60_000);
     const cityWarRepairOn = pickAt(conf, 'cityWarRepair', cityWarRepair) === true;
     const cityWarPrepLead = Math.max(60, Number(pickAt(conf, 'cityWarPrepLeadSec', cityWarPrepLeadSec)) || DEFAULT_CW_PREP_LEAD_SEC);
     // ⚠ 局部名不能和同名参数一样：`const cityWarRepairBelow = ... pickAt(conf, '…', cityWarRepairBelow)`
@@ -1235,8 +1420,12 @@ export async function runLoop(initialClient, protocol, {
     const cityWarMinRatio = Number(pickAt(conf, 'cityWarMinPowerRatio', cityWarMinPowerRatio)) || 0;
     const cityWarReserve = Number(pickAt(conf, 'cityWarPetrolReserve', cityWarPetrolReserve)) || 0;
     const cityWarPerCity = Math.max(1, Number(pickAt(conf, 'cityWarMaxFleetsPerCity', cityWarMaxFleetsPerCity)) || DEFAULT_CW_MAX_FLEETS_PER_CITY);
+    // 战期只有 1 小时，而舰队一波打完就被服务端送回后方城 —— 3 分钟一轮等于每波白等 2 分钟。
+    // 用上一轮记下的战期窗口判断「现在在不在战期」，免得等这一轮探测完才知道（那时已经晚了）。
+    const cwNowSec = Math.floor(tickAt / 1000);
+    cityWarInterval = warPollInterval(cityWarEvery, cityWarLiveEvery, cityWarWindow, cwNowSec);
     const cityWarSkipping = cityWarOn && cityWarSkipUntil > tickAt;
-    const cityWarDue = cityWarOn && !cityWarSkipping && gateDue(lastCityWarAt, cityWarEvery, tickAt);
+    const cityWarDue = cityWarOn && !cityWarSkipping && gateDue(lastCityWarAt, cityWarInterval, tickAt);
     // 静默窗可长达一整天（白天 → 次日 19:50），只在「设窗/换窗」那一轮报一次。
     let cityWarSkipNotice = false;
     if (halted()) break;
@@ -1273,10 +1462,22 @@ export async function runLoop(initialClient, protocol, {
           summary.cityWar.results = results;
           summary.cityWar.gain = formatCityWarGain(results);
         }
+
+        // ---- 城战在线奖励（7 档）----
+        // `WorldOnlineRwdCfg` 的档位是「累计在线 1/60/120/180/240/300/300 秒」，客户端是
+        // **自动发** `GotWorldOnlineRwdRequest` 的（`WarOnlineReward` 里 stage==已领+1 && 计时到点），
+        // 无头客户端不跑那段 UI → 10/29 实测整场 7 档一个都没领。
+        // 战期内每轮补几次，领到服务端拒为止（拒 = 这一档还没解锁或已经领完）。
+        if (allowMutate && cwView.phase === 'live') {
+          const online = await claimWarOnlineReward(client, protocol);
+          summary.cityWar.online = online;
+          summary.cityWar.onlineText = formatOnlineReward(online);
+        }
+
         // 静默窗：算下一次该醒的时刻。
         //   waiting/done → 睡到下一场「开战前 N 分钟」；战期是按天固定的，所以直接按整日推。
         //   unknown      → 服务端没给战期（没宣战 / 还没到 0 点推送），每小时探一次。
-        //   战中被拒     → 退避 5 分钟，别每 3 分钟拿同一条必败请求撞墙。
+        //   战中被拒     → 战期内 1 分钟就重试（战期只有 1 小时，5 分钟退避等于白丢 5 分钟的战斗点）。
         const failedNow = (summary.cityWar.results ?? []).filter((entry) => entry.ok === false && !entry.skipped).length;
         const nextSkip = (() => {
           if (cwView.phase === 'waiting' || cwView.phase === 'done') {
@@ -1290,7 +1491,20 @@ export async function runLoop(initialClient, protocol, {
           if (cwView.phase === 'unknown') {
             return { until: tickAt + 3_600_000, why: '服务端没给战期（每小时探一次）' };
           }
+          // 战前布署被服务端拒（prompt「not city war time」）：说明这座城还没进战期，
+          // 提前派纯属白打请求（10/29 实测：19:50/19:55/20:00 各派 2 艘全被拒，
+          // 20:01 才真的动）。既然服务端只认战期，就直接睡到开战，别 5 分钟撞一次墙。
+          const warTimeRefused = (summary.cityWar.results ?? []).some(
+            (entry) => entry.ok === false && !entry.skipped && /city war time/i.test(String(entry.error ?? '')),
+          );
+          if (warTimeRefused && cwSurvey.startAt * 1000 > tickAt) {
+            const at = new Date(cwSurvey.startAt * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+            return { until: cwSurvey.startAt * 1000, why: `战前布署被拒（服务端只认战期内派兵），等到 ${at} 开战再派` };
+          }
           if (failedNow > 0) {
+            if (cwView.phase === 'live') {
+              return { until: tickAt + cityWarInterval, why: `派兵/修船被拒，战期内每 ${Math.round(cityWarInterval / 1000)} 秒重试` };
+            }
             return { until: tickAt + 5 * 60_000, why: '派兵/修船被拒，5 分钟后再试' };
           }
           return { until: 0, why: '' };
@@ -1299,6 +1513,11 @@ export async function runLoop(initialClient, protocol, {
         cityWarSkipNotice = nextSkip.until > 0 && Math.abs(nextSkip.until - cityWarSkipUntil) > 60_000;
         cityWarSkipUntil = nextSkip.until;
         cityWarSkipReason = nextSkip.why;
+        // 记下这一场的窗口：下一轮开算「现在在不在战期」不用再等探测结果，
+        // 战期一到就按 60 秒的节奏跑（否则要多等一个 180 秒间隔才发觉开战了）。
+        if (cwSurvey.startAt > 0 && cwSurvey.endAt > cwSurvey.startAt) {
+          cityWarWindow = { startAt: cwSurvey.startAt, endAt: cwSurvey.endAt };
+        }
         // 探测成功就算用掉了这一格时间；失败不记时，下一轮立刻重试。
         lastCityWarAt = tickAt;
       } catch (error) {
@@ -1320,12 +1539,29 @@ export async function runLoop(initialClient, protocol, {
     const youduEvery = pickAt(conf, 'youduEveryMs', youduEveryMs);
     const youduSpinNow = pickAt(conf, 'youduSpin', youduSpin) === true;
     const youduEdictNow = pickAt(conf, 'youduEdict', youduEdict) === true;
-    const youduDue = youduOn && gateDue(lastYouduAt, youduEvery, tickAt);
+    const youduSkipping = youduOn && youduSkipUntil > tickAt;
+    const youduDue = youduOn && !youduSkipping && gateDue(lastYouduAt, youduEvery, tickAt);
+    youduSkipNotice = false;
     if (halted()) break;
     if (youduDue) {
       try {
-        const ydSurvey = await linkRetry(() => surveyYoudu(client, { config }));
+        // 库存复用海面那一段的（`worldSurvey.stock`）—— 和货轮/情报/海盗/国战几段同一做法，
+        // 省掉每轮一次 AllItemRequest（5 分钟一次，一天 288 次）。
+        const ydSurvey = await linkRetry(() => surveyYoudu(client, { config, items: worldSurvey?.stock ?? null }));
         const ydView = viewYoudu(ydSurvey, { config });
+        // 活动下线（2026-11-11 之后）时 3 个 info 请求全是 prompt 74 → 退避 1 小时再探，
+        // 日志里只留一句「暂停探测」，别把每轮日志都刷成「未开启」。
+        // ⚠ 只有服务端明确说「活动关了」才退避：`not connected`（掉线/刚重连）也走
+        //   `open=false` 这条分支，按 1 小时退避就等于断一次网白丢一小时活动。
+        if (!ydView.open && isYouduClosed(ydSurvey?.reason)) {
+          const until = tickAt + 3_600_000;
+          youduSkipNotice = Math.abs(until - youduSkipUntil) > 60_000;
+          youduSkipUntil = until;
+          youduSkipReason = `活动未开启（${String(ydSurvey?.reason ?? '').slice(0, 40)}，每小时探一次）`;
+        } else {
+          youduSkipUntil = 0;
+          youduSkipReason = '';
+        }
         const ydPlan = planYoudu(ydView, { config, spin: youduSpinNow, edict: youduEdictNow });
         summary.youdu.planned = ydPlan.actions.length;
         summary.youdu.notes = ydPlan.notes;
@@ -1382,6 +1618,10 @@ export async function runLoop(initialClient, protocol, {
     // 静默窗还在跑的时候，攒够 30 分钟才再报一次（第一次已经在设窗那一轮报过了）。
     const treasureSkipNotice = treasureSkipping && tickAt - treasureSkipNoticedAt >= SKIP_NOTICE_MS;
     if (treasureSkipNotice) treasureSkipNoticedAt = tickAt;
+    // 情报的静默窗是「事件打光了，等刷新」，可以长达几小时 —— 同样只在设窗那轮记一次。
+    const radarSkipping = radarOn && radarSkipUntil > tickAt;
+    const radarSkipNotice = radarSkipping && tickAt - radarSkipNoticedAt >= SKIP_NOTICE_MS;
+    if (radarSkipNotice) radarSkipNoticedAt = tickAt;
     // 贸易港口的静默窗是「船在海上」这一个原因，设窗那一轮印一次就够。
     const cargoSkipNotice = cargoSkipping && tickAt - cargoSkipNoticedAt >= SKIP_NOTICE_MS;
     if (cargoSkipNotice) cargoSkipNoticedAt = tickAt;
@@ -1408,7 +1648,20 @@ export async function runLoop(initialClient, protocol, {
         // 最近一次探测到的每日奖励次数（网页直接显示，不用额外请求）。
         stats: treasureStats,
       },
-      radar: { ...gateSummary(radarOn, radarEvery, lastRadarAt, tickAt), throttled: radarOn && !radarDue },
+      radar: {
+        ...gateSummary(radarOn, radarEvery, lastRadarAt, tickAt),
+        // 静默中不算「间隔未到」—— 「事件打光等刷新」和「60 秒间隔没到」是两件事，
+        // 混在一起页面上就只是「还差 43 秒」，看不出其实要睡到几小时后。
+        throttled: radarOn && !radarDue && !radarSkipping,
+        skipped: radarSkipping,
+        skipReason: radarSkipping ? '事件已打完，等刷新' : '',
+        skipForever: false,
+        skipLeftSeconds: radarSkipping ? Math.max(0, Math.ceil((radarSkipUntil - tickAt) / 1000)) : 0,
+        skipUntil: radarSkipping ? Math.floor(radarSkipUntil / 1000) : null,
+        skipNotice: radarSkipNotice,
+        // 服务端给的下次刷新时刻（秒）。页面拿它显示「还有多久刷新」，不额外发请求。
+        nextRefreshAt: radarNextRefreshAt > 0 ? radarNextRefreshAt : null,
+      },
       pirate: { ...gateSummary(pirateOn, pirateEvery, lastPirateAt, tickAt), throttled: pirateOn && !pirateDue },
       forge: { ...gateSummary(forgeOn, forgeEvery, lastForgeAt, tickAt), throttled: forgeOn && !forgeDue },
       pet: { ...gateSummary(petOn, petEvery, lastPetAt, tickAt), throttled: petOn && !petDue },
@@ -1456,8 +1709,10 @@ export async function runLoop(initialClient, protocol, {
         // 静默窗可以很长（一场 9 小时的超凡船），但只在设窗那轮报一次，之后每 30 分钟提醒。
         skipNotice: guildShipSkipping && tickAt - guildShipSkipNoticedAt >= SKIP_NOTICE_MS,
       },
+      guildPack: { ...gateSummary(guildPackOn, guildPackEvery, lastGuildPackAt, tickAt), throttled: guildPackOn && !guildPackDue },
       cityWar: {
-        ...gateSummary(cityWarOn, cityWarEvery, lastCityWarAt, tickAt),
+        // 战期内用 60 秒节奏（cityWarInterval），页面上的倒计时才不会和服务端实际节奏打架。
+        ...gateSummary(cityWarOn, cityWarInterval, lastCityWarAt, tickAt),
         throttled: cityWarOn && !cityWarDue && !cityWarSkipping,
         // 「战斗还没开始/已经打完，睡到下一场布署点」跟「间隔未到」是两回事，页面上要分得清。
         skipped: cityWarSkipping,
@@ -1469,7 +1724,13 @@ export async function runLoop(initialClient, protocol, {
       },
       youdu: {
         ...gateSummary(youduOn, youduEvery, lastYouduAt, tickAt),
-        throttled: youduOn && !youduDue,
+        throttled: youduOn && !youduDue && !youduSkipping,
+        // 活动下线后每小时才探一次；gateLine 靠这几个字段印「暂停探测：…，N 分后再试」。
+        skipped: youduSkipping,
+        skipReason: youduSkipReason,
+        skipUntil: youduSkipping ? Math.floor(youduSkipUntil / 1000) : null,
+        skipLeftSeconds: youduSkipping ? Math.max(0, Math.ceil((youduSkipUntil - tickAt) / 1000)) : 0,
+        skipNotice: youduSkipNotice,
       },
     };
 
@@ -1520,6 +1781,14 @@ const KIND_TEXT = {
   guildShipSeek: '应聘船长',
   cityWarMove: '国战派兵',
   cityWarRepair: '国战修船',
+  youduKill: '灭邪祟',
+  youduEvilClaim: '领驱邪奖励',
+  youduSpin: '转罗盘',
+  youduWheelClaim: '领罗盘积分',
+  youduEdictStart: '开法旨',
+  youduEdictGuess: '交法旨',
+  youduSign: '签到',
+  youduActive: '领活跃度',
   mailQuickGet: '领邮件',
   afkDraw: '挂机收益',
   afkLevelDraw: '挂机等级奖励',
@@ -1630,7 +1899,15 @@ export function formatLoopRound(summary) {
     line('日常', summary.dailies),
     ...detailLines(summary.dailies),
     ...(summary.dailies.notes ?? []).map((note) => `    注意 ${note}`),
-    `${line('海面', summary.world)}  人口 ${summary.world.population}`,
+    // 瞬成补产单独挂在海面那一行：它不在主段的 planned/results 里（是同一轮的第 3.5 段），
+    // 不印出来就只能去翻逐条动作日志才知道跑了几趟、收了多少。
+    `${line('海面', summary.world)}  人口 ${summary.world.population}`
+      + (summary.world.instant
+        ? `  · 瞬成补产 ${summary.world.instant.passes} 趟`
+          + `${(summary.world.instant.items ?? []).length > 0
+            ? `，收 ${(summary.world.instant.items ?? []).map(([id, num]) => `${id}×${num}`).join('、')}` : ''}`
+          + `${summary.world.instant.ms > 0 ? `（${humanDuration(summary.world.instant.ms / 1000)}）` : ''}`
+        : ''),
     ...detailLines(summary.world),
     // 海面这一段的 note 以前**没有任何出口**（控制台和网页都看不到），
     // 于是「为什么这座工厂没排产」只能靠猜。这里把它印出来，最多 4 条。
@@ -1706,11 +1983,18 @@ export function formatLoopRound(summary) {
         ...detailLines(summary.guildShip),
         ...(summary.guildShip.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
+    // 联盟礼包：看过库就印一行（「已领完」也要印，否则看不出开关有没有生效）。
+    ...(summary.guildPack && (summary.guildPack.summary || (summary.guildPack.notes ?? []).length > 0)
+      ? [`${line('联盟礼包', summary.guildPack)}${summary.guildPack.summary ? `  ${summary.guildPack.summary}` : ''}`,
+        ...detailLines(summary.guildPack),
+        ...(summary.guildPack.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
+      : []),
     // 国战：探测过就印一行（「还没到布署时间」「无需派兵」也要印，
     // 否则白天整天看不到这一段，会以为开关没生效）。
     ...(summary.cityWar && (summary.cityWar.summary || (summary.cityWar.notes ?? []).length > 0)
       ? [`${line('国战', summary.cityWar)}${summary.cityWar.summary ? `  ${summary.cityWar.summary}` : ''}`
-          + (summary.cityWar.gain ? `  ${summary.cityWar.gain}` : ''),
+          + (summary.cityWar.gain ? `  ${summary.cityWar.gain}` : '')
+          + (summary.cityWar.onlineText ? `  ${summary.cityWar.onlineText}` : ''),
         ...detailLines(summary.cityWar),
         ...(summary.cityWar.notes ?? []).slice(0, 4).map((note) => `    跳过 ${note}`)]
       : []),
@@ -1730,6 +2014,7 @@ export function formatLoopRound(summary) {
     ...[gateLine('海商王', summary.gates?.trade)].filter(Boolean),
     ...[gateLine('联盟订单', summary.gates?.guildOrder)].filter(Boolean),
     ...[gateLine('联盟商船', summary.gates?.guildShip)].filter(Boolean),
+    ...[gateLine('联盟礼包', summary.gates?.guildPack)].filter(Boolean),
     ...[gateLine('国战', summary.gates?.cityWar)].filter(Boolean),
     ...[gateLine('酆都诡事', summary.gates?.youdu)].filter(Boolean),
     ...[gateLine('挂机领取', summary.gates?.idle)].filter(Boolean),

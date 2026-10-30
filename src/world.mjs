@@ -509,6 +509,10 @@ export function planWorld(survey, {
   // 瞬成配方的排满策略：减免把生产时间压到 0 的配方，一次把空制造位排满；
   // 关掉就退回「一轮每座工厂只排 1 个」。
   fillInstantQueue = true,
+  // 队列里允许堆几个「非瞬成」配方（默认 1）：串行队列一次只跑一个，堆第 2 个不提升产能，
+  // 却会把制造位吃光 —— 瞬成配方（0 秒，排下去就完成）就再也排不进去。
+  // 传 Infinity 退回旧行为（一轮接一轮往队列里塞长物品，实测能堆满 6/6）。
+  maxLongQueue = 1,
   // 农田开关：收成熟作物 + 补种空地。跟拾荒一样由调用方按自己的间隔门控
   // （循环默认 2 分钟看一次），关掉就完全不碰农田。
   farm = true,
@@ -941,6 +945,17 @@ export function planWorld(survey, {
     notes.push(`用过剩作物排产：${feedWants.slice(0, 4).join(' ')}${feedWants.length > 4 ? ' …' : ''}`);
   }
   const instantHints = new Set(survey.produce?.instant ?? []);
+  // 配方索引：`工厂类型 + 物品` → 配方行。用来判断**队列里排着的那一项是不是瞬成** ——
+  // 队列项只有 productId，没有时长，必须回表查。查不到配方一律当「非瞬成」（保守）。
+  const produceRowByKey = new Map(produceRows.map((row) => [`${row.buildType}\u0000${row.itemId}`, row]));
+  const instantOfItem = (buildType, itemId) => {
+    const row = produceRowByKey.get(`${buildType}\u0000${itemId}`);
+    if (!row) return false;
+    return isInstantRecipe({
+      finalSeconds: produceFinalTime(row.produceTime, produceReduce),
+      hint: instantHints.has(`${buildType}\u0000${itemId}`),
+    });
+  };
   // **全局在产量**：所有工厂的「待收 + 队列」里这件物品一共有几个。
   // 存量上限是全局限，不是单厂限 —— 同一件物品可能好几座工厂都能产（配方表按 buildType 分，
   // 布匹这类材料就不止一座能出）。只算本厂的话，A 厂排了 40 个、B 厂完全看不见，
@@ -971,15 +986,12 @@ export function planWorld(survey, {
     const queue = b.factory.factoryQ ?? [];
     // 队列是**串行**的：只有队首真的在产，第 2 项及以后都只是排着队（服务端连 finishTime 都不给）。
     // 所以「队列里有没有活」不能看 queue.length，要看**队首**：
-    //   队首在跑 / 未排上时间 —— 这一轮新排的东西只会排到它后面等，排瞬成也一样等
-    //                            （实测 2026-10-26：1服装厂 队首是 45 分钟的鱼皮鞋，
-    //                             后面堆了 4 个瞬成，全都得等它跑完才逐个落地）
-    //   队首已完成 / 空队列    —— 瞬成才是真的「排下去就出货」，一次排满剩余空位
-    const head = queue[0] ?? null;
-    const headFinish = head ? Number(head.finishTime) || 0 : 0;
-    // `> now` = 还在跑，`<= now` = 已完成（服务端会自己搬进待收）。
-    // `finishTime = 0` 是「这条队列还没被服务端排上时间」（刚排完还没结算），也按忙处理。
-    const headRunning = head ? (headFinish === 0 || headFinish > now) : false;
+    //   队首在跑 / 未排上时间（finishTime = 0 = 刚排完没结算）—— 新排的东西只能排在它后面等，
+    //                            包括瞬成（实测 2026-10-26：1服装厂 队首是 45 分钟的鱼皮鞋，
+    //                            后面堆了 4 个瞬成，全都得等它跑完才逐个落地）
+    //   队首已完成 / 空队列 —— 瞬成才是真的「排下去就出货」
+    // 但 2026-10-30 起「队首在跑」不再阻止**瞬成**填满剩余空位：排队不花时间（瓶颈是队首），
+    // 等队首结束它们会在同一个 tick 里全部落地。只有**非瞬成**才严格一轮 1 个。
     const openSlots = Math.max(0, slots - queue.length);
     if (openSlots === 0) continue;
     // 持有量 / 在产量统一走全局口径（见上面 globalHeldOf / pendingOf）：
@@ -1057,15 +1069,31 @@ export function planWorld(survey, {
     };
     // 瞬成判断用减免后的秒数；0 = 排下去就完成，可以放心排满。
     // 委任数据拉不到时退到观测标记（队列里抓到过「还剩 0~2 秒」的队首）。
-    const instantOf = (row) => isInstantRecipe({
-      finalSeconds: produceFinalTime(row.produceTime, produceReduce),
-      hint: instantHints.has(`${b.type}\u0000${row.itemId}`),
-    });
+    const instantOf = (row) => instantOfItem(b.type, row.itemId);
+    // 队列里「非瞬成项」的个数。瞬成项排下去就完成、不会长期占位；占住制造位的是非瞬成项。
+    // 串行队列同一时刻只跑一个，排队第 2 个长物品**不提升任何产能**，却会把位置吃光 ——
+    // 实测 2026-10-30 14:03 的 OnWaterResponse：1家具厂 6/6（橱柜+躺椅×5）、1服装厂 6/6（鱼皮鞋×5+渔夫帽）、
+    // 1建材厂 6/6（电线×2+木板×4）、1玩具厂 6/6（鱼皮风筝×6）全是小时级，
+    // 有需求的瞬成配方（布匹、淡水）连排队资格都没有，只能干等前面几个跑完。
+    const queueLong = queue.reduce((sum, job) => sum + (instantOfItem(b.type, job?.productId) ? 0 : 1), 0);
     // 队首还在跑的时候也可以排，但**只排 1 个**（见下面的 wanted）：
     // 空位闲着才是真浪费，而排 1 个只占 1/6 容量，不会像「排满」那样把 5 个位全堆成排队项
     // （实测 2026-10-26：1服装厂 队首 45 分钟的鱼皮鞋后面堆了 4 个瞬成，全得等它跑完）。
     // 有需求的配方靠 scoreFor 里的需求加权自然排在最前面，不用在这儿过滤。
-    const candidates = pool;
+    // 队列里已经有 maxLongQueue 个非瞬成项时，本轮**只允许排瞬成**：
+    // 长物品排第 2 个既不提升产能（串行，一次只跑一个），又会把剩下的制造位吃光，
+    // 让有需求的瞬成配方（布匹/淡水/生鱼片这些 0 秒的）一整轮都排不进去。
+    // 瞬成里连「料够」的都没有时放开限制 —— 让长物品顶上总比工厂空转强。
+    const longCap = Number.isFinite(Number(maxLongQueue)) ? Math.max(0, Number(maxLongQueue)) : Infinity;
+    let candidates = pool;
+    let longBlocked = false;
+    if (queueLong >= longCap) {
+      const instantPool = pool.filter((row) => instantOf(row));
+      if (instantPool.some((row) => affordable(row))) {
+        candidates = instantPool;
+        longBlocked = true;
+      }
+    }
 
     let best = candidates.find((row) => affordable(row)) ?? null;
     let packPlanUsed = null;
@@ -1140,7 +1168,8 @@ export function planWorld(survey, {
           ?? candidates[0];
         const short = costOf(shortRow).filter((cost) => free(cost.id) < cost.num)
           .map((cost) => `${cost.id} ${free(cost.id)}/${cost.num}`).join(' ') || '未知';
-        notes.push(`${b.buildingId} 空闲：料不够（${short}）${whyNoPack(shortRow)}`);
+        notes.push(`${b.buildingId} 空闲：料不够（${short}）${whyNoPack(shortRow)}`
+          + (longBlocked ? `（队列里已有 ${queueLong} 个长配方，本轮只排瞬成，瞬成也缺料）` : ''));
       }
       continue;
     }
@@ -1148,18 +1177,20 @@ export function planWorld(survey, {
     const need = demand.get(best.itemId) ?? 0;
     const finalSeconds = produceFinalTime(best.produceTime, produceReduce);
     const instant = instantOf(best);
-    // 一次排几个：瞬成 + **队列空** → 把剩余空位排满（每一份都真的立刻完成）；
-    // 队首还在跑 → 只排 1 个（排多了只是往队尾堆一堆排队项，全在等队首，还把位置占满）。
     // 一次排几个：
-    //   - 队首还在跑 → **1 个**（多排只是往队尾堆排队项，全在等队首）
-    //   - 队列空/队首已完成 → 瞬成配方把剩余空位排满；非瞬成仍只 1 个
+    //   - 瞬成配方 → 把剩余空位排满。**队首在跑也排满**（2026-10-30 改）：
+    //     串行队列的瓶颈在队首那一个长物品，瞬成排进去只是排队、**不增加任何时间成本**；
+    //     等长物品跑完，它们会在同一个 tick 里全部落地，下一轮一起收。
+    //     旧逻辑「队首在跑只排 1 个」的后果是：长物品占 30 分钟，5 个空位干等，
+    //     瞬成在这半小时里一个都不产出（用户 2026-10-30 反馈的就是这个）。
+    //   - 非瞬成配方 → 1 个（多排只是往队尾堆排队项，产能还是一样的）
     //   - 有**明确需求**（订单 / 货船）时按缺口排，别一次干到 6 个造成过量：
     //     货船要 2 个淡水、排 6 个，多出来的 4 个既占库存也占材料
     const needNow = Math.max(0, (demand.get(best.itemId) ?? 0) - queueHeldOf(best.itemId));
     // 走「无需求小额兜底」排上的这条，强制只排 1 个：料是拿包换的，排满等于把包按 N 倍烧。
     const wanted = packSmallGap
       ? 1
-      : (fillInstantQueue && instant && !headRunning
+      : (fillInstantQueue && instant
         ? (needNow > 0 ? Math.min(openSlots, needNow) : openSlots)
         : 1);
     // 这条配方的持有量（仓库 + 待收 + 队列）。pool 已经按同一个 heldOf 过滤过上限，
@@ -1210,6 +1241,12 @@ export function planWorld(survey, {
         body: { buildingId: b.buildingId, productId: best.itemId },
         // 一条动作 = 一个成品。日志按 items 累加，瞬成排 3 个就显示「排产 木板×3」。
         items: [[best.itemId, 1]],
+        // 这两个字段是给挂机的「瞬成补产」用的：
+        //   instant   —— 这条产 0 秒就能收（排完等几秒就能拿），值得在同一轮里反复排/收；
+        //   queueLong —— 这座工厂队列里已经有几个非瞬成项。>0 时瞬成排下去只能排队，
+        //                「等 6 秒就收」收不到，补产循环会跳过它。
+        instant,
+        queueLong,
         // 瞬成排满是同一座工厂连发 N 条：key 必须带上序号，否则 stepKey 会把它们算成同一个动作。
         // transient：排产失败几乎都是瞬时原因（队列满/库存满/料不够），不该被 rejected 永久记住。
         key: `startProduce:${b.buildingId}#${k}`,

@@ -11,8 +11,12 @@
 //   `_maxExpItemNum = getAssetNum("徽章经验")`，`expItemNum` 就是实际投入的经验点数，
 //   `decomposeUid` 是额外的「分解掉换经验」的闲置徽章。**本模块恒发空数组**：
 //   只花背包里的「徽章经验」道具，不分解任何徽章 —— 分解不可逆，没有收益判断依据时不做。
-// - 徽章升星（`BadgeStarRequest`）需要分解 `HeroBadgeStarCfg[star].upBadgeNum` 个徽章，
-//   客户端按 `equalBadgeNum` 折算，属于不可逆操作，本模块**只探测不执行**。
+// - 徽章升星（`BadgeStarRequest { uid, decomposeUid[], starItemNum }`，回包是空消息
+//   `BadgeStarResponse`）：**只有 RED 品质能升**（客户端 `canUpOneStar` 写死
+//   `"RED"==quality && star<5`）。成本＝`HeroBadgeStarCfg[目标星]` 的 `consume[1]` 金币
+//   ＋ `upBadgeNum` 个「徽章升星石」；星石不够时按 `equalBadgeNum` 折算，把闲置红徽章放进
+//   `decomposeUid` 由服务端一起分解。分解不可逆 → 只拆「比这枚更差」的、绝不碰佩戴中的，
+//   门槛见 `planBadgeStar`。
 // - 替换方向（实证 `_onBtnPutOn` / `BadgeReplaceRequest`）：
 //   `downUid` = 要穿上的那件（背包里更好的），`upUid` = 身上被换下的那件。
 //   空位用 `PutOnBadgeRequest { uid, heroId, pos }` / `PutOnEquipRequest { uid, heroId }`。
@@ -70,6 +74,10 @@ export const EQUIP_SLOTS = ['武器', '防具', '饰品'];
 
 export const MAX_EQUIP_STAR = 5;
 
+// 徽章星级上限。客户端 `BadgeLvUpPop` 里写死 `_maxStar = 5`，`canUpOneStar` 也是 `star < 5`，
+// 所以 4 星升 5 星是最后一步（吃 HeroBadgeStarCfg[5]：星石 16 / GOLD 800 万）。
+export const MAX_BADGE_STAR = 5;
+
 // 专武星级上限（ExclusiveStarCfg 最大 star）。写死是为了「到顶就不再排」的判据不依赖配置表末尾。
 export const MAX_EXCLUSIVE_STAR = 25;
 
@@ -79,8 +87,9 @@ export const MAX_ACTIONS_PER_HERO = 80;
 // 页面上的开关名与默认值。默认全开 = 「点执行就养成」；
 // 替换类单独可关（它会把身上的东西换下来，属于不可逆的那一档）。
 export const GROW_SWITCHES = {
-  badgeEnhance: true,
   badgeReplace: true,
+  badgeStar: true,
+  badgeEnhance: true,
   equipLevel: true,
   equipRefine: true,
   equipStar: true,
@@ -90,8 +99,9 @@ export const GROW_SWITCHES = {
 };
 
 export const SWITCH_LABELS = {
-  badgeEnhance: '勋章强化',
   badgeReplace: '勋章替换',
+  badgeStar: '勋章升星',
+  badgeEnhance: '勋章强化',
   equipLevel: '装备升级',
   equipRefine: '装备精炼',
   equipStar: '装备升星',
@@ -166,6 +176,14 @@ export function exclusiveHasWeapon(index, heroId) {
 
 export function badgeMaxLevel(index, badgeId, star) {
   return num(index.badgeAttr.get(`${badgeId}_${num(star)}`)?.maxLevel);
+}
+
+// 一枚徽章分解后顶多少个「徽章升星石」：客户端 `idleRedBadgeStarNum` 里
+// 0 星算 1 个，n 星取 `HeroBadgeStarCfg[n].equalBadgeNum`（1→2、2→4、3→8、4→16、5→32）。
+export function badgeStarEquivalent(index, star) {
+  const s = num(star);
+  if (s <= 0) return 1;
+  return num(index.badgeStar.get(s)?.equalBadgeNum);
 }
 
 export function equipMaxLevel(index, equipId, star) {
@@ -393,6 +411,80 @@ function planBadgeEnhance(badge, index, budget) {
   return { from: badge.level, to: level, gained, exp: spentExp, gold: spentGold };
 }
 
+// 徽章升星（把一枚红徽章的星级顶上去，顺带抬高它的等级上限档位）。
+//
+// 事实来源（反编译 `BadgeLvUpPop`）：
+// - **只有 RED 品质能升**：`canUpOneStar` 里写死 `"RED" == badgeCfg.quality && star < 5`，
+//   其它品质的徽章在客户端连升星页签都不会给按钮。
+// - 成本 = `HeroBadgeStarCfg[目标星]` 的 `consume[1]` 金币 + `upBadgeNum` 个「徽章升星石」。
+// - 星石不够时客户端允许拿**闲置红徽章**折算补差：0 星算 1 个当量，n 星算 `equalBadgeNum`
+//   个（`idleRedBadgeStarNum`）。折算的徽章放进 `decomposeUid`，由服务端连同请求一起分解。
+//   请求 `BadgeStarRequest { uid, decomposeUid[], starItemNum }`（回包是空消息
+//   `BadgeStarResponse`，客户端 `sendMessage` 带回调只是为了接 `material`）。
+//
+// ⚠ 分解不可逆，所以候选比客户端弹窗那份「可勾选列表」严得多，三条同时满足才拆：
+//   ① 不在任何英雄身上（`worn`）—— 佩戴中的一律不碰；
+//   ② 不是本轮替换计划里要穿的（`usedUids`）、也没被别的徽章先拿去分解（`feedUsed`）；
+//   ③ 分数**严格低于**要升星的这一枚（品质→星级→等级），也就是「明确更差」才值得拆。
+// 池子按当量升序取（同当量取分数低的）：缺 2 个当量时宁可拆两枚 0 星，也不动一枚 1 星。
+// 一次凑不齐就整级放弃 —— 不做「半分投入」，服务端也不收不满足条件的请求。
+function planBadgeStar(badge, index, budget, { feed, feedUsed, usedUids }) {
+  if (badge.quality !== 'RED') return null;
+  if (badge.star >= MAX_BADGE_STAR) return null;
+  const steps = [];
+  let star = badge.star;
+  let goldTotal = 0;
+  let itemTotal = 0;
+  while (star < MAX_BADGE_STAR) {
+    const row = index.badgeStar.get(star + 1);
+    if (!row) break;
+    const needItems = num(row.upBadgeNum);
+    const gold = num(Array.isArray(row.consume) ? row.consume[1] : 0);
+    if (needItems <= 0) break;
+    // 金币是硬门槛：不够就停在这一星（升星的金币量级是几十万到几百万，容易被强化先花掉）。
+    if (budget.have(GOLD) < gold) break;
+    // 先吃星石，再按当量拆闲置徽章补差。
+    const fromItems = Math.min(budget.have(BADGE_STAR_ITEM), needItems);
+    let covered = fromItems;
+    const picked = [];
+    for (const one of feed) {
+      if (covered >= needItems) break;
+      if (one.uid === badge.uid || feedUsed.has(one.uid) || usedUids.has(one.uid)) continue;
+      if (one.score >= badge.score) continue;
+      const eq = badgeStarEquivalent(index, one.star);
+      if (eq <= 0) continue;
+      picked.push(one);
+      covered += eq;
+    }
+    if (covered < needItems) break;
+    budget.take(GOLD, gold);
+    budget.take(BADGE_STAR_ITEM, fromItems);
+    for (const one of picked) feedUsed.add(one.uid);
+    star += 1;
+    goldTotal += gold;
+    itemTotal += fromItems;
+    steps.push({
+      from: star - 1,
+      to: star,
+      gold,
+      starItems: fromItems,
+      decompose: picked,
+      // 分解当量超过所需是允许的（客户端同样只校验 >= ），但要记下来，日志里说清「拆多了」。
+      overflow: covered - needItems,
+    });
+  }
+  if (!steps.length) return null;
+  return {
+    from: badge.star,
+    to: star,
+    steps,
+    gold: goldTotal,
+    starItems: itemTotal,
+    decompose: steps.flatMap((one) => one.decompose),
+    overflow: steps.reduce((sum, one) => sum + one.overflow, 0),
+  };
+}
+
 // 空位 / 更优件的替换候选。同职业才穿（徽章 id 带职业，跨职业穿上去大概率不加属性）。
 // minLevel 用来把「品质更高但等级低到会掉战力」的件挡在候选池外 —— 如果只在选中之后
 // 再判断，一个紫 lv1 就会把背包里真正能换的蓝 lv40 挡住，结果是两边都没换上。
@@ -410,6 +502,9 @@ function bestCandidate(pool, heroCareer, exclude, { needSameCareer = true, minLe
 function finalizeItems(items) {
   return items.map((item) => {
     if (!item.mergeKey) return { kind: item.kind, text: item.text };
+    if (item.kind === 'badgeStar') {
+      return { kind: item.kind, text: `${item.title} ${item.from}→${item.to} 星` };
+    }
     if (item.kind === 'equipLevel') {
       return { kind: item.kind, text: `${item.title} ${item.from}→${item.to} 级（+${item.to - item.from}，精铁 ${item.cost}）` };
     }
@@ -455,6 +550,18 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
 
   // 背包里的候选按英雄逐个消耗：一件装备/一个徽章只能穿到一个英雄身上。
   const usedUids = new Set();
+  // 徽章升星的「分解料池」：只有红徽章顶当量（升星石不够时拿它们补差）。
+  // 排序 = 当量小的先、同当量取分数低的：拆两枚 0 星保住一枚 1 星，比直接拆 1 星划算。
+  const badgeFeed = survey.badgeBag
+    .filter((one) => one.quality === 'RED' && !one.worn)
+    .sort((a, b) => badgeStarEquivalent(index, a.star) - badgeStarEquivalent(index, b.star) || a.score - b.score);
+  // 已经被某个徽章拿去分解的 uid：跨英雄共享，一个徽章只拆一次。
+  const badgeFeedUsed = new Set();
+  // 够条件却没升上去的红徽章数（金币 / 星石 / 可拆闲置徽章不够），最后汇总成一句 note。
+  let starMissed = 0;
+  // 替换候选要同时排除「本轮已计划穿上的」和「本轮已拿去分解的」——
+  // 否则后面某个英雄的替换会把刚拆掉的徽章又穿上去（服务端只会回「徽章不存在」）。
+  const blockedBadges = { has: (uid) => usedUids.has(uid) || badgeFeedUsed.has(uid) };
 
   for (const hero of picked) {
     // 一件装备升 6 级会拆成 6 条请求，但页面上只该占一行 —— 所以先记明细，
@@ -486,7 +593,8 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
         if (hero.level < slot.level) continue;
         const current = hero.badges.find((one) => one.pos === slot.pos) ?? null;
         // 已有徽章时把「等级太低」的候选直接排除（见 bestCandidate 注释）。
-        const best = bestCandidate(survey.badgeBag, hero.career, usedUids, {
+        // blockedBadges = 已计划穿上 + 已拿去分解，见上面注释。
+        const best = bestCandidate(survey.badgeBag, hero.career, blockedBadges, {
           minLevel: current ? current.level * REPLACE_MIN_LEVEL_RATIO : 0,
         });
         if (!best) continue;
@@ -522,6 +630,53 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
           transient: true,
           label: `${hero.heroId} 第${pos}位：「${best.badgeId}」lv${best.level} ${best.star}星 换下「${current.badgeId}」lv${current.level} ${current.star}星`,
         }, { text: `换勋章 第${pos}位：${current.badgeId} lv${current.level} ${current.star}星 → ${best.badgeId} lv${best.level} ${best.star}星` });
+      }
+    }
+
+    // ---- 勋章升星：只有红徽章能升。**放在强化之前** —— 升星会抬高
+    //      `HeroBadgeAttrCfg[id_star].maxLevel` 这一档的上限（star 越高上限越高），
+    //      先升星再强化，一次就能顶到新上限，省掉一串「强到顶 → 停 → 升星 → 再强」的动作。
+    //      分解闲置徽章换星石当量是不可逆的，候选门槛见 planBadgeStar 注释。
+    if (on.badgeStar) {
+      for (const badge of [...hero.badges].sort((a, b) => b.score - a.score)) {
+        // 够条件却没排上 = 材料不够（金币 / 星石 / 可拆的闲置红徽章），汇总成一句 note。
+        const eligible = badge.quality === 'RED' && badge.star < MAX_BADGE_STAR;
+        const starPlan = planBadgeStar(badge, index, budget, {
+          feed: badgeFeed,
+          feedUsed: badgeFeedUsed,
+          usedUids,
+        });
+        if (!starPlan) {
+          if (eligible) starMissed += 1;
+          continue;
+        }
+        badge.star = starPlan.to;
+        for (const step of starPlan.steps) {
+          const cut = step.decompose;
+          const cutText = cut.map((one) => `${one.badgeId}${one.star}星`).join('、');
+          push({
+            kind: 'badgeStar',
+            request: 'BadgeStarRequest',
+            response: 'BadgeStarResponse',
+            // starItemNum = 这一级实投的「徽章升星石」；decomposeUid = 折算补差的闲置红徽章（不可逆）。
+            body: {
+              uid: badge.uid,
+              decomposeUid: cut.map((one) => one.uid),
+              starItemNum: step.starItems,
+            },
+            key: `badgeStar:${badge.uid}:${step.to}`,
+            group: `hero:${hero.heroId}:badgeStar:${badge.uid}`,
+            transient: true,
+            label: `${hero.heroId}「${badge.badgeId}」${step.from}→${step.to} 星（星石 ${step.starItems}${
+              cut.length ? ` + 分解 ${cut.length} 枚（${cutText}）` : ''
+            } · 金币 ${goldText(step.gold)}${step.overflow > 0 ? ` · 多拆 ${step.overflow} 当量` : ''}）`,
+          }, {
+            mergeKey: `badgeStar:${badge.uid}`,
+            title: `勋章 ${badge.badgeId} 升星`,
+            from: starPlan.from,
+            to: starPlan.to,
+          });
+        }
       }
     }
 
@@ -786,6 +941,13 @@ export function planHeroGrowth(survey, { switches = {}, heroIds = null, onlyFron
   if (on.exclusiveLevel && exclusiveBlocked.levelUp.length) {
     const need = num(index.exclusiveUpgrade.get(1)?.heroStar);
     notes.push(`专武升级要英雄 ${need} 星：${exclusiveBlocked.levelUp.join('、')}`);
+  }
+  // 红徽章升星：只有金币/星石/可拆闲置红徽章这三样会卡住，说一句免得以为功能没生效。
+  if (on.badgeStar && starMissed > 0) {
+    notes.push(
+      `红徽章还有 ${starMissed} 枚没升星：缺金币、徽章升星石，或没有「比它更差」的闲置红徽章可拆`
+      + '（不拆佩戴中的，也不拆比它强的）',
+    );
   }
 
   return { actions, notes, heroes, switches: on };

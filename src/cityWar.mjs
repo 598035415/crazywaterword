@@ -596,6 +596,89 @@ export function formatCityWarGain(results) {
   return `失败 ${failed.length} 条：${failed[0].error ?? ''}`;
 }
 
+// ---- 战期内的轮询节奏 ----
+//
+// 舰队一波打完是「服务端送回后方城 → 修满 → 再派」，一轮完整循环实测 9–10 分钟
+// （10/29：20:01 派 → 20:03 交战 → 20:04 回城 85 → 20:08 修满 → 20:10 再派）。
+// 原来统一 180 秒的间隔下，每波要白等最多 3 分钟；一场只有 1 小时（≈6 波），
+// 等于白丢 10 分钟以上 —— 少打整整一波。
+//
+// 抽成纯函数是为了能单测：loop 里那段同时在算 skip / gate / 退避，改动容易互相踩。
+export const CW_LIVE_MIN_MS = 30_000;
+export const CW_LIVE_DEFAULT_MS = 60_000;
+
+export function warPollInterval(baseMs, liveMs, window, nowSec) {
+  const base = Math.max(0, num(baseMs));
+  const live = Math.max(CW_LIVE_MIN_MS, num(liveMs) || CW_LIVE_DEFAULT_MS);
+  const inWindow = window != null
+    && num(window.startAt) > 0
+    && num(nowSec) >= num(window.startAt)
+    && num(nowSec) <= num(window.endAt);
+  if (!inWindow) return base;
+  // 取 min：用户把常规间隔调得更短（如 30 秒）时不能被战期节奏拖长。
+  return base > 0 ? Math.min(base, live) : live;
+}
+
+// ---- 城战在线奖励（WorldOnlineRwdCfg，7 档）----
+//
+// 规则（`TipsDescCfg.城战规则`）：战期内在线即可领取，**前置档领完才开下一档的倒计时**。
+// 档位是累计在线 1 / 60 / 120 / 180 / 240 / 300 / 300 秒，也就是开战 5 分钟就全解锁。
+//
+// 为什么必须自己补：客户端 `WarOnlineReward` 里是**自动发**的 —
+//   `n.stage == s + 1 && t.isTimeOver` → `GotWorldOnlineRwdRequest`，
+// 无头挂机不跑那段 UI 逻辑，所以整场一个奖都不会领。
+// 2026-10-29 实测：`grep -c GotWorldOnlineRwd data/protocol.log` = 0，7 档全漏，
+// 白丢汽油 6 万 / RUBY 210 / 功勋 4.6 万 / 橙卡万能碎片 1 / 藏品券 1 / 抽卡券 1 / 橙技能书 1。
+//
+// 请求是**空消息**（无参数）。服务端满足一档就回一条 `GotRewardResponse`（带 reward.asset），
+// 没有可领的档位时回 `PromptResponse` → 用「被拒」当收手信号，别无限打。
+export const CW_ONLINE_TRIES = 4;
+export const CW_ONLINE_TIMEOUT = 2500;
+
+export async function claimWarOnlineReward(client, protocol, {
+  maxTries = CW_ONLINE_TRIES,
+  timeout = CW_ONLINE_TIMEOUT,
+} = {}) {
+  const req = 'GotWorldOnlineRwdRequest';
+  const res = 'GotRewardResponse';
+  if (!protocol?.[req] || !protocol?.[res]) {
+    return { supported: false, rounds: 0, gifts: [], stoppedBy: 'unsupported', error: '' };
+  }
+  const gifts = [];
+  let rounds = 0;
+  let stoppedBy = 'maxTries';
+  let error = '';
+  for (let i = 0; i < Math.max(1, num(maxTries)); i += 1) {
+    try {
+      const body = normalize(await client.request(req, {}, res, timeout));
+      rounds += 1;
+      const assets = (body?.reward?.asset ?? [])
+        .map((a) => ({ id: String(a?.id ?? ''), num: assetCount(a?.num) }))
+        .filter((a) => a.id && a.num > 0);
+      // 空包裹也不用继续打：说明这一档就是空的（或已领过）。
+      if (assets.length === 0) {
+        stoppedBy = 'empty';
+        break;
+      }
+      gifts.push(...assets);
+    } catch (e) {
+      stoppedBy = 'rejected';
+      error = String(e?.message ?? e);
+      break;
+    }
+  }
+  return { supported: true, rounds, gifts, stoppedBy, error };
+}
+
+// 把一次领奖结果压成一行：`在线奖励 汽油×7000 + RUBY×30`。没领到返回空串。
+export function formatOnlineReward(result) {
+  const list = result?.gifts ?? [];
+  if (list.length === 0) return '';
+  const merged = new Map();
+  for (const gift of list) merged.set(gift.id, (merged.get(gift.id) ?? 0) + num(gift.num));
+  return `在线奖励 ${[...merged].map(([id, count]) => `${id}×${count}`).join(' + ')}`;
+}
+
 // 战期结束后「下一步该干嘛」——网页/日志共用一句。
 // 舰队不用手动撤回：城战结束后它们留在城里当驻守，下一次布署会自己开去新目标城。
 export function cityWarNextHint(view) {

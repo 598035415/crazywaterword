@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { GameClient, SECRET_FRAMES, clipBody } from './client.mjs';
 import { loadProtocol } from './proto.mjs';
-import { createConsole, openBrowser } from './server.mjs';
+import { createConsole, openBrowser, readLoopAuto, LOOP_AUTO_PATH } from './server.mjs';
 import { loadStore, saveStore, pickAccount, removeAccount, setActive, describeAccount, revealAccount, ACCOUNTS_PATH, LEGACY_CREDENTIALS_PATH } from './accounts.mjs';
 import { listWorlds, listGroup, enterWorld, describeRole } from './worlds.mjs';
 import { collectState, summarize, formatState } from './game.mjs';
@@ -1157,15 +1157,20 @@ async function youduCli({ allowMutate, dryRun, spin = true, edict = true }) {
       for (const note of edictFix.notes) console.log(`  · ${note}`);
     }
     // 签到与活跃度都按回包决定进度，不能进静态计划（见 runYouduSigns / runYouduActive 注释）。
-    const signs = await runYouduSigns(client, {
-      config,
-      onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
-    });
-    for (const note of signs.notes) console.log(`  · ${note}`);
-    const active = await runYouduActive(client, {
-      onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
-    });
-    for (const note of active.notes) console.log(`  · ${note}`);
+    // 活动没开就别发 —— 这两个函数不看 survey，发了只会拿到一串 prompt 74。
+    const signs = { results: [], notes: [] };
+    const active = { results: [], notes: [] };
+    if (view.open) {
+      Object.assign(signs, await runYouduSigns(client, {
+        config,
+        onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
+      }));
+      for (const note of signs.notes) console.log(`  · ${note}`);
+      Object.assign(active, await runYouduActive(client, {
+        onStep: (entry) => console.log(entry.ok ? `  . ${entry.step.label}` : `  x ${entry.step.label} 失败: ${entry.error}`),
+      }));
+      for (const note of active.notes) console.log(`  · ${note}`);
+    }
     const gain = formatYouduGain(summarizeYoudu([...results, ...signs.results, ...active.results]));
     if (gain) console.log(`\n${gain}`);
   } finally {
@@ -1423,14 +1428,16 @@ async function loopCli({
   treasureEverySeconds = 60,
   // 抢哪些货轮等级（多选，3 蓝小型 / 4 紫中型 / 5 橙万吨）；默认只抢万吨。
   treasureColors = DEFAULT_COLORS,
-  // 联盟商船：CLI 的 --no-guildship / --guildship-every / --no-seek 以前没接进来（参数被静默忽略），
-  // 这里补上，否则 README 写的开关是假的。
-  guildShipEnabled = true,
-  guildShipEverySeconds = 120,
-  guildShipSeek = true,
+  // 联盟商船（活动 GuildShip）：**活动 2026-10-30 已结束**，loop 里那一段也整段注释了。
+  // 默认关；活动重开时改回 true，并把 loop.mjs 第 12 段解注释（页面/接口/CLI 也一并恢复）。
+  guildShipEnabled = false,
+  guildShipEverySeconds = 0,
+  guildShipSeek = false,
   // 国战（联盟攻城）：只派兵 + 修船，平时整段静默。
   cityWarEnabled = true,
   cityWarEverySeconds = 180,
+  // 战期内的节奏（默认 60 秒）：一波打完就被送回后方城，3 分钟一轮等于白等。
+  cityWarLiveEverySeconds = 60,
   cityWarRepair = true,
   // 酆都诡事（捞尸人联动，2026-10-29 ~ 11-11）：四个免费板块全做，付费板块一个请求都不发。
   youduEnabled = true,
@@ -1467,7 +1474,7 @@ async function loopCli({
     console.log(`货轮=${treasureEnabled ? (treasureEverySeconds > 0 ? `开(每 ${treasureEverySeconds}s 抢一次：抢 ${treasureColors.length > 0 ? colorsText(config, treasureColors) : '未勾等级，不派船'}，一天 3 次奖励)` : '开(每轮都抢)') : '关'}`);
     console.log(`贸易港口=${cargoEnabled ? (cargoEverySeconds > 0 ? `开(每 ${cargoEverySeconds}s 看一眼：逐格交货换经验金币 + 返航领奖)` : '开(每轮都看)') : '关'}`);
     console.log(`联盟商船=${guildShipEnabled ? `开(每 ${guildShipEverySeconds}s 看一眼，${guildShipSeek ? '补货 + 应聘船长' : '只补货'})` : '关'}`);
-    console.log(`国战=${cityWarEnabled ? `开(战前 10 分钟布署，每 ${cityWarEverySeconds}s 看一眼${cityWarRepair ? ' + 耐久低自动修' : ''})` : '关'}`);
+    console.log(`国战=${cityWarEnabled ? `开(战前 10 分钟布署，战期内每 ${cityWarLiveEverySeconds}s 派一次空闲船 + 领在线奖励${cityWarRepair ? ' + 耐久低自动修' : ''}，其余时间每 ${cityWarEverySeconds}s 看一眼)` : '关'}`);
     console.log(`酆都诡事=${youduEnabled ? (youduEverySeconds > 0 ? `开(每 ${youduEverySeconds}s 看一眼：灭邪祟 + 领累计奖${youduSpin ? ' + 转罗盘' : ''}${youduEdict ? ' + 开法旨' : ''} + 签到/活跃，付费板块不碰)` : `开(每轮都看：灭邪祟 + 领累计奖${youduSpin ? ' + 转罗盘' : ''}${youduEdict ? ' + 开法旨' : ''} + 签到/活跃，付费板块不碰)`) : '关'}`);
     console.log(`海商王=${tradeEnabled ? (tradeEverySeconds > 0 ? `开(每 ${tradeEverySeconds}s 跑一段：卖→买特产→起航，指针全用)` : '开(每轮都跑)') : '关(活动已下线)'}`);
     await runLoop(client, protocol, {
@@ -1513,6 +1520,7 @@ async function loopCli({
       guildShipSeek,
       cityWarEnabled,
       cityWarEveryMs: Math.max(0, Number(cityWarEverySeconds) || 0) * 1000,
+      cityWarLiveEveryMs: Math.max(30, Number(cityWarLiveEverySeconds) || 60) * 1000,
       cityWarRepair,
       youduEnabled,
       youduEveryMs: Math.max(0, Number(youduEverySeconds) || 0) * 1000,
@@ -1604,6 +1612,53 @@ async function accountsCli(args) {
   }
 
   throw new Error(`未知子命令 ${sub}。可用: list / use / label / remove / show`);
+}
+
+// 控制台一起来就自动挂机（默认行为），不用再手点一次「开始挂机」。
+//   · 参数优先用上次保存的 `data/loop-auto.json`（每次开始/热更新都会回写），没存过就用内置默认；
+//   · rounds 强制 0 = 无限轮（页面上的轮数默认 1，那是「只跑一轮」的意思，不能当挂机）；
+//   · 关掉：`--no-auto-loop` 或 `CW_NO_AUTO_LOOP=1`（比如你只在网页上手动跑单步）。
+// 为什么用 HTTP 打自己而不是直接调函数：`/api/loop/start` 那套逻辑（ensureConnected、
+// reconnect 钩子、onRound 回写、日志文案）整段挂在一个路由 handler 里，抽出来要动三百行；
+// 回环请求两行就复用，失败了也只影响这一行日志，不影响控制台本身。
+async function autoStartLoop(url, store) {
+  if (process.argv.includes('--no-auto-loop') || process.env.CW_NO_AUTO_LOOP === '1') {
+    console.log('挂机自启动：已关闭（--no-auto-loop / CW_NO_AUTO_LOOP=1）');
+    return;
+  }
+  if (!store.accounts.length) {
+    console.log('挂机自启动：跳过（还没有账号，先在网页「账号」页扫码添加）');
+    return;
+  }
+  const saved = readLoopAuto();
+  const body = { ...saved, confirm: true, rounds: 0 };
+  // 网关对「上一个进程刚断开 / 刚被顶下线」的账号会连着回 result=3（`login rejected`），
+  // 而自启动恰恰最容易撞上这个窗口：用户关掉旧窗口马上又开一个新的。
+  // 所以这里退避重试三次（20s / 60s / 150s，跨度约 4 分钟），比让人回来手点一次省事。
+  // 真实占用（手机端正在玩）会一直失败 —— 那就最后一次提示，别无限等。
+  const retryDelays = [20_000, 60_000, 150_000];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await fetch(`${url}/api/loop/start`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || data?.error) throw new Error(data?.error ?? `HTTP ${response.status}`);
+      console.log(`挂机自启动：已开始（无限轮）${Object.keys(saved).length ? `，沿用 ${LOOP_AUTO_PATH}` : '，用内置默认参数'}`);
+      return;
+    } catch (error) {
+      const transient = /result=3|login rejected|正在自动重连/.test(error.message);
+      if (!transient || attempt >= retryDelays.length) {
+        console.log(`挂机自启动失败：${error.message} —— 网页上手动点「开始挂机」即可（手机端正在玩的话会一直抢不到）`);
+        return;
+      }
+      const wait = retryDelays[attempt];
+      console.log(`挂机自启动：登录被拒（${error.message}），${Math.round(wait / 1000)} 秒后重试（第 ${attempt + 1}/${retryDelays.length} 次）`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
 }
 
 async function main() {
@@ -1748,16 +1803,18 @@ async function main() {
       // 贸易港口：--no-cargo 关，--cargo-every 秒（默认 60）。
       cargoEnabled: !process.argv.includes('--no-cargo'),
       cargoEverySeconds: at('--cargo-every', 60),
-      // 海商王：活动已下线（2026-10-28），默认关；要开得显式加 --trade。
-      tradeEnabled: process.argv.includes('--trade'),
-      tradeEverySeconds: at('--trade-every', 60),
-      // 联盟商船：--no-guildship 关，--guildship-every 秒（默认 120），--no-seek 不当船长。
-      guildShipEnabled: !process.argv.includes('--no-guildship'),
-      guildShipEverySeconds: at('--guildship-every', 120),
-      guildShipSeek: !process.argv.includes('--no-seek'),
-      // 国战：--no-citywar 关，--citywar-every 秒（默认 180），--no-citywar-repair 只派兵不修船。
+      // 海商王（2026-10-28 下线）/ 联盟商船（2026-10-30 结束）：活动都没了，恒传 false。
+      // 重开时改回 --trade / --no-guildship 那套参数即可（loop 里对应段也要解注释）。
+      tradeEnabled: false,
+      tradeEverySeconds: 0,
+      guildShipEnabled: false,
+      guildShipEverySeconds: 0,
+      guildShipSeek: false,
+      // 国战：--no-citywar 关，--citywar-every 秒（默认 180，常规节奏），
+      //       --citywar-live-every 秒（默认 60，战期内的节奏），--no-citywar-repair 只派兵不修船。
       cityWarEnabled: !process.argv.includes('--no-citywar'),
       cityWarEverySeconds: at('--citywar-every', 180),
+      cityWarLiveEverySeconds: at('--citywar-live-every', 60),
       cityWarRepair: !process.argv.includes('--no-citywar-repair'),
       // 酆都诡事：--no-youdu 关，--youdu-every 秒（默认 300），--no-youdu-spin 不抽罗盘，--no-youdu-edict 不开法旨。
       youduEnabled: !process.argv.includes('--no-youdu'),
@@ -1879,14 +1936,20 @@ async function main() {
     return;
   }
 
+  // ══ 联盟商船（活动 GuildShip）2026-10-30 已结束：CLI 入口停用 ══
+  //    重开时恢复办法：改回下面注释掉的那 8 行（loop.mjs 第 12 段、server 路由、页面控件要一并恢复）。
   if (mode === 'guildship') {
-    await guildShipCli({
-      dryRun: process.argv.includes('--dry'),
-      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
-      allowSeek: !process.argv.includes('--no-seek'),
-    });
+    console.log('联盟商船活动已于 2026-10-30 结束，这段代码已停用（loop.mjs 第 12 段也一起注释了）。');
     return;
   }
+  // if (mode === 'guildship') {
+  //   await guildShipCli({
+  //     dryRun: process.argv.includes('--dry'),
+  //     allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+  //     allowSeek: !process.argv.includes('--no-seek'),
+  //   });
+  //   return;
+  // }
 
   if (mode === 'citywar') {
     await cityWarCli({
@@ -1908,14 +1971,19 @@ async function main() {
     return;
   }
 
+  // ══ 海商王（活动 Trade）2026-10-28 已下线：CLI 入口停用 ══
   if (mode === 'trade') {
-    await tradeCli({
-      dryRun: process.argv.includes('--dry'),
-      allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
-      allowSpeed: !process.argv.includes('--no-speed'),
-    });
+    console.log('海商王活动已于 2026-10-28 下线，这段代码已停用（loop.mjs 第 10 段也一起注释了）。');
     return;
   }
+  // if (mode === 'trade') {
+  //   await tradeCli({
+  //     dryRun: process.argv.includes('--dry'),
+  //     allowMutate: process.env.CW_ALLOW_MUTATE === '1' || process.argv.includes('--yes'),
+  //     allowSpeed: !process.argv.includes('--no-speed'),
+  //   });
+  //   return;
+  // }
 
   if (mode === 'idle') {
     await idleCli({      dryRun: process.argv.includes('--dry'),
@@ -1967,6 +2035,8 @@ async function main() {
   } else {
     console.log(`账号 ${store.accounts.length} 个，当前: ${describeAccount(pickAccount(store, null)).title}`);
   }
+  // 最后再自启挂机：登录 + 进服要几秒，放最后才不会把上面几行账号信息憋住。
+  await autoStartLoop(url, store);
 }
 
 main().catch((error) => {

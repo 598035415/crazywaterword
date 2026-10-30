@@ -38,6 +38,8 @@ import {
   formatCityWarSummary,
   formatCityWarGain,
   cityWarBlockedReason,
+  claimWarOnlineReward,
+  formatOnlineReward,
   CW_STATE_TEXT,
   DEFAULT_CW_PREP_LEAD_SEC,
   DEFAULT_CW_REPAIR_BELOW,
@@ -104,6 +106,32 @@ function duraFloorOf(loop) {
   return Math.min(1, Math.max(0, Number(loop?.radarRepairBelow ?? 80) / 100));
 }
 
+// 挂机设置落盘：`node src/app.mjs` 一启动就自动开挂机（app.mjs 的 autoStartLoop），
+// 优先沿用这份文件。以前设置只在内存里，进程一停就得重新点「开始挂机」再重填所有开关。
+// 存的是「启动参数」（页面那套驼峰字段），不是 loop 运行时状态 —— 后者每次探测都会变，
+// 存下来会把「上次执行时间」一起带进下一轮，导致新进程开头几分钟一段都不跑。
+export const LOOP_AUTO_PATH = path.resolve(import.meta.dirname, '../data/loop-auto.json');
+
+function saveLoopAuto(payload) {
+  try {
+    // rounds 故意不存：自启动永远按「无限轮」跑，存 1 会变成「重启后只跑一轮就停」。
+    const { confirm, rounds, ...rest } = payload ?? {};
+    fs.mkdirSync(path.dirname(LOOP_AUTO_PATH), { recursive: true });
+    fs.writeFileSync(LOOP_AUTO_PATH, JSON.stringify(rest, null, 2));
+  } catch {
+    /* 存不下来不影响本次挂机，下次顶多按内置默认起 */
+  }
+}
+
+export function readLoopAuto() {
+  try {
+    const data = JSON.parse(fs.readFileSync(LOOP_AUTO_PATH, 'utf8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch {
+    return {};
+  }
+}
+
 export function createConsole({ host = '127.0.0.1', port = 17321 }) {
   const protocol = loadProtocol();
   const globalLog = [];
@@ -158,6 +186,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 拾荒的间隔（0 = 不限制，每轮都试）。潜水已移除，这里只剩拾荒。
         pickEveryMs: 0,
         lastPickAt: null,
+        // 瞬成补产（默认开）：瞬成配方排满后，同一轮里「等 6 秒 → 收 → 再排」，最多 4 趟。
+        // 关掉就退回「一轮一批 6 个」，不会占用主循环的 60 秒节奏。
+        instantTopUp: true,
+        // 队列里允许堆几个非瞬成配方（默认 1）：堆多了不提升产能，只会把瞬成挤出去。
+        maxLongQueue: 1,
         // 农田开关与间隔：作物最快 30 分钟成熟，没必要每轮都探测，默认 2 分钟看一次。
         farmEnabled: true,
         farmEveryMs: 120_000,
@@ -167,6 +200,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         radarEnabled: true,
         radarEveryMs: 60_000,
         lastRadarAt: null,
+        // 事件打光后到服务端下次刷新之间不再探测：这两个是「睡到几点」和「下次刷新是几点」（秒）。
+        radarSkipUntil: null,
+        radarNextRefreshAt: null,
         // 修船门槛（百分数）：耐久低于它就留在港里修，不派出去打情报。0 = 关。
         radarRepairBelow: 80,
         // 海盗讨伐（真出战 ChallengePirateRequest）：跟免战扫荡（dailies 1010）不是一回事。
@@ -211,14 +247,21 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         cargoEnabled: true,
         cargoEveryMs: 60_000,
         lastCargoAt: null,
-        guildShipEnabled: true,
-        guildShipEveryMs: 120_000,
+        // 联盟商船（活动 GuildShip）2026-10-30 已结束：默认关，loop 里第 12 段整段注释。
+        guildShipEnabled: false,
+        guildShipEveryMs: 0,
         lastGuildShipAt: null,
-        guildShipSeek: true,
+        guildShipSeek: false,
+        // 联盟礼包（公会福利礼包）：队友丢进联盟礼包库的免费包，一条空请求全领走，24 小时过期。
+        guildPackEnabled: true,
+        guildPackEveryMs: 600_000,
+        lastGuildPackAt: null,
         // 国战（联盟攻城，每天 20:00–21:00）：只做「派兵 + 修船」，不宣战、不取消宣战（200 钻石）。
         // 平时整段静默 —— 不在「战前 10 分钟 ~ 战期结束」就直接睡到下一场布署点。
         cityWarEnabled: true,
         cityWarEveryMs: 180_000,
+        // 战期内的节奏（60 秒）：打完一波被送回后方城，要尽快再派出去。
+        cityWarLiveEveryMs: 60_000,
         lastCityWarAt: null,
         cityWarRepair: true,
         cityWarPrepLeadSec: 600,
@@ -235,6 +278,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         lastYouduAt: null,
         youduSpin: true,
         youduEdict: true,
+        // 活动下线后（11-11 结束）改成每小时探一次：页面要能看出「不是坏了，是活动没了」。
+        youduSkipUntil: null,
+        youduSkipReason: '',
         // 海商王（活动「Trade」，每天 10~22 点）：在港就卖 + 买本港特产 + 开去紧缺港口。
         // 只花活动内的商会币（不花钻石），商会指针是免费道具 —— 默认全用。
         // 海商王活动 2026-10-28 已下线，loop 里那一段整段注释，这里也跟着默认关。
@@ -380,7 +426,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
 
   async function overview(session, account) {
     const instance = await ensureConnected(session, account);
-    const { ok, failed } = await collectState(instance, protocol, { timeout: 15000 });
+    // 跳过情报：总览只用 summarize 会用的那几十个字段，RadarInfoResponse 一个都不用；
+    // 而且页面每 60 秒刷一次总览，等于把挂机的雷达静默窗（事件打光后睡到刷新）打成每分钟一探。
+    const { ok, failed } = await collectState(instance, protocol, { timeout: 15000, skip: ['RadarInfoRequest'] });
     const config = loadConfigSafe();
     const view = summarize({ ok }, { config });
     const daily = view.daily;
@@ -853,6 +901,42 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         text: formatGuildShipSummary(view) + (plan.actions.length > 0
           ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
           : `\n没有可做的（${plan.notes[0] ?? '等下一条船刷新'}）`),
+      },
+    };
+  }
+
+  // 联盟礼包（公会福利礼包）：队友丢进「联盟礼包库」的免费包，每个成员各能领一次、24 小时过期。
+  // 请求 `GotGuildWelfarePackRequest` 是空消息 —— 一条就把库里所有未领的一次结清，
+  // 所以这里只有「看一眼」和「领一次」两个动作，没有挑挑拣拣。
+  async function guildPack(session, account) {
+    const instance = await ensureConnected(session, account);
+    const survey = await surveyGuildPack(instance, protocol);
+    const plan = planGuildPack(survey);
+    return {
+      survey,
+      plan,
+      payload: {
+        ok: survey.ok,
+        error: survey.error ?? null,
+        guildName: survey.guildName ?? '',
+        gotWelfareTime: survey.gotWelfareTime ?? 0,
+        pending: survey.pending ?? 0,
+        expiringInSeconds: survey.expiringInSeconds ?? 0,
+        summary: formatGuildPackSummary(survey),
+        packs: (survey.claimable ?? []).map((pack) => ({
+          descId: pack.descId,
+          descParams: pack.descParams,
+          createTime: pack.createTime,
+          expireInSeconds: pack.expireInSeconds,
+          anonymous: pack.anonymous,
+          assets: pack.assets,
+        })),
+        actions: plan.actions.map((step) => ({ kind: step.kind, label: step.label })),
+        notes: plan.notes,
+        text: formatGuildPackSummary(survey)
+          + (plan.actions.length > 0
+            ? `\n待办：${plan.actions.map((step) => step.label).join('、')}`
+            : '\n没有可领的'),
       },
     };
   }
@@ -1513,10 +1597,42 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
-      // 联盟商船（活动「GuildShip」）：只读视图 + 补货/应聘计划，真正的写走 /api/guildship/run。
-      if (route === 'GET /api/guildship') {
+      // ══ 联盟商船（活动「GuildShip」）2026-10-30 已结束：路由停用 ══
+      //    重开时把这两行注释标记去掉，同时恢复 loop.mjs 第 12 段、page.mjs 的控件、app.mjs 的 CLI。
+      // // 联盟商船（活动「GuildShip」）：只读视图 + 补货/应聘计划，真正的写走 /api/guildship/run。
+      // if (route === 'GET /api/guildship') {
+      //   const { account, session } = scoped_(parsed);
+      //   json((await guildShip(session, account)).payload);
+      //   return;
+      // }
+      // 联盟礼包：只读看库里还有几个没领（每个成员各能领一次、24 小时过期）。
+      if (route === 'GET /api/guildpack') {
         const { account, session } = scoped_(parsed);
-        json((await guildShip(session, account)).payload);
+        json((await guildPack(session, account)).payload);
+        return;
+      }
+      // 立刻把联盟礼包库里的全领了（空消息一条结清，免费）。
+      if (route === 'POST /api/guildpack/run') {
+        needConfirm(jsonBody());
+        const { account, session } = scoped_(parsed);
+        const before = await guildPack(session, account);
+        const instance = await ensureConnected(session, account);
+        let results = [];
+        if (before.plan.actions.length > 0) {
+          ({ results } = await runGuildPack(instance, protocol, before.plan, {
+            allowMutate: true,
+            onStep: (entry) => {
+              if (entry.skipped) emit(session, 'warn', `联盟礼包「${entry.step.label}」跳过：${entry.error}`);
+              else emit(session, entry.ok ? 'info' : 'error', entry.ok ? `联盟礼包 ${entry.step.label}` : `联盟礼包 ${entry.step.label} 失败：${entry.error}`);
+            },
+          }));
+          const gain = formatGuildPackGain(results);
+          if (gain) emit(session, 'warn', `联盟礼包 ${gain}`);
+        }
+        json({
+          results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          ...(await guildPack(session, account)).payload,
+        });
         return;
       }
       // 国战（联盟攻城）：只读看局势（联盟宣了哪几座城、守军多强、我每艘船在哪、派过去多少汽油）。
@@ -1540,6 +1656,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const before = await cityWar(session, account, options);
         const instance = await ensureConnected(session, account);
         let results = [];
+        // 战期内手动跑也顺手把在线奖励领了（免费；7 档全领约汽油 6 万 / RUBY 210 / 功勋 4.6 万）。
+        let onlineReward = null;
+        if (before.view.phase === 'live') {
+          onlineReward = await claimWarOnlineReward(instance, protocol);
+          const onlineText = formatOnlineReward(onlineReward);
+          if (onlineText) emit(session, 'info', `国战 ${onlineText}`);
+        }
         if (before.plan.actions.length > 0) {
           ({ results } = await runWorld(instance, protocol, before.plan, {
             allowMutate: true,
@@ -1555,6 +1678,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         }
         json({
           results: results.map((r) => ({ label: r.step.label, ok: r.ok, skipped: r.skipped, error: r.error })),
+          onlineReward: onlineReward
+            ? { gifts: onlineReward.gifts, text: formatOnlineReward(onlineReward), stoppedBy: onlineReward.stoppedBy }
+            : null,
           ...(await cityWar(session, account, options)).payload,
         });
         return;
@@ -1635,6 +1761,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         return;
       }
       // 立刻跑一段联盟商船（补货 → 应聘船长），判据与循环里那套完全一样。
+      /* ══ 联盟商船（2026-10-30 结束）+ 海商王（2026-10-28 下线）：写入口停用 ══
+         页面按钮已注释，这里一并停掉，避免有人直接打接口。
+         重开时去掉本段注释标记（本行开头的斜杠星号 与 下面「块结束」那行的 星号斜杠）。 */
       if (route === 'POST /api/guildship/run') {
         const payload = jsonBody();
         needConfirm(payload);
@@ -1698,6 +1827,7 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         });
         return;
       }
+      /* ══ 联盟商船 / 海商王 写入口块结束 ══ */
       if (route === 'GET /api/pet') {        const { account, session } = scoped_(parsed);
         json(await pet(session, account));
         return;
@@ -2186,20 +2316,31 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         // 交货拿 EXP+金币是免费的，返航是小时级的，一分钟看一次就够。
         loop.cargoEnabled = payload.cargo !== false;
         loop.cargoEveryMs = secondsArg(payload.cargoEverySeconds, 60) * 1000;
-        // 海商王默认开，间隔默认 60 秒（一趟卖+买+起航就完事，指针够时几乎瞬移）。
-        loop.tradeEnabled = payload.trade !== false;
-        loop.tradeEveryMs = secondsArg(payload.tradeEverySeconds, 60) * 1000;
-        loop.tradeAllowSpeed = payload.tradeSpeed !== false;
-        loop.tradePass = payload.tradePass !== false;
-        // 联盟商船默认开，间隔默认 120 秒：补货窗口只有 30 分钟、好舱位会被队友抢，
-        // 但商船 3 小时才刷新一次，探太勤也只是白打请求。
-        loop.guildShipEnabled = payload.guildShip !== false;
-        loop.guildShipEveryMs = secondsArg(payload.guildShipEverySeconds, 120) * 1000;
-        loop.guildShipSeek = payload.guildShipSeek !== false;
+        // 瞬成补产：默认开。传 false 就退回「一轮一批」，不会多花那 24 秒。
+        // maxLongQueue：队列里允许堆几个非瞬成配方（默认 1，0 = 一个都不许排队 = 只产瞬成）。
+        loop.instantTopUp = payload.instantTopUp !== false;
+        loop.maxLongQueue = Number.isFinite(Number(payload.maxLongQueue)) && Number(payload.maxLongQueue) >= 0
+          ? Number(payload.maxLongQueue)
+          : 1;
+        // 海商王（2026-10-28 下线）/ 联盟商船（2026-10-30 结束）：活动没了，忽略前端传值，恒关。
+        loop.tradeEnabled = false;
+        loop.tradeEveryMs = 0;
+        loop.tradeAllowSpeed = false;
+        loop.tradePass = false;
+        loop.guildShipEnabled = false;
+        loop.guildShipEveryMs = 0;
+        loop.guildShipSeek = false;
+        // 联盟礼包默认开，间隔默认 600 秒：礼包是队友随时丢进来的、24 小时才过期，
+        // 一条空请求就能全领走，看太勤纯属白打 GuildInfoRequest。
+        loop.guildPackEnabled = payload.guildPack !== false;
+        loop.guildPackEveryMs = secondsArg(payload.guildPackEverySeconds, 600) * 1000;
         // 国战默认开：动作只有「把闲置舰队派到联盟宣战城」+「耐久低了修一下」，全程只烧汽油，
         // 而且平时整段静默，不会为了它多打请求。间隔 180 秒（布署窗 10 分钟够算好几轮）。
         loop.cityWarEnabled = payload.cityWar !== false;
         loop.cityWarEveryMs = secondsArg(payload.cityWarEverySeconds, 180) * 1000;
+        // 战期内单独一个更短的节奏（默认 60 秒）：舰队一波打完就被送回后方城，
+        // 3 分钟一轮等于每波白等 2 分钟，而战期总共只有 1 小时。
+        loop.cityWarLiveEveryMs = secondsArg(payload.cityWarLiveEverySeconds, 60) * 1000;
         loop.cityWarRepair = payload.cityWarRepair !== false;
         loop.cityWarPrepLeadSec = secondsArg(payload.cityWarPrepLeadSeconds, 600);
         loop.cityWarMinPowerRatio = Number(payload.cityWarPowerRatio) > 0 ? Number(payload.cityWarPowerRatio) : 0;
@@ -2234,6 +2375,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           loop.lastPickAt = null;
           loop.lastFarmAt = null;
           loop.lastRadarAt = null;
+          // 情报的静默窗同理：新开循环就该重新看一眼，别沿用上次「睡到 6 小时后」。
+          loop.radarSkipUntil = null;
           loop.lastPirateAt = null;
           loop.lastForgeAt = null;
           loop.lastPetAt = null;
@@ -2247,6 +2390,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           loop.lastCityWarAt = null;
           loop.cityWarSkipUntil = null;
           loop.cityWarSkipReason = '';
+          loop.youduSkipUntil = null;
+          loop.youduSkipReason = '';
         }
         const gateText = loop.pickEveryMs > 0 ? `拾荒每 ${Math.round(loop.pickEveryMs / 1000)} 秒最多一次` : '拾荒每轮都试';
         const farmText = loop.farmEnabled
@@ -2273,26 +2418,33 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
         const cargoText = loop.cargoEnabled
           ? (loop.cargoEveryMs > 0 ? `贸易港口每 ${Math.round(loop.cargoEveryMs / 1000)} 秒看一眼` : '贸易港口每轮都看')
           : '贸易港口关';
-        const tradeText = loop.tradeEnabled
-          ? (loop.tradeEveryMs > 0 ? `海商王每 ${Math.round(loop.tradeEveryMs / 1000)} 秒跑一段（指针${loop.tradeAllowSpeed ? '全用' : '不用'}）` : '海商王每轮都跑')
-          : '海商王关';
-        const guildShipText = loop.guildShipEnabled
-          ? (loop.guildShipEveryMs > 0 ? `联盟商船每 ${Math.round(loop.guildShipEveryMs / 1000)} 秒看一眼（补货${loop.guildShipSeek ? ' + 应聘船长' : ''}）` : '联盟商船每轮都看')
-          : '联盟商船关';
+        // 海商王（2026-10-28 下线）/ 联盟商船（2026-10-30 结束）：活动没了，不再出现在「当前设置」里。
+        // const tradeText = loop.tradeEnabled
+        //   ? (loop.tradeEveryMs > 0 ? `海商王每 ${Math.round(loop.tradeEveryMs / 1000)} 秒跑一段（指针${loop.tradeAllowSpeed ? '全用' : '不用'}）` : '海商王每轮都跑')
+        //   : '海商王关';
+        // const guildShipText = loop.guildShipEnabled
+        //   ? (loop.guildShipEveryMs > 0 ? `联盟商船每 ${Math.round(loop.guildShipEveryMs / 1000)} 秒看一眼（补货${loop.guildShipSeek ? ' + 应聘船长' : ''}）` : '联盟商船每轮都看')
+        //   : '联盟商船关';
+        const guildPackText = loop.guildPackEnabled
+          ? (loop.guildPackEveryMs > 0 ? `联盟礼包每 ${Math.round(loop.guildPackEveryMs / 1000)} 秒看一次（有就全领）` : '联盟礼包每轮都看')
+          : '联盟礼包关';
         const guildOrderText = loop.guildOrderEnabled
           ? (loop.guildOrderEveryMs > 0 ? `联盟订单每 ${Math.round(loop.guildOrderEveryMs / 1000)} 秒看一眼` : '联盟订单每轮都看')
           : '联盟订单关';
         const cityWarText = loop.cityWarEnabled
           ? `国战开战前 ${Math.round(loop.cityWarPrepLeadSec / 60)} 分钟布署舰队`
             + `（每城最多 ${loop.cityWarMaxFleetsPerCity} 艘${loop.cityWarRepair ? ' + 耐久低自动修' : ''}，`
-            + `留 ${loop.cityWarPetrolReserve} 汽油备用；只在 20:00–21:00 前后干活）`
+            + `留 ${loop.cityWarPetrolReserve} 汽油备用；战期内每 ${Math.round((loop.cityWarLiveEveryMs ?? 60_000) / 1000)} 秒`
+            + `派一次空闲船 + 领在线奖励，只在 20:00–21:00 前后干活）`
           : '国战关';
         const pirateText = loop.pirateEnabled
           ? `海盗${loop.pirateEveryMs > 0 ? `每 ${Math.round(loop.pirateEveryMs / 1000)} 秒` : '每轮'}讨伐一次`
             + `（${loop.pirateRepeat ? '含已通关等级' : '只打首杀等级'}，战力余量 ${loop.minPowerRatio}×）`
           : '海盗关';
         const head = hot ? '挂机设置已更新（下一轮生效）' : '自动挂机开始';
-        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${tradeText}；${guildShipText}；${guildOrderText}；${cityWarText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
+        emit(session, 'info', `${head}：${hot ? '' : `${loop.rounds} 轮，`}每轮间隔 ${Math.round(loop.everyMs / 1000)} 秒；${gateText}；${farmText}；${idleText}；${treasureText}；${cargoText}；${guildPackText}；${guildOrderText}；${cityWarText}；${radarText}；${pirateText}；${forgeText}；${petText}`);
+        // 设置落盘：下次 `node src/app.mjs` 起来直接按这套参数自动开挂机（热更新同样会刷新它）。
+        saveLoopAuto(payload);
         // 热更新到此为止：正在跑的那个 runLoop 会从 live() 读到新值，下一轮自动生效。
         if (hot) {
           json({ ok: true, running: true, hot: true, note: '设置已应用，下一轮生效' });
@@ -2309,6 +2461,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           allowReroll: loop.allowReroll,
           pickUpFloaters: loop.pickUpFloaters,
           pickEveryMs: loop.pickEveryMs,
+          // 瞬成补产：排满 → 等 6 秒 → 收 → 再排（最多 4 趟 / 30 秒）。怕拖慢主循环就在这里关掉。
+          instantTopUp: loop.instantTopUp !== false,
+          maxLongQueue: loop.maxLongQueue,
           farmEnabled: loop.farmEnabled,
           farmEveryMs: loop.farmEveryMs,
           radarEnabled: loop.radarEnabled,
@@ -2339,8 +2494,11 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
           guildShipEnabled: loop.guildShipEnabled,
           guildShipEveryMs: loop.guildShipEveryMs,
           guildShipSeek: loop.guildShipSeek,
+          guildPackEnabled: loop.guildPackEnabled,
+          guildPackEveryMs: loop.guildPackEveryMs,
           cityWarEnabled: loop.cityWarEnabled,
           cityWarEveryMs: loop.cityWarEveryMs,
+          cityWarLiveEveryMs: loop.cityWarLiveEveryMs,
           cityWarRepair: loop.cityWarRepair,
           cityWarPrepLeadSec: loop.cityWarPrepLeadSec,
           cityWarMinPowerRatio: loop.cityWarMinPowerRatio,
@@ -2372,6 +2530,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastPickAt = summary.gates?.pick?.lastAt ?? loop.lastPickAt;
             loop.lastFarmAt = summary.gates?.farm?.lastAt ?? loop.lastFarmAt;
             loop.lastRadarAt = summary.gates?.radar?.lastAt ?? loop.lastRadarAt;
+            // 「事件打光，睡到刷新」的窗口与刷新时刻：页面靠它显示「还有多久刷新」，
+            // 不用再额外发请求去问（/api/radar 是手动读取，别在轮询里调）。
+            loop.radarSkipUntil = summary.gates?.radar?.skipUntil ?? null;
+            loop.radarNextRefreshAt = summary.gates?.radar?.nextRefreshAt ?? loop.radarNextRefreshAt;
             loop.lastPirateAt = summary.gates?.pirate?.lastAt ?? loop.lastPirateAt;
             loop.lastForgeAt = summary.gates?.forge?.lastAt ?? loop.lastForgeAt;
             loop.lastPetAt = summary.gates?.pet?.lastAt ?? loop.lastPetAt;
@@ -2384,6 +2546,8 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
             loop.lastYouduAt = summary.gates?.youdu?.lastAt ?? loop.lastYouduAt;
             loop.cityWarSkipUntil = summary.gates?.cityWar?.skipUntil ?? loop.cityWarSkipUntil;
             loop.cityWarSkipReason = summary.gates?.cityWar?.skipReason ?? loop.cityWarSkipReason;
+            loop.youduSkipUntil = summary.gates?.youdu?.skipUntil ?? loop.youduSkipUntil;
+            loop.youduSkipReason = summary.gates?.youdu?.skipReason ?? loop.youduSkipReason;
             loop.lastGuildOrderAt = summary.gates?.guildOrder?.lastAt ?? loop.lastGuildOrderAt;
             // 奖励次数只有真的探测过才有新值（静默窗里是上一轮的旧值，保留着给页面显示）。
             loop.treasureStats = summary.gates?.treasure?.stats ?? loop.treasureStats;
@@ -2461,6 +2625,10 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       radarEveryMs: loop.radarEveryMs,
       radarRepairBelow: loop.radarRepairBelow,
       lastRadarAt: loop.lastRadarAt,
+      // 事件打光后的「睡到刷新」窗口 + 服务端下次刷新时刻（都是秒）。
+      // 页面用它们显示「还有多久刷新」，不需要为了这个数字额外发请求。
+      radarSkipUntil: loop.radarSkipUntil,
+      radarNextRefreshAt: loop.radarNextRefreshAt,
       // 海盗讨伐（真出战）：开关 / 间隔 / 上次执行 / 是否刷已通关等级。
       pirateEnabled: loop.pirateEnabled !== false,
       pirateEveryMs: loop.pirateEveryMs,
@@ -2497,8 +2665,12 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       guildShipEveryMs: loop.guildShipEveryMs,
       lastGuildShipAt: loop.lastGuildShipAt,
       guildShipSeek: loop.guildShipSeek,
+      guildPackEnabled: loop.guildPackEnabled,
+      guildPackEveryMs: loop.guildPackEveryMs,
+      lastGuildPackAt: loop.lastGuildPackAt,
       cityWarEnabled: loop.cityWarEnabled,
       cityWarEveryMs: loop.cityWarEveryMs,
+      cityWarLiveEveryMs: loop.cityWarLiveEveryMs,
       lastCityWarAt: loop.lastCityWarAt,
       cityWarRepair: loop.cityWarRepair,
       cityWarPrepLeadSec: loop.cityWarPrepLeadSec,
@@ -2507,6 +2679,13 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       cityWarMaxFleetsPerCity: loop.cityWarMaxFleetsPerCity,
       cityWarSkipUntil: loop.cityWarSkipUntil,
       cityWarSkipReason: loop.cityWarSkipReason,
+      youduEnabled: loop.youduEnabled,
+      youduEveryMs: loop.youduEveryMs,
+      lastYouduAt: loop.lastYouduAt,
+      youduSpin: loop.youduSpin,
+      youduEdict: loop.youduEdict,
+      youduSkipUntil: loop.youduSkipUntil,
+      youduSkipReason: loop.youduSkipReason,
       guildOrderEnabled: loop.guildOrderEnabled,
       guildOrderEveryMs: loop.guildOrderEveryMs,
       lastGuildOrderAt: loop.lastGuildOrderAt,
@@ -2514,6 +2693,9 @@ export function createConsole({ host = '127.0.0.1', port = 17321 }) {
       // 执行范围也回给页面：运行中回填勾选，避免「页面勾着、服务端其实关着」。
       useSelectPack: loop.useSelectPack !== false,
       maxPackPerRound: loop.maxPackPerRound ?? null,
+      // 瞬成补产（排满 → 等 6 秒 → 收 → 再排，最多 4 趟）+ 队列里允许堆几个长配方。
+      instantTopUp: loop.instantTopUp !== false,
+      maxLongQueue: loop.maxLongQueue ?? 1,
       packGapMax: loop.packGapMax ?? null,
       allowSpeedUp: loop.allowSpeedUp === true,
       allowReroll: loop.allowReroll === true,

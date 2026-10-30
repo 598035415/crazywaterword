@@ -251,7 +251,10 @@ export const PAGE = `<!doctype html>
 低于它的船不派出去，改成在港里修满（花汽油，耗时按服务端下发的单位代价算）。
 依据是配置表 LoadingTipsCfg 的官方提示「城战中舰船耐久度低于 1600 会降低输出，增加受到的伤害」（本账号 2000 上限 = 80%）。
 修船要船是空闲的（航行/战斗中修不了），修理期间这艘船也派不出去 —— 这就是留余量的意义。
-状态「上次 3 分钟前 · 还差 20 秒」里的时间只在这轮真的探测成功后才更新 —— 探测失败不占用间隔，下一轮立刻重试。</pre>
+事件打光之后不用每 60 秒空探：服务端会给「下次刷新时刻」，挂机直接睡到那一刻（实测间隔 6 小时量级），
+这期间一次 RadarInfo 都不发；状态行会写「静默中：事件已打完，X 后刷新」。
+状态「上次 3 分钟前 · 还差 20 秒 · 刷新 5 小时后」里，前两个是探测节奏，最后一个是事件池真正的刷新时间。
+探测失败不占用间隔，下一轮立刻重试。</pre>
 
     <h2>自动海盗讨伐</h2>
     <div class="bar">
@@ -320,6 +323,25 @@ export const PAGE = `<!doctype html>
 种子厂的存量上限留 5 个余量（50 → 排到 45 就停），接近上限的种子不再占队列位，让给真正缺的那种。
 种子厂等级决定能产哪几种种子（每级解锁一种，当前 Lv4 = 小麦/玉米/土豆/番茄），产一炉只出 1 个。</pre>
 
+    <h2>瞬成补产</h2>
+    <div class="bar">
+      <label class="dim" title="瞬成配方（减免后 0 秒完成，如布匹/淡水/生鱼片）排满后，同一轮里「等 6 秒 → 收一次 → 再排」，最多 4 趟。关掉就退回「一轮只排一批 6 个」">
+        <input type="checkbox" id="world-instant-topup" checked> 瞬成补产（排满 → 等 6 秒 → 收 → 再排）
+      </label>
+      <span id="instant-state" class="dim">还没跑过</span>
+    </div>
+    <pre id="instant-view">为什么要这一段：瞬成配方（生产时间 300s − 英雄委任减免 774s = 0 秒）**排下去就完成**，
+但「收取」必须重新探测一次才看得见 —— 于是老流程一轮只走「排 6 个 → 下一轮收 6 个」这一格，60 秒才 6 个。
+实测 13:57:41 连发 6 条布匹、13:58:40 才收到 6 个，库存被打空后要好几轮才能补回来。
+现在的做法：主段排完瞬成后，同一轮里再「等 6 秒 → 拉一次海面 → 收成品 → 接着排瞬成」，**最多 4 趟**，
+到产物存量上限（50 个，种子厂 45）或料不够就自动停 —— 稳态下每轮只会跑 1 趟（上轮已经顶到上限）。
+三道刹车，防止它影响主挂机的 60 秒节奏：① 最多 4 趟 ② 总耗时超 30 秒立刻停 ③ 只对「队列里没有长物品」的工厂做
+（有长物品在跑时瞬成排下去只是排队，等 6 秒也收不到，白等还白花请求）。
+配套改了队列卫生：**队列里最多堆 1 个非瞬成配方**（world.mjs 的 maxLongQueue）。串行队列一次只跑一个，
+堆第 2 个不提升任何产能，却会把制造位吃光 —— 实测 14:03 的存档里 1家具厂 6/6 全是躺椅/橱柜、
+1服装厂 6/6 全是鱼皮鞋、1玩具厂 6/6 全是鱼皮风筝，0 秒的布匹/淡水连排队资格都没有。
+状态行「最近一轮补产 N 趟：布匹×6」里的数字来自挂机回传，页面不额外发请求。</pre>
+
     <h2>挂机收益 / 邮件</h2>
     <div class="bar">
       <label class="dim" title="邮件附件 + 挂机本段收益 + 挂机等级奖励/升级：四件都免费，不发就白放着（收益 8 小时封顶后产出停摆）">
@@ -371,8 +393,9 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 排在挂机最后一段：前面几段（交单/排产）先把材料用掉，剩下的才拿来贸易，避免互相抢料。
 间隔填 0 = 每轮都看。</pre>
 
-    <!-- 海商王（活动 Trade）2026-10-28 已下线：loop.mjs 里第 10 段整段注释停用，这里默认不勾。
-         活动重开时：把 loop.mjs 那段解注释、勾上这个开关即可，控件与接口都还在。 -->
+    <!-- ══════ 海商王（活动 Trade）2026-10-28 已下线：整块停用 ══════
+         重开时：① loop.mjs 第 10 段解注释 + 删掉 4 行 stub；② 去掉本块的注释标记；
+                 ③ 恢复下面 JS 里 trade-on / trade-every / trade-speed / trade-run / trade-state / trade-view 的引用。
     <h2>海商王（港口贸易 · 活动已下线）</h2>
     <div class="bar">
       <label class="dim" title="每天 10~22 点的港口贸易活动。⚠ 活动已于 2026-10-28 下线，挂机里那一段已注释停用">
@@ -397,7 +420,11 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - 只花活动内的商会币，**不花钻石**：升船（300/600/1200/2000 钻）和买指针（50 钻/次）都不做。
 - 顺手领：个人累计利润成就、联盟任务、商情共享奖励、海商王战令免费档。
 - 一趟「卖 + 买 + 起航」算一轮，间隔填 0 = 每轮都跑；在航且没指针、不在 10~22 点时会静默，不白打请求。</pre>
+    --><!-- ══════ 海商王块结束 ══════ -->
 
+    <!-- ══════ 联盟商船（活动 GuildShip）2026-10-30 已结束：整块停用 ══════
+         重开时：① loop.mjs 第 12 段解注释 + 删掉 4 行 stub；② 去掉本块的注释标记；
+                 ③ 恢复下面 JS 里 guild-ship-on / guild-ship-every / guild-ship-seek / guild-ship-run / guild-ship-state / guild-ship-view 的引用。
     <h2>联盟商船</h2>
     <div class="bar">
       <label class="dim" title="全联盟一起凑货舱：给已有船长的船补一个货舱（材料得够，缺料绝不买），顺带应聘没人当的船长">
@@ -418,6 +445,7 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - **两条硬限制**：船长不能给自己那条船补货；每人最多同时登 2 艘，而且一旦上船就被锁到船到港（2.5~9 小时）才释放名额。
 - 所以策略是「**船员优先 + 挑空舱少的船**（快启航、名额释放快）」，剩余名额才去当船长。
 - **缺料一律不补、绝不花钻石买料**（客户端那条路会弹「购买」，这里不接），等工厂产出来再说。</pre>
+    --><!-- ══════ 联盟商船块结束 ══════ -->
 
     <h2>国战（联盟攻城）</h2>
     <div class="bar">
@@ -425,6 +453,9 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
         <input type="checkbox" id="city-war-on" checked> 自动跑国战
       </label>
       <label class="dim">间隔 <input id="city-war-every" value="180" style="width:60px"> 秒</label>
+      <label class="dim" title="战期内单独用这个节奏：舰队一波打完就被服务端送回后方城，要尽快再派出去。战期只有 1 小时，间隔越长少打的波数越多">
+        战期内每 <input id="city-war-live" value="60" style="width:56px"> 秒
+      </label>
       <label class="dim" title="开战前多少秒开始布署：要留够修船（满耐久约 5 分钟）和行军的时间">战前 <input id="city-war-lead" value="600" style="width:60px"> 秒布署</label>
       <label class="dim" title="同一座城最多派几艘（越多人打越快占领，但汽油也越多）">每城最多 <input id="city-war-max" value="3" style="width:48px"> 艘</label>
       <label class="dim" title="派兵后至少留下这么多汽油，别把回程/修理的余量烧光">留 <input id="city-war-reserve" value="20000" style="width:72px"> 汽油</label>
@@ -471,8 +502,8 @@ cargoIndex 是**从 1 开始的槽位号**，一条请求能把这一船攒够�
 - **酆都法旨**：花「入场券」开一局，猜 4 个符文。**服务端把答案直接下发在 session.rune 里**（客户端只是用它渲染符纸、再用遮罩挡住），
   所以这里是 0 显化直接提交 → 耐心留满 100 → 拿最高档（功德×20）。显化一次扣 5 耐心、猜错扣 10，一次都不该显化。
 - **签到 + 每日活跃**：14 天签到（每天入场券×1 + 体力×20 + 100 钻）与活跃度里程碑。两件都没有 info 接口能查进度，
-  只能按服务端回包推进（already checked in 跳过、not time yet 当天收工、no claimable reward 表示领到头）；
-  被拒后冷却 1 小时再探，不会每轮都去撞一次。
+  只能按服务端回包推进（already checked in 跳过、not time yet 当天收工、no claimable reward 表示领到头）。
+  签到 14 天要挨个试，被拒后**冷却 1 小时**再探；活跃度每个间隔探 1 条（领到头就停），有积压时一轮连领好几档。
 - ⛔ **不碰付费**：每日累充、每日特惠、酆都礼遇战令、满减商店结账 —— 都需要充值/花钻石，这里一个请求都不发。
 - 活动实例 id 是 **20261001**（大版本活动容器），不是活动上线日 20261029 —— 后者一律回 prompt 74（活动状态不符）。</pre>
 
@@ -1093,6 +1124,34 @@ function renderGate(nodeId, lastAt, everyMs, enabled, running = true) {
     : base + ' · ' + (left > 0 ? '还差 ' + dur(left) : '已到间隔');
 }
 
+// 情报的状态行要额外回答一个问题：**下次刷新还有多久**。
+// 事件是「打光就没了、等服务端按 nextRefreshTime 刷一批」的池子，刷新是小时级的，
+// 只写「上次 15 秒前 · 还差 43 秒」会让人以为 43 秒后有新事件，其实那是下次探测。
+// 两个数字都来自挂机每轮回传的 gates.radar（服务端探测到的），页面不额外发请求 ——
+// /api/radar 是手动「读取情报」，塞进 3 秒轮询里会把网关刷爆。
+function renderRadarGate(data, enabled) {
+  const node = $('radar-state');
+  if (!node) return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const refreshAt = Number(data.radarNextRefreshAt) || 0;
+  const refreshLeft = refreshAt > nowSec ? refreshAt - nowSec : 0;
+  const skipUntil = Number(data.radarSkipUntil) || 0;
+  // 静默中（事件打光 → 睡到刷新）：这跟「间隔未到」是两件事，必须写清楚，
+  // 否则页面显示「还差 43 秒」而挂机其实一次请求都不发。
+  if (enabled && data.running && skipUntil > nowSec) {
+    node.title = (data.lastRadarAt ? '上次探测 ' + clock(data.lastRadarAt) + '；' : '')
+      + '服务端刷新时刻 ' + clock(refreshAt > 0 ? refreshAt : skipUntil);
+    node.textContent = '静默中：事件已打完，' + dur(skipUntil - nowSec) + '后刷新（期间不发请求）';
+    return;
+  }
+  renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, enabled, data.running);
+  if (!enabled || !data.running) return;
+  if (refreshLeft > 0) {
+    node.title = (node.title ? node.title + '；' : '') + '事件刷新时刻 ' + clock(refreshAt);
+    node.textContent += ' · 刷新 ' + dur(refreshLeft) + '后';
+  }
+}
+
 // 国战的状态行跟别的段不一样：它平时是**静默**的（没到布署窗就睡到下一场），
 // 用通用 renderGate 会一直显示「还差 20 小时」，看着像卡死。这里显式写出静默原因与唤醒时刻。
 function renderCityWarGate(data, enabled) {
@@ -1122,7 +1181,37 @@ function renderCityWarGate(data, enabled) {
     node.textContent = '上次：还没执行（首次跑就做一次）';
     return;
   }
-  node.textContent = '上次 ' + ago(Math.max(0, Date.now() / 1000 - data.lastCityWarAt)) + ' · 战期窗口内，按间隔轮询';
+  const liveSec = Math.round((Number(data.cityWarLiveEveryMs) || 60_000) / 1000);
+  node.textContent = '上次 ' + ago(Math.max(0, Date.now() / 1000 - data.lastCityWarAt))
+    + ' · 战期窗口内，每 ' + liveSec + ' 秒派一次空闲船 + 领在线奖励';
+}
+
+// 酆都诡事和国战一样有「静默窗」：活动下线（2026-11-11 结束）后改成每小时探一次。
+// 用通用 renderGate 会一直显示「已到间隔」，看着像挂机卡住了 —— 这里显式写出静默原因与唤醒时刻。
+function renderYouduGate(data, enabled) {
+  const node = $('youdu-state');
+  if (!node) return;
+  node.title = '';
+  if (!enabled) {
+    node.textContent = '未勾选，不会执行';
+    return;
+  }
+  if (!data.running) {
+    node.textContent = data.lastYouduAt
+      ? '上次 ' + ago(Math.max(0, Date.now() / 1000 - data.lastYouduAt)) + ' · 未在挂机，不会执行'
+      : '还没执行过（未在挂机）';
+    return;
+  }
+  const until = Number(data.youduSkipUntil) || 0;
+  if (until > 0) {
+    const left = until - Math.floor(Date.now() / 1000);
+    node.title = '唤醒时刻 ' + clock(until);
+    node.textContent = left > 0
+      ? '静默中：' + (data.youduSkipReason || '活动未开启') + '（' + dur(left) + '后唤醒）'
+      : '静默结束，下一轮就探测';
+    return;
+  }
+  renderGate('youdu-state', data.lastYouduAt, data.youduEveryMs, enabled, data.running);
 }
 
 // 每日宝藏奖励次数：数值来自服务端最近一次探测（挂机每轮更新，手动「立刻抢一次」也更新），
@@ -1148,6 +1237,24 @@ function renderTreasureCount(data, lastRound) {
   const view = treasureCountOf(data && data.treasureStats, lastRound && lastRound.gates && lastRound.gates.treasure);
   node.textContent = view.text;
   node.title = view.title;
+}
+
+// 最近一轮的瞬成补产结果：跑了几趟、收到了什么。
+// 数据来自挂机每轮回传的 summary.world.instant（服务端已经执行过），页面只读缓存，
+// 不在 3 秒轮询里为了这个数字额外探测 —— 「读取情报」那类手动接口不能塞进轮询。
+function renderInstantTopUp(lastRound) {
+  const node = $('instant-state');
+  if (!node) return;
+  const info = lastRound && lastRound.world && lastRound.world.instant;
+  if (!info) {
+    node.textContent = '最近一轮没补产（已到存量上限 / 料不够 / 队列里有长物品）';
+    node.title = '瞬成配方排满后才会补产；队列里有非瞬成配方在跑时，瞬成只能排队，等 6 秒也收不到，所以这一段会跳过';
+    return;
+  }
+  const items = (info.items || []).map(([id, num]) => id + '×' + num).join('、');
+  node.textContent = '最近一轮补产 ' + info.passes + ' 趟' + (items ? '：' + items : '')
+    + (info.ms > 0 ? '（耗时 ' + dur(info.ms / 1000) + '）' : '');
+  node.title = '每趟隔 6 秒，最多 4 趟 / 30 秒；到存量上限或料不够就停';
 }
 
 // 页面刚打开、挂机也没跑过时，服务端一个数字都没有 —— 补一次，
@@ -1185,16 +1292,16 @@ async function fetchTreasureCountOnce() {
 const loopDirty = new Set();
 const LOOP_FIELDS = [
   'loop-rounds', 'loop-every', 'world-speedup', 'world-reroll',
-  'world-pick', 'pick-every', 'world-farm', 'farm-every',
+  'world-pick', 'pick-every', 'world-farm', 'farm-every', 'world-instant-topup',
   'loop-radar', 'radar-every', 'radar-ratio', 'radar-repair',
   'pirate-on', 'pirate-every', 'pirate-repeat',
   'forge-on', 'forge-every', 'pet-on', 'pet-every', 'pet-quality', 'pet-feed',
   'idle-on', 'idle-every', 'treasure-on', 'treasure-every',
   'treasure-color-3', 'treasure-color-4', 'treasure-color-5',
   'cargo-on', 'cargo-every',
-  'trade-on', 'trade-every', 'trade-speed', 'guild-ship-on', 'guild-ship-every', 'guild-ship-seek',
+  // 'trade-on', 'trade-every', 'trade-speed', 'guild-ship-on', 'guild-ship-every', 'guild-ship-seek',  // 两个活动已下线，控件注释掉了
   'guild-order-on', 'guild-order-every',
-  'city-war-on', 'city-war-every', 'city-war-lead', 'city-war-max', 'city-war-reserve', 'city-war-repair',
+  'city-war-on', 'city-war-every', 'city-war-live', 'city-war-lead', 'city-war-max', 'city-war-reserve', 'city-war-repair',
   'city-war-ratio',
   'youdu-on', 'youdu-every', 'youdu-spin', 'youdu-edict',
 ];
@@ -1239,15 +1346,16 @@ function renderLoop(data) {
   syncInterval('idle-every', data.idleEveryMs);
   syncInterval('treasure-every', data.treasureEveryMs);
   syncInterval('cargo-every', data.cargoEveryMs);
-  syncInterval('trade-every', data.tradeEveryMs);
-  syncInterval('guild-ship-every', data.guildShipEveryMs);
+  // 海商王 / 联盟商船：活动下线，控件注释掉了，间隔不再回填。
+  // syncInterval('trade-every', data.tradeEveryMs);
+  // syncInterval('guild-ship-every', data.guildShipEveryMs);
   syncInterval('guild-order-every', data.guildOrderEveryMs);
   // 状态行一律按**服务端实际生效**的开关算（未挂机时才看页面勾选）——
   // 页面勾着但服务端关着时，写「还差 20 秒」会误导。
   const gateOn = (id, serverValue) => (data.running && typeof serverValue === 'boolean' ? serverValue : $(id).checked);
   renderGate('pick-state', data.lastPickAt, data.pickEveryMs, gateOn('world-pick', data.pickEnabled), data.running);
   renderGate('farm-state', data.lastFarmAt, data.farmEveryMs, gateOn('world-farm', data.farmEnabled), data.running);
-  renderGate('radar-state', data.lastRadarAt, data.radarEveryMs, gateOn('loop-radar', data.radarEnabled), data.running);
+  renderRadarGate(data, gateOn('loop-radar', data.radarEnabled));
   renderGate('pirate-state', data.lastPirateAt, data.pirateEveryMs, gateOn('pirate-on', data.pirateEnabled), data.running);
   // 运行中把「刷已通关等级」回填（默认关），标脏的不动。
   if (data.running && typeof data.pirateRepeat === 'boolean' && !loopDirty.has('pirate-repeat')) {
@@ -1260,15 +1368,17 @@ function renderLoop(data) {
   renderGate('idle-state', data.lastIdleAt, data.idleEveryMs, gateOn('idle-on', data.idleEnabled), data.running);
   renderGate('treasure-state', data.lastTreasureAt, data.treasureEveryMs, gateOn('treasure-on', data.treasureEnabled), data.running);
   renderGate('cargo-state', data.lastCargoAt, data.cargoEveryMs, gateOn('cargo-on', data.cargoEnabled), data.running);
-  renderGate('trade-state', data.lastTradeAt, data.tradeEveryMs, gateOn('trade-on', data.tradeEnabled), data.running);
-  renderGate('guild-ship-state', data.lastGuildShipAt, data.guildShipEveryMs, gateOn('guild-ship-on', data.guildShipEnabled), data.running);
-  if (data.running && typeof data.guildShipSeek === 'boolean' && !loopDirty.has('guild-ship-seek')) {
-    $('guild-ship-seek').checked = data.guildShipSeek;
-  }
+  // 海商王 / 联盟商船：活动已下线，页面控件与这一整块 DOM 都注释掉了，这里不再渲染它们的状态。
+  // renderGate('trade-state', data.lastTradeAt, data.tradeEveryMs, gateOn('trade-on', data.tradeEnabled), data.running);
+  // renderGate('guild-ship-state', data.lastGuildShipAt, data.guildShipEveryMs, gateOn('guild-ship-on', data.guildShipEnabled), data.running);
+  // if (data.running && typeof data.guildShipSeek === 'boolean' && !loopDirty.has('guild-ship-seek')) {
+  //   $('guild-ship-seek').checked = data.guildShipSeek;
+  // }
   renderGate('guild-order-state', data.lastGuildOrderAt, data.guildOrderEveryMs, gateOn('guild-order-on', data.guildOrderEnabled), data.running);
   // 国战：静默窗可能长达一整天（白天 → 次日 19:50），必须写清「不是坏了，是还没到点」，
   // 否则状态行会一直显示「还差 20 小时」，看起来像卡死。
   syncInterval('city-war-every', data.cityWarEveryMs);
+  syncInterval('city-war-live', data.cityWarLiveEveryMs);
   if (data.running && typeof data.cityWarPrepLeadSec === 'number' && !loopDirty.has('city-war-lead')
     && document.activeElement !== $('city-war-lead')) {
     $('city-war-lead').value = String(Math.round(data.cityWarPrepLeadSec));
@@ -1293,7 +1403,7 @@ function renderLoop(data) {
   }
   renderCityWarGate(data, gateOn('city-war-on', data.cityWarEnabled));
   syncInterval('youdu-every', data.youduEveryMs);
-  renderGate('youdu-state', data.lastYouduAt, data.youduEveryMs, gateOn('youdu-on', data.youduEnabled), data.running);
+  renderYouduGate(data, gateOn('youdu-on', data.youduEnabled));
   if (data.running && typeof data.youduSpin === 'boolean' && !loopDirty.has('youdu-spin')) {
     $('youdu-spin').checked = data.youduSpin;
   }
@@ -1303,12 +1413,17 @@ function renderLoop(data) {
   if (data.running && typeof data.youduEnabled === 'boolean' && !loopDirty.has('youdu-on')) {
     $('youdu-on').checked = data.youduEnabled;
   }
-  // 运行中把「用商会指针」回填（默认开），标脏的不动。
-  if (data.running && typeof data.tradeAllowSpeed === 'boolean' && !loopDirty.has('trade-speed')) {
-    $('trade-speed').checked = data.tradeAllowSpeed;
-  }
+  // 海商王活动已下线，控件注释掉，这里不再回填「用商会指针」。
+  // if (data.running && typeof data.tradeAllowSpeed === 'boolean' && !loopDirty.has('trade-speed')) {
+  //   $('trade-speed').checked = data.tradeAllowSpeed;
+  // }
   renderTreasureCount(data, data.history[data.history.length - 1]);
   if (!data.treasureStats) fetchTreasureCountOnce();
+  // 瞬成补产：运行中按服务端实际生效的值回填（用户刚改过的不覆盖），并显示最近一轮的补产结果。
+  if (data.running && typeof data.instantTopUp === 'boolean' && !loopDirty.has('world-instant-topup')) {
+    $('world-instant-topup').checked = data.instantTopUp;
+  }
+  renderInstantTopUp(data.history[data.history.length - 1]);
   // 运行中把「抢哪些」回填到多选框（默认只勾万吨），标脏的不动。
   if (data.running && Array.isArray(data.treasureColors)) {
     for (const color of [3, 4, 5]) {
@@ -1353,6 +1468,10 @@ $('loop-start').onclick = async () => {
         // 农田默认开，跟拾荒一样有独立间隔（作物最快 30 分钟熟，默认 2 分钟看一次）。
         farm: $('world-farm').checked,
         farmEverySeconds: Number($('farm-every').value || 0),
+        // 瞬成补产（排满 → 等 6 秒 → 收 → 再排，最多 4 趟）：关掉就退回「一轮一批 6 个」。
+        instantTopUp: $('world-instant-topup').checked,
+        // 队列里允许堆几个非瞬成配方（默认 1）：堆多了不提升产能，只会把制造位吃光、挤掉瞬成。
+        maxLongQueue: 1,
         // 情报默认开，跟拾荒/农田一样有独立间隔（默认 60 秒）；战力余量越小越激进（战败掉耐久）。
         radar: $('loop-radar').checked,
         radarEverySeconds: Number($('radar-every').value || 0),
@@ -1382,20 +1501,21 @@ $('loop-start').onclick = async () => {
         // 贸易港口（建筑「货轮港口」）默认开，默认 60 秒看一眼：交货换经验金币、返航领藏品奖励。
         cargo: $('cargo-on').checked,
         cargoEverySeconds: Number($('cargo-every').value || 0),
-        // 海商王：默认开、60 秒一段、商会指针全用（免费道具）。
-        // 联盟商船：默认开、120 秒一段、允许应聘船长。
-        guildShip: $('guild-ship-on').checked,
-        guildShipEverySeconds: Number($('guild-ship-every').value || 0),
-        guildShipSeek: $('guild-ship-seek').checked,
-        trade: $('trade-on').checked,
-        tradeEverySeconds: Number($('trade-every').value || 0),
-        tradeSpeed: $('trade-speed').checked,
+        // 海商王（2026-10-28 下线）/ 联盟商船（2026-10-30 结束）：活动都没了，页面控件已注释，
+        // 这里恒传 false，服务端不会再启动这两段，也不再往日志里写它们。
+        guildShip: false,
+        guildShipEverySeconds: 0,
+        guildShipSeek: false,
+        trade: false,
+        tradeEverySeconds: 0,
+        tradeSpeed: false,
         // 联盟订单：默认开、600 秒看一眼（料是加工品，工厂一炉 30~300 分钟）。
         guildOrder: $('guild-order-on').checked,
         guildOrderEverySeconds: Number($('guild-order-every').value || 0),
         // 国战：默认开。平时整段静默，只在「战前 N 秒 ~ 战期结束」之间动。
         cityWar: $('city-war-on').checked,
         cityWarEverySeconds: Number($('city-war-every').value || 0),
+        cityWarLiveEverySeconds: Number($('city-war-live').value || 60),
         cityWarPrepLeadSeconds: Number($('city-war-lead').value || 600),
         cityWarMaxFleets: Number($('city-war-max').value || 3),
         cityWarPetrolReserve: Number($('city-war-reserve').value || 0),
@@ -1562,6 +1682,10 @@ $('cargo-run').onclick = async () => {
   }
 };
 
+/* ══ 海商王（2026-10-28 下线）/ 联盟商船（2026-10-30 结束）：两个手动按钮整块停用 ══
+   活动都没了，对应 DOM 也已经注释，这里再绑事件会取到 null 直接报错。
+   重开时：去掉本段注释标记 + 恢复页面控件 + 恢复 loop.mjs 对应段 + 恢复 server.mjs 的 /api/trade、/api/guildship 路由。
+
 // 手动「立刻跑一段海商王」：卖 → 共享商情 → 买本港特产 → 起航 → 用指针，跟挂机里那套完全一样。
 $('trade-run').onclick = async () => {
   $('trade-state').textContent = '执行中 ...';
@@ -1603,6 +1727,7 @@ $('guild-ship-run').onclick = async () => {
     $('guild-ship-state').textContent = error.message;
   }
 };
+/* ══ 海商王 / 联盟商船 手动按钮块结束 ══ */
 
 $('city-war-look').onclick = async () => {
   $('city-war-state').textContent = '读取局势 ...';

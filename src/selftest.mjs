@@ -36,9 +36,12 @@ import {
   cityDistance,
   planCityWar,
   formatCityWarSummary,
+  claimWarOnlineReward,
+  formatOnlineReward,
+  warPollInterval,
   CW_STATE_IDLE,
 } from './cityWar.mjs';
-import { viewYoudu, planYoudu, formatYouduSummary, settleYouduEdict, runYouduActive, summarizeYoudu, YOUDU_ACTIVITY_ID } from './youdu.mjs';
+import { viewYoudu, planYoudu, formatYouduSummary, settleYouduEdict, runYouduActive, summarizeYoudu, isYouduClosed, YOUDU_ACTIVITY_ID } from './youdu.mjs';
 
 const require = createRequire(import.meta.url);
 const minimal = require('protobufjs/minimal');
@@ -688,6 +691,107 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   checked += 1;
 }
 
+// 勋章升星（BadgeStarRequest）：只有 RED 能升、星石不够才拆闲置红徽章、
+// 拆的时候不碰佩戴中的/更强的/非红的，凑不齐就整级不做。这一组把这些边界全钉住。
+{
+  const { surveyHeroGrowth, planHeroGrowth, badgeStarEquivalent } = await import('./heroGrow.mjs');
+  const config = { tables: {
+    HeroCfg: { data: [{ id: 'A', career: '法师', quality: 'RED', qualityIndex: 5 }] },
+    HeroBadgeCfg: { data: [
+      { id: '红法师徽章', career: '法师', quality: 'RED', qualityIndex: 5 },
+      { id: '蓝法师徽章', career: '法师', quality: 'BLUE', qualityIndex: 1 },
+    ] },
+    HeroBadgeAttrCfg: { data: [
+      { id: '红法师徽章', star: 4, maxLevel: 10 },
+      { id: '红法师徽章', star: 5, maxLevel: 20 },
+    ] },
+    HeroBadgeLevelCfg: { data: [{ level: 1, exp: 0, goldExpRadio: 0 }, { level: 2, exp: 10, goldExpRadio: 1 }] },
+    HeroBadgeStarCfg: { data: [
+      // 只有「4 星 → 5 星」这一行：升满就是客户端写死的 `_maxStar = 5`，再往上没有配置。
+      { star: 5, upBadgeNum: 2, equalBadgeNum: 2, consume: ['GOLD', 100] },
+    ] },
+    HeroBadgeUnlockCfg: { data: [{ pos: 1, level: 1 }] },
+    EquipCfg: { data: [] }, EquipAttrCfg: { data: [] }, EquipUpDecomposeCfg: { data: [] },
+    EquipRefineCfg: { data: [] }, EquipUpStarCfg: { data: [] },
+    ExclusiveWeaponCfg: { data: [] }, ExclusiveUpgradeCfg: { data: [] }, ExclusiveStarCfg: { data: [] },
+  } };
+  const responses = {
+    AllHeroResponse: { heroes: [{
+      heroId: 'A', level: 99, star: 5, power: { low: 100, high: 0 }, skillLevels: [], equips: [],
+      // 身上这枚是 4 星 5 级（score = 品质 5e6 + 4 星 4e4 + 5 级 500），背包里没有比它更强的 → 不会替换。
+      badges: [{ pos: 1, uid: 11, badgeId: '红法师徽章', level: 5, exp: 0, star: 4 }],
+    }] },
+    GetFormationResponse: { formation: { heroPositions: [{ heroId: 'A', pos: { x: 1, y: 1 } }], presetId: 1 } },
+    BadgesResponse: { badge: [
+      { uid: 11, badgeId: '红法师徽章', level: 5, exp: 0, star: 4 },   // 佩戴中 —— 永不拆
+      { uid: 21, badgeId: '红法师徽章', level: 1, exp: 0, star: 0 },   // 更差，当量 1
+      { uid: 22, badgeId: '红法师徽章', level: 2, exp: 0, star: 0 },   // 更差，当量 1
+      { uid: 23, badgeId: '红法师徽章', level: 9, exp: 0, star: 1 },   // 更差但更贵（当量 2），够用了就不该动它
+      { uid: 24, badgeId: '蓝法师徽章', level: 1, exp: 0, star: 0 },   // 非红 —— 顶不了当量
+    ] },
+    // 只有 1 个星石：升 5 星要 2 个，必须靠拆 1 枚闲置红徽章补差。
+    AllItemResponse: { items: [
+      { itemId: '徽章升星石', num: { low: 1, high: 0 } },
+      { itemId: '徽章经验', num: { low: 100, high: 0 } },
+    ] },
+    AllResourceResponse: { list: [{ res: 3, amount: { low: 100000, high: 0 } }] },
+  };
+  const fake = { request: async (name, body, response) => responses[response] };
+  const protocol = Object.fromEntries(
+    Object.keys(responses)
+      .map((name) => [name, 1])
+      .concat(['AllHeroRequest', 'BadgesRequest', 'EquipsRequest', 'AllItemRequest', 'AllResourceRequest', 'GetFormationRequest'].map((name) => [name, 1])),
+  );
+
+  // 当量折算照客户端 `idleRedBadgeStarNum`：0 星 1 个，n 星 equalBadgeNum。
+  const index = { badgeStar: new Map([[1, { equalBadgeNum: 2 }], [2, { equalBadgeNum: 4 }]]) };
+  assert.equal(badgeStarEquivalent(index, 0), 1, 'a 0-star badge is worth 1 star stone');
+  assert.equal(badgeStarEquivalent(index, 2), 4, 'a 2-star badge is worth equalBadgeNum stones');
+
+  const survey = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 99 });
+  const plan = planHeroGrowth(survey, { switches: { exclusiveLevel: false, exclusiveStar: false } });
+  const star = plan.actions.filter((one) => one.kind === 'badgeStar');
+  assert.equal(star.length, 1, 'a 4-star red badge gets exactly one request: 4 → 5, then the hard cap stops it');
+  const first = star[0];
+  assert.equal(first.request, 'BadgeStarRequest');
+  assert.equal(first.body.uid, 11, 'the star up targets the worn red badge');
+  assert.equal(first.body.starItemNum, 1, 'starItemNum is the stones actually spent (1 of the 2 needed)');
+  assert.deepEqual(first.body.decomposeUid, [21], 'the cheapest idle red badge covers the 1-stone gap');
+  assert.ok(!first.body.decomposeUid.includes(23), 'a pricier idle badge (2 equivalents) is not touched once the gap is filled');
+  assert.ok(!first.body.decomposeUid.includes(24), 'a non-red badge cannot pay for a red star up');
+  assert.ok(!first.body.decomposeUid.includes(11), 'the badge being starred up is not used as fuel');
+  assert.equal(plan.heroes[0].badges.find((one) => one.pos === 1).star, 5, 'the planned star is reflected in the hero row');
+
+  // 升星必须排在强化之前：升星抬高 maxLevel 档位，先强到旧上限就白花经验。
+  const starAt = plan.actions.findIndex((one) => one.kind === 'badgeStar');
+  const enhanceAt = plan.actions.findIndex((one) => one.kind === 'badgeEnhance');
+  assert.ok(starAt >= 0 && (enhanceAt < 0 || starAt < enhanceAt), 'star up runs before enhance');
+
+  // 星石够用时一条都不拆（decomposeUid 恒空数组，不可逆操作最小化）。
+  const rich = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 99 });
+  rich.stock.set('徽章升星石', 20);
+  rich.stock.set('GOLD', 100000);
+  const richPlan = planHeroGrowth(rich, { switches: { badgeEnhance: false, exclusiveLevel: false, exclusiveStar: false } });
+  const richStars = richPlan.actions.filter((one) => one.kind === 'badgeStar');
+  assert.equal(richStars.length, 1, 'the only configured star row is 4 → 5');
+  assert.ok(richStars.every((one) => one.body.decomposeUid.length === 0), 'plenty of stones means zero decomposition');
+
+  // 星石为 0 且没有「更差」的闲置红徽章可拆时：整级不做，也不能拆佩戴中的那枚。
+  const empty = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 99 });
+  empty.stock.set('徽章升星石', 0);
+  empty.badgeBag = empty.badgeBag.filter((one) => one.worn);
+  const emptyPlan = planHeroGrowth(empty, { switches: { exclusiveLevel: false, exclusiveStar: false } });
+  assert.equal(emptyPlan.actions.filter((one) => one.kind === 'badgeStar').length, 0, 'no stones and no fuel means no request at all');
+
+  // 金币不够时一枚都升不了，而且要给出一句能看懂的原因。
+  const poor = await surveyHeroGrowth(fake, protocol, { config, playerLevel: 99 });
+  poor.stock.set('GOLD', 0);
+  const poorPlan = planHeroGrowth(poor, { switches: { exclusiveLevel: false, exclusiveStar: false } });
+  assert.equal(poorPlan.actions.filter((one) => one.kind === 'badgeStar').length, 0, 'no gold, no star up');
+  assert.ok(poorPlan.notes.some((note) => note.includes('红徽章还有 1 枚没升星')), 'the blocked red badge explains itself');
+  checked += 1;
+}
+
 // 专武（英雄专属武器）：数据在 heroes[].exclusive、材料按品质二选一、等级被星级封顶。
 // 这一组钉三件事：① 橙/红各自取 cost[0]/cost[1]；② 0 星封顶就升不动、先升星才放开；
 // ③ universal 恒 false（不拿万能碎片垫英雄碎片）。
@@ -1188,34 +1292,65 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   const slow = planWorld(surveyFor({ seaweed: 9, reduce: 0 }), { config });
   assert.equal(producesOf(slow).length, 1, 'a non-instant recipe is still queued one at a time');
   assert.equal(producesOf(slow)[0].body.productId, '鱼', 'the shorter recipe is still preferred');
-  // 队列非空但**没满**：只补「瞬成」配方到剩余空位。
-  // 以前是队列非空就整座跳过，实测切鱼厂排了个 32 分钟的鱼皮之后 5 个制造位空着半小时，
-  // 生鱼片/鱼肠线这些瞬成配方全被挡住；而长配方往正在跑的队列后面塞等于把料压死，所以只放瞬成的。
+  // 队列非空但**没满**：瞬成配方把剩余空位排满，长配方不往里塞。
   // 队列是**串行**的：只有队首真的在产，第 2 项及以后只是排队（服务端连 finishTime 都不编码）。
-  // 所以「队首还在跑」时**一单都不排** —— 新排的东西只能排到队尾等，瞬成也不例外。
-  // 实测 2026-10-26：1服装厂 队首是 70 分钟的鱼皮鞋，后面堆了 4 个瞬成，全在等它跑完。
+  // 2026-10-30 改：队首还在跑时**瞬成照样排满剩余空位** —— 排队不增加任何时间成本
+  // （瓶颈是队首那个长物品），长物品一结束它们会在同一个 tick 里全部落地、下一轮一起收。
+  // 旧逻辑「队首在跑只排 1 个」的后果是长物品占 30 分钟、5 个制造位干等、瞬成零产出。
   const busyQueue = [{ idx: 1, productId: '烤鱼', finishTime: 5000 }, { idx: 2, productId: '烤鱼', finishTime: 0 }];
   const busy = planWorld(surveyFor({ seaweed: 9, queue: busyQueue }), { config });
-  assert.equal(producesOf(busy).length, 1, '队首在跑时只排 1 个（不批量堆队列）');
+  assert.equal(producesOf(busy).length, 4, '队列 2/6 → 剩下的 4 个空位全排瞬成（排队等队首跑完）');
   assert.equal(producesOf(busy)[0].body.productId, '鱼', '没需求时排时间最短的（鱼 300s）');
   // 队首已经完成（finishTime <= now）：视同空闲，瞬成把剩余空位排满。
   const doneQueue = [{ idx: 1, productId: '烤鱼', finishTime: 500 }];
   const headDone = planWorld(surveyFor({ seaweed: 9, queue: doneQueue }), { config });
   assert.equal(producesOf(headDone).length, 5, '队首已完成 → 剩下 5 个空位排满瞬成');
   assert.ok(producesOf(headDone).every((action) => action.body.productId === '鱼'), '排的是瞬成的鱼');
-  // 队首 finishTime = 0 = 服务端还没给这条队列排上时间（刚排完没结算），也按忙处理。
+  // 队首 finishTime = 0 = 服务端还没给这条队列排上时间（刚排完没结算），也当「在跑」。
   const queuedHead = [{ idx: 1, productId: '烤鱼', finishTime: 0 }];
   const zeroHead = planWorld(surveyFor({ seaweed: 9, queue: queuedHead }), { config });
-  assert.equal(producesOf(zeroHead).length, 1, '队首 finishTime=0（还没排上时间）也按忙处理，只排 1 个');
+  assert.equal(producesOf(zeroHead).length, 5, '队首 finishTime=0 也算占位，瞬成只填剩下的 5 个空位');
 
-  // 例外：**有明确需求的配方**（订单缺口 / 货船缺口）在队首还在跑时也要排进去 ——
-  // 反正都要排队，那就排确定要用的那条，而不是干等着。一轮 1 个，不批量。
+  // 有明确需求的配方（订单 / 货船缺口）在队首还在跑时也要排进去 —— 但**队列里已经有长物品时不再往上堆**
+  // （2026-10-30 加 maxLongQueue）：串行队列一次只跑一个，堆第 2 个不提升任何产能，
+  // 却会把制造位吃光（实测 1家具厂 6/6 = 橱柜+躺椅×5、1服装厂 6/6 = 鱼皮鞋×5+渔夫帽，
+  // 0 秒的瞬成配方布匹/淡水连排队资格都没有）。下面这条队列已经排了 2 个烤鱼 → 本轮改排瞬成的鱼。
   const busyDemandSurvey = surveyFor({ seaweed: 9, queue: busyQueue });
   busyDemandSurvey.stock.set('鱼', 4);
   // 队列里已经有 2 个烤鱼，所以需求得给到 4 才算「还没填满」。
   const busyDemand = planWorld(busyDemandSurvey, { config, cargoDemand: new Map([['烤鱼', 4]]) });
-  assert.equal(producesOf(busyDemand).length, 1, '队首在跑时，有需求的配方也只排 1 个');
-  assert.equal(producesOf(busyDemand)[0].body.productId, '烤鱼', '排的是有需求的那条，不是瞬成的鱼');
+  assert.equal(producesOf(busyDemand).length, 4, '队列 2/6 → 4 个空位全排瞬成');
+  assert.equal(producesOf(busyDemand)[0].body.productId, '鱼',
+    '队列里已有长物品 → 不再堆烤鱼，改排瞬成的鱼（长物品一跑完它立刻落地）');
+  // 队列里只有 1 个长物品（正在跑）时同理：那一个是必要的，但第 2 个不再追加。
+  const oneLong = planWorld(
+    surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }] }),
+    { config, cargoDemand: new Map([['烤鱼', 3]]) },
+  );
+  assert.ok(producesOf(oneLong).length > 0 && producesOf(oneLong).every((a) => a.body.productId === '鱼'),
+    '队列里已有 1 个长物品在跑 → 本轮只排瞬成（maxLongQueue 默认 1）');
+  // 队列空 + 有需求：长物品照样排，不然它永远轮不上（瞬成的分更高时会一直霸占）。
+  // 烤鱼要「鱼×2」当料，这里先给够，否则它连 affordable 都过不了、根本进不了比较。
+  const emptyLongSurvey = surveyFor({ seaweed: 9 });
+  emptyLongSurvey.stock.set('鱼', 4);
+  const emptyLong = planWorld(emptyLongSurvey, { config, cargoDemand: new Map([['烤鱼', 2]]) });
+  assert.equal(producesOf(emptyLong)[0].body.productId, '烤鱼', '队列空 + 有需求 → 长物品排最前');
+  assert.equal(producesOf(emptyLong).length, 1, '长物品一轮只排 1 个');
+  // 想退回旧行为（能把队列重新堆满长物品）就传 Infinity。
+  const legacySurvey = surveyFor({ seaweed: 9, queue: busyQueue });
+  legacySurvey.stock.set('鱼', 4);
+  const legacyQueue = planWorld(legacySurvey,
+    { config, maxLongQueue: Infinity, cargoDemand: new Map([['烤鱼', 4]]) });
+  assert.equal(producesOf(legacyQueue)[0].body.productId, '烤鱼', 'maxLongQueue = Infinity 时退回「继续堆长物品」');
+  // 排产动作要带「是不是瞬成」和「这座厂队列里几个长物品」两个标记 —— 挂机的瞬成补产循环靠它
+  // 判断「排完等 6 秒能不能收到」（队列里有长物品时瞬成只能排队，收不到）。
+  assert.equal(producesOf(emptyLong)[0].instant, false, '长物品的排产动作不带瞬成标记');
+  assert.equal(producesOf(emptyLong)[0].queueLong, 0, '空队列的 queueLong = 0');
+  const instantMark = planWorld(surveyFor({ seaweed: 9 }), { config });
+  assert.equal(producesOf(instantMark)[0].instant, true, '瞬成配方的排产动作带 instant 标记');
+  assert.equal(producesOf(instantMark)[0].queueLong, 0, '空队列的瞬成动作 queueLong = 0');
+  const queuedMark = planWorld(surveyFor({ seaweed: 9, queue: [{ idx: 1, productId: '烤鱼', finishTime: 5000 }] }), { config });
+  assert.equal(producesOf(queuedMark)[0].queueLong, 1, '队列里 1 个长物品 → queueLong = 1（补产循环会跳过它）');
   // 队列空 + 有需求 + 瞬成配方：按缺口排，不排满空位（货船要 2 个就产 2 个，多产的既占库存也占材料）。
   const gapSurvey = surveyFor({ seaweed: 9 });
   const gapPlan = planWorld(gapSurvey, { config, cargoDemand: new Map([['鱼', 2]]) });
@@ -2023,6 +2158,55 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.equal(orderPlan.length, 1, 'one idle fleet => one dispatch');
   assert.deepEqual(orderPlan[0].body, { fleetBuildingIds: ['1远征船'] },
     '固定事件优先于颜色更高的随机事件（不带 uid 派兵 = 选中固定事件）');
+
+  // ---- 事件打光后「睡到刷新」：这段时间一次请求都不发 ----
+  // radarIdleUntil 返回 0 = 按常规间隔（60 秒）再来；返回时间戳 = 到那时才值得再探。
+  // 只有「确实无事可做」才敢睡，任何一件事能做都必须回来 —— 否则挂机会一直睡着不干活。
+  const { radarIdleUntil } = await import('./radar.mjs');
+  const NOW = 1000 * 1000; // 毫秒
+  const refreshIn = (sec) => Math.floor(NOW / 1000) + sec;
+  const idleView = (over = {}) => viewRadar(surveyFor({
+    events: [], fleets: [fleet()], ...over,
+  }), { config });
+  assert.equal(radarIdleUntil(idleView({ events: [] }), { nowMs: NOW }), 0,
+    'nextRefreshTime 没给（0）就不敢睡，只能照常轮询');
+
+  const quiet = { ...idleView({ events: [] }), nextRefreshTime: refreshIn(6 * 3600) };
+  const sleepAt = radarIdleUntil(quiet, { nowMs: NOW });
+  assert.ok(sleepAt > NOW, '事件打光 + 船全在港 → 睡到刷新点');
+  assert.equal(sleepAt, refreshIn(6 * 3600) * 1000 + 5000, '刷新时刻 + 5 秒余量（早探只会白拿空列表）');
+
+  // 有 state=1 的事件（哪怕战力不够打不了）就不能睡：材料是工厂现产、战力会变。
+  const hasEvent = { ...quiet, events: viewRadar(surveyFor({
+    events: [event({ key: 'a', uid: 11 })],
+    fleets: [fleet({ power: 90000 })], // 打不过，但事件还挂着
+  }), { config }).events };
+  assert.equal(radarIdleUntil(hasEvent, { nowMs: NOW }), 0, '还有打不了的事件挂着，不能睡到刷新');
+
+  // 待领奖也不能睡：奖励不领不会自己进包。
+  const hasReward = { ...quiet, rewards: [{ key: 'r' }] };
+  assert.equal(radarIdleUntil(hasReward, { nowMs: NOW }), 0, '有奖没领就得回来');
+
+  // 船在外面（航行/战斗/修理）也不能睡：回来就能接着打。
+  for (const state of [2, 3, 4, 5]) {
+    const out = viewRadar(surveyFor({ events: [], fleets: [fleet({ state })] }), { config });
+    assert.equal(radarIdleUntil({ ...out, nextRefreshTime: refreshIn(3600) }, { nowMs: NOW }), 0,
+      `fleet state ${state} 的船在外面，回来要接着派，不能睡`);
+  }
+
+  // 有船该修却没修（汽油不够）也不能睡：可能下一轮汽油就够了。
+  const needFix = viewRadar(surveyFor({
+    events: [],
+    fleets: [fleet({ durability: 0, maxDurability: 2000 })],
+    petrol: 5,
+    repairParams,
+  }), { config, repairBelow: 0.8 });
+  assert.equal(radarIdleUntil({ ...needFix, nextRefreshTime: refreshIn(3600) }, { nowMs: NOW }), 0,
+    '有船等着修，不能睡');
+
+  // 刷新时刻已经过点（服务端已刷 / 时钟偏差）也不睡，正常探测。
+  assert.equal(radarIdleUntil({ ...quiet, nextRefreshTime: Math.floor(NOW / 1000) - 1 }, { nowMs: NOW }), 0,
+    '刷新时间已过 → 立刻探一次');
   checked += 1;
 }
 
@@ -5651,6 +5835,70 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   assert.ok(summary.includes('20:00') && summary.includes('2 攻'), `概览要带战期和攻守城数，实际：${summary}`);
   assert.ok(summary.includes('舰队 2/2'), `概览要带空闲船数，实际：${summary}`);
 
+  // 12. 战期节奏：战期内 60 秒（一波打完要立刻再派），战期外仍是 180 秒。
+  //     判据：10/29 实测一完整波 = 派 → 交战 → 回后方城 → 修满 → 再派 ≈ 9–10 分钟，
+  //     3 分钟间隔下每波白等最多 3 分钟，一场只 1 小时 ≈ 6 波，等于少打一整波。
+  const warCycle = [day1Start, day1End]; // day1Start = 10/28 20:00
+  const w = { startAt: warCycle[0], endAt: warCycle[1] };
+  assert.equal(warPollInterval(180_000, 60_000, w, day1Start + 600), 60_000, '战期内切 60 秒');
+  assert.equal(warPollInterval(180_000, 60_000, w, day1Start - 600), 180_000, '布署窗（还没开战）仍 180 秒');
+  assert.equal(warPollInterval(180_000, 60_000, w, day1End + 60), 180_000, '战期结束后回到 180 秒');
+  assert.equal(warPollInterval(180_000, 60_000, null, day1Start + 600), 180_000, '窗口未知 → 不加速（宁可慢也别乱发）');
+  assert.equal(warPollInterval(30_000, 60_000, w, day1Start + 600), 30_000, '常规间隔更短时取 min，不被拖长');
+  assert.equal(warPollInterval(180_000, 1_000, w, day1Start + 600), 30_000, '战期节奏有 30 秒下限（别把服务端打烦）');
+  assert.equal(warPollInterval(0, 60_000, w, day1Start + 600), 60_000, '常规=0（每轮都跑）时战期内也是 60 秒');
+
+  // 13. 城战在线奖励：请求是空消息，服务端满足一档回一条 GotRewardResponse，没得领就回 prompt。
+  //     客户端 WarOnlineReward 是自动发的，无头客户端必须自己补 —— 2026-10-29 实测整场 7 档全漏
+  //     （`grep -c GotWorldOnlineRwd data/protocol.log` = 0）。
+  const onlineProtocol = { GotWorldOnlineRwdRequest: () => {}, GotRewardResponse: () => {} };
+  const fakeClient = (queue) => {
+    let i = 0;
+    return {
+      sent: 0,
+      async request() {
+        this.sent += 1;
+        const next = queue[Math.min(i, queue.length - 1)];
+        i += 1;
+        if (next instanceof Error) throw next;
+        return next;
+      },
+    };
+  };
+  const gift = (id, n) => ({ reward: { asset: [{ type: 0, id, num: { low: n, high: 0, unsigned: false } }] } });
+
+  // 领到两档后第三档还没解锁（服务端回 prompt）→ 收手，别继续打。
+  const c1 = fakeClient([gift('汽油', 7000), gift('RUBY', 30), new Error('server prompt: no claimable reward')]);
+  const r1 = await claimWarOnlineReward(c1, onlineProtocol, { maxTries: 4, timeout: 50 });
+  assert.equal(r1.rounds, 2, '领到两档就停（第三档被拒）');
+  assert.equal(r1.stoppedBy, 'rejected', '被 prompt 拒 → 收手信号是 rejected');
+  assert.deepEqual(r1.gifts.map((g) => `${g.id}x${g.num}`), ['汽油x7000', 'RUBYx30'], '奖励要按条收集');
+  assert.equal(c1.sent, 3, '被拒后不再多发（3 次就停）');
+
+  // 空包裹 → empty 收手（这一档是空的 / 已经领过）。
+  const r2 = await claimWarOnlineReward(fakeClient([{ reward: { asset: [] } }]), onlineProtocol, { timeout: 50 });
+  assert.equal(r2.stoppedBy, 'empty', '空包裹不该继续打');
+  assert.equal(r2.gifts.length, 0, '空包裹没有奖励');
+
+  // 一直成功 → 打到 maxTries 为止，不会无限循环。
+  const c3 = fakeClient([gift('汽油', 100)]);
+  const r3 = await claimWarOnlineReward(c3, onlineProtocol, { maxTries: 3, timeout: 50 });
+  assert.equal(r3.stoppedBy, 'maxTries', '全成功就到 maxTries 停');
+  assert.equal(c3.sent, 3, 'maxTries=3 就只发 3 次');
+
+  // 协议表里没有这两个消息 → 不支持，一个请求都不发（老版本 bundle 别崩）。
+  const r4 = await claimWarOnlineReward(fakeClient([gift('汽油', 1)]), {}, {});
+  assert.equal(r4.supported, false, '没有协议 → supported=false');
+  assert.equal(r4.gifts.length, 0, '不支持时没有奖励');
+
+  // 同名奖励合并成一行，日志才读得下去。
+  assert.equal(
+    formatOnlineReward({ gifts: [{ id: '汽油', num: 7000 }, { id: '汽油', num: 7500 }, { id: 'RUBY', num: 30 }] }),
+    '在线奖励 汽油×14500 + RUBY×30',
+    '同名奖励要合并',
+  );
+  assert.equal(formatOnlineReward({ gifts: [] }), '', '没领到就返回空串（概览行不该多出「在线奖励」）');
+
   checked += 1;
 }
 
@@ -5841,7 +6089,15 @@ roundTrip(Buffer.from('RequestResponse'.repeat(200)), 'text');
   // 开局这条也必须 transient（入场券是签到给的，今天没有明天可能有）。
   const startAction = p3.actions.find((a) => a.kind === 'youduEdictStart');
   assert.ok(startAction?.transient === true, 'youduEdictStart 必须 transient，否则没券那天会把它拉黑到进程结束');
+
+  // 13. 「活动关闭」≠「网络断了」：三个 info 全挂时都是 open=false，但只有服务端明确
+  //     回 prompt（74=ACTIVE_END）才算活动下线、退避 1 小时；掉线必须下一轮立刻重试。
+  assert.equal(isYouduClosed('server prompt: prompt=74'), true, 'prompt 74 = 活动已关闭');
+  assert.equal(isYouduClosed('prompt=ACTIVE_END'), true, 'ACTIVE_END 也算关闭');
+  assert.equal(isYouduClosed('not connected'), false, '掉线不能当活动关闭（会白停 1 小时）');
+  assert.equal(isYouduClosed('拿不到 EvilExpelInfoResponse，读不了活动'), false, '单条失败不算关闭');
+  assert.equal(isYouduClosed(undefined), false, '没原因时按「没通」处理，下一轮重试');
   checked += 1;
 }
 
-console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 联盟商船 / 国战攻城 / 酆都诡事 / 海盗讨伐 / 日志脱敏与回包归档 / 今日收益统计）`);
+console.log(`selftest ok: ${checked} 组检查通过（协议帧 / lz4 / 账号仓库 / 素材索引 / 二维码 / 海面计划 / 工厂视图 / 页面单元格契约 / 拾荒间隔与潜水禁令 / 活跃度宝箱 / 每日赠礼 / 循环日志物品明细 / 挂机领取 / 搁浅的货轮 / 海兽培育 / 贸易港口 / 海商王 / 联盟商船 / 国战攻城 / 酆都诡事 / 海盗讨伐 / 英雄养成 / 勋章升星 / 专武 / 日志脱敏与回包归档 / 今日收益统计）`);
